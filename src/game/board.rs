@@ -233,6 +233,11 @@ impl Board {
             }
         }
 
+        // 清零通道 2（last_move），避免上一帧残留
+        for idx in 0..size {
+            data[2 * size + idx] = 0.0;
+        }
+
         if let Some((lr, lc)) = self.last_move {
             data[2 * size + lr * BOARD_SIZE + lc] = 1.0;
         }
