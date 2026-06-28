@@ -120,8 +120,6 @@ impl Node {
 #[derive(Clone)]
 pub struct MCTS {
     nodes: Vec<Node>,
-    /// 单次评估编码缓冲区 [4 * 225] f32
-    eval_buffer: Vec<f32>,
 }
 
 /// 搜索返回结果
@@ -136,10 +134,7 @@ pub struct SearchResult {
 
 impl MCTS {
     pub fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            eval_buffer: vec![0.0f32; 4 * NUM_POSITIONS],
-        }
+        Self { nodes: Vec::new() }
     }
 
     /// 执行 MCTS 搜索，返回最佳走法和策略。
@@ -170,9 +165,15 @@ impl MCTS {
             };
         }
 
-        let (policy_logits, value) = self.evaluate(board, network, device);
-        let policy_probs = self.masked_softmax(&policy_logits, &legal_moves);
-        let root_value: f32 = value.into_scalar();
+        let (policy_logits, value) = {
+            let mut buf = vec![0.0f32; 4 * NUM_POSITIONS];
+            board.encode_into(&mut buf);
+            let state = Tensor::<1>::from_floats(buf.as_slice(), device).reshape([1, 4, 15, 15]);
+            network.forward(state)
+        };
+        let policy_probs =
+            self.masked_softmax(&policy_logits.clone().reshape([POLICY_OUT]), &legal_moves);
+        let root_value: f32 = value.reshape([1]).into_scalar();
 
         // 展开根节点（带 Dirichlet 噪声）
         let dirichlet = Self::dirichlet_noise(legal_moves.len(), DIRICHLET_ALPHA);
@@ -196,9 +197,7 @@ impl MCTS {
                 let mut local_mcts = self.clone();
                 let mut sim_board = board.clone();
                 let mut legal = Vec::with_capacity(NUM_POSITIONS);
-                for _ in 0..sims {
-                    local_mcts.simulate(&mut sim_board, 0, network, device, &mut legal);
-                }
+                local_mcts.simulate_batch(sims, &mut sim_board, network, device, &mut legal);
                 local_mcts.nodes
             })
             .collect();
@@ -261,99 +260,189 @@ impl MCTS {
         0
     }
 
-    /// 单次 MCTS 模拟（递归实现）
+    /// 批量评估模拟
     ///
-    /// ## 执行步骤
+    /// 在每轮中，多个模拟从根节点出发，沿 PUCT 走到各自叶节点，
+    /// 收集所有叶节点状态后一次性前向传播（避免逐次网络调用开销）。
     ///
-    /// 1. **终局检测**：如果棋盘已结束，直接返回结果（胜 +1，平 0）
-    /// 2. **叶节点评估**：如果当前节点未展开，调用神经网络评估并创建子节点，
-    ///    返回网络评估值（取反，因为需要从父节点视角）
-    /// 3. **PUCT 选择**：在所有合法子节点中，按 PUCT 公式选择得分最高的走法
-    /// 4. **施加虚拟损失**：对选中子节点和当前节点施加虚拟损失，
-    ///    降低其 Q 值以阻止其他并行线程重复选择
-    /// 5. **递归模拟**：在选中的子节点上继续模拟
-    /// 6. **撤销虚拟损失**：模拟完成后恢复原始统计量
-    /// 7. **反向传播**：将模拟结果累加到子节点的 visit_count 和 total_value，
-    ///    同时更新父节点 visit_count（用于 PUCT 的 sqrt(N_parent) 计算）
+    /// ## 算法步骤
     ///
-    /// ## 视角约定
-    ///
-    /// 返回值始终从**调用者（父节点）**的视角：
-    /// - 如果模拟发现父节点获胜，返回 +1.0
-    /// - 如果对手获胜，返回 -1.0
-    /// - 平局返回 0.0
-    ///
-    /// 递归传递时每次取反，自动完成视角翻转。
-    ///
-    /// 返回从**调用者（父节点）视角**的局面价值。
-    fn simulate(
+    /// 1. 以 `batch_capacity` 个模拟为一组
+    /// 2. 每组中各模拟独立走树，叶节点未展开则记录评估需求
+    /// 3. 收集完一组后，将所有叶节点棋盘编码为 batch tensor
+    /// 4. 一次网络前向得到所有叶节点的策略和价值
+    /// 5. 展开各叶节点并按照各自 value 做反向传播
+    fn simulate_batch(
         &mut self,
+        num_simulations: usize,
         board: &mut Board,
-        node_idx: usize,
         network: &GobangNetwork,
         device: &Device,
         legal: &mut Vec<(usize, usize)>,
-    ) -> f32 {
-        // 终局：上一手玩家已获胜或平局
-        if board.game_over {
-            return match board.winner {
-                Some(_) => 1.0,
-                None => 0.0,
-            };
+    ) {
+        /// 批量评估上限。太小无法发挥批处理优势，太大增加延迟。
+        const BATCH_CAP: usize = 32;
+
+        // 每个模拟独立维护路径栈：(node_idx, move_idx, child_idx)
+        // 用于反向传播
+        struct SimState {
+            path: Vec<(usize, usize, usize)>, // (node, move, child)
+            board: Board,
+            done: bool,
         }
 
-        board.fill_legal_moves(legal);
-        if legal.is_empty() {
-            return 0.0;
-        }
+        let mut sims: Vec<SimState> = Vec::with_capacity(BATCH_CAP);
 
-        if !self.nodes[node_idx].expanded {
-            let (policy_logits, value) = self.evaluate(board, network, device);
-            let val: f32 = value.into_scalar();
-            let probs = self.masked_softmax(&policy_logits, legal);
-            self.expand_node(node_idx, legal, &probs, None);
-            self.nodes[node_idx].expanded = true;
-            return -val;
-        }
+        let mut todo = num_simulations;
+        while todo > 0 {
+            let batch_size = todo.min(BATCH_CAP);
+            todo -= batch_size;
 
-        let parent_sqrt_n = self.nodes[node_idx].effective_n().sqrt();
-        let mut best: Option<(usize, usize, f32)> = None;
+            // 初始化本轮模拟
+            sims.clear();
+            for _ in 0..batch_size {
+                sims.push(SimState {
+                    path: Vec::new(),
+                    board: board.clone(),
+                    done: false,
+                });
+            }
 
-        for &(r, c) in legal.iter() {
-            let idx = Board::pos_to_idx(r, c);
-            if let Some(ci) = self.nodes[node_idx].children[idx] {
-                let child = &self.nodes[ci];
-                let score = child.effective_q()
-                    + C_PUCT * child.prior * parent_sqrt_n / (1.0 + child.effective_n());
-                if best.map_or(true, |(_, _, s)| score > s) {
-                    best = Some((idx, ci, score));
+            // ── 阶段 1: 走树 ──
+            // 每轮对未结束的模拟推进一步
+            loop {
+                let active = sims.iter().filter(|s| !s.done).count();
+                if active == 0 {
+                    break;
+                }
+
+                // 收集需要评估的叶节点
+                let mut eval_indices: Vec<usize> = Vec::new();
+                for (si, sim) in sims.iter_mut().enumerate() {
+                    if sim.done {
+                        continue;
+                    }
+
+                    if sim.board.game_over {
+                        // 终局：从当前玩家视角看，上一手获胜
+                        let winner_val = match sim.board.winner {
+                            Some(_) => 1.0,
+                            None => 0.0,
+                        };
+                        // 反向传播
+                        self.backprop_path(&sim.path, winner_val);
+                        sim.done = true;
+                        continue;
+                    }
+
+                    sim.board.fill_legal_moves(legal);
+                    if legal.is_empty() {
+                        self.backprop_path(&sim.path, 0.0);
+                        sim.done = true;
+                        continue;
+                    }
+
+                    // 当前节点索引
+                    let node_idx = sim.path.last().map(|&(_, _, ci)| ci).unwrap_or(0);
+
+                    if !self.nodes[node_idx].expanded {
+                        eval_indices.push(si);
+                        sim.done = true; // 标记需要评估
+                        continue;
+                    }
+
+                    // PUCT 选择
+                    let parent_sqrt_n = self.nodes[node_idx].effective_n().sqrt();
+                    let mut best: Option<(usize, usize, f32)> = None;
+                    for &(r, c) in legal.iter() {
+                        let idx = Board::pos_to_idx(r, c);
+                        if let Some(ci) = self.nodes[node_idx].children[idx] {
+                            let child = &self.nodes[ci];
+                            let score = child.effective_q()
+                                + C_PUCT * child.prior * parent_sqrt_n
+                                    / (1.0 + child.effective_n());
+                            if best.map_or(true, |(_, _, s)| score > s) {
+                                best = Some((idx, ci, score));
+                            }
+                        }
+                    }
+
+                    let (move_idx, child_idx) =
+                        best.map(|(mi, ci, _)| (mi, ci)).unwrap_or_else(|| {
+                            let idx = Board::pos_to_idx(legal[0].0, legal[0].1);
+                            (idx, self.nodes[node_idx].children[idx].unwrap())
+                        });
+
+                    // 施加虚拟损失
+                    self.nodes[child_idx].add_virtual_loss();
+                    self.nodes[node_idx].add_virtual_loss();
+
+                    sim.path.push((node_idx, move_idx, child_idx));
+                    sim.board.play_idx(move_idx);
+                }
+
+                // ── 阶段 2: 批量网络评估 ──
+                if !eval_indices.is_empty() {
+                    let n_eval = eval_indices.len();
+                    let mut batch_buffer: Vec<f32> = vec![0.0f32; n_eval * 4 * NUM_POSITIONS];
+
+                    // 编码所有待评估棋盘
+                    for (bi, &si) in eval_indices.iter().enumerate() {
+                        let offset = bi * 4 * NUM_POSITIONS;
+                        sims[si]
+                            .board
+                            .encode_into(&mut batch_buffer[offset..offset + 4 * NUM_POSITIONS]);
+                    }
+
+                    let state_tensor = Tensor::<1>::from_floats(batch_buffer.as_slice(), device)
+                        .reshape([n_eval, 4, 15, 15]);
+
+                    let (policy_logits, values) = network.forward(state_tensor);
+
+                    // 处理每个评估结果
+                    for (bi, &si) in eval_indices.iter().enumerate() {
+                        let node_idx = sims[si].path.last().map(|&(_, _, ci)| ci).unwrap_or(0);
+
+                        let val: f32 = values.clone().slice([bi..bi + 1]).into_scalar();
+
+                        // 掩码 softmax
+                        sims[si].board.fill_legal_moves(legal);
+                        let logit_slice = policy_logits
+                            .clone()
+                            .slice([bi..bi + 1])
+                            .reshape([POLICY_OUT]);
+                        let probs = self.masked_softmax(&logit_slice, legal);
+
+                        self.expand_node(node_idx, legal, &probs, None);
+                        self.nodes[node_idx].expanded = true;
+
+                        // 网络评估值从当前玩家视角，取反后反向传播
+                        self.backprop_path(&sims[si].path, -val);
+                    }
                 }
             }
         }
+    }
 
-        let (best_move_idx, best_child_idx) =
-            best.map(|(mi, ci, _)| (mi, ci)).unwrap_or_else(|| {
-                let idx = Board::pos_to_idx(legal[0].0, legal[0].1);
-                (idx, self.nodes[node_idx].children[idx].unwrap())
-            });
+    /// 沿路径反向传播结果。
+    ///
+    /// value 从根模拟调用者的视角传入（路径起点的视角）。
+    /// 路径中每步翻转符号并撤销虚拟损失、更新统计量。
+    fn backprop_path(&mut self, path: &[(usize, usize, usize)], mut value: f32) {
+        // 从叶到根回溯
+        for &(node_idx, _move_idx, child_idx) in path.iter().rev() {
+            // 撤销虚拟损失
+            self.nodes[child_idx].remove_virtual_loss();
+            self.nodes[node_idx].remove_virtual_loss();
 
-        self.nodes[best_child_idx].add_virtual_loss();
-        self.nodes[node_idx].add_virtual_loss();
+            // 累积统计量（从父节点视角）
+            self.nodes[child_idx].visit_count += 1.0;
+            self.nodes[child_idx].total_value += value;
+            self.nodes[node_idx].visit_count += 1.0;
 
-        let snap = board.snapshot();
-        board.play_idx(best_move_idx);
-        let value = self.simulate(board, best_child_idx, network, device, legal);
-        let (mr, mc) = Board::idx_to_pos(best_move_idx);
-        board.undo(mr, mc, &snap);
-
-        self.nodes[best_child_idx].remove_virtual_loss();
-        self.nodes[node_idx].remove_virtual_loss();
-
-        self.nodes[best_child_idx].visit_count += 1.0;
-        self.nodes[best_child_idx].total_value += value;
-        self.nodes[node_idx].visit_count += 1.0;
-
-        -value
+            // 向上翻转视角
+            value = -value;
+        }
     }
 
     /// 展开节点：为所有合法走法创建子节点。
@@ -379,23 +468,6 @@ impl MCTS {
             self.nodes.push(Node::new(prior));
             self.nodes[parent].children[idx] = Some(ci);
         }
-    }
-
-    /// 神经网络前向评估
-    fn evaluate(
-        &mut self,
-        board: &Board,
-        network: &GobangNetwork,
-        device: &Device,
-    ) -> (Tensor<1>, Tensor<1>) {
-        board.encode_into(&mut self.eval_buffer);
-        let state =
-            Tensor::<1>::from_floats(self.eval_buffer.as_slice(), device).reshape([1, 4, 15, 15]);
-
-        let (policy_logits, value) = network.forward(state);
-        let policy_1d = policy_logits.reshape([POLICY_OUT]);
-        let value_1d = value.reshape([1]);
-        (policy_1d, value_1d)
     }
 
     /// 掩码 Softmax：仅对合法走法计算概率分布。
