@@ -19,7 +19,7 @@ enum Command {
         iterations: usize,
 
         /// 每轮自对弈局数
-        #[arg(short = 'g', long, default_value = "4")]
+        #[arg(short = 'g', long, default_value = "64")]
         games: usize,
 
         /// 每次 MCTS 模拟次数
@@ -31,7 +31,7 @@ enum Command {
         learning_rate: f64,
 
         /// 批大小
-        #[arg(short = 'b', long, default_value = "64")]
+        #[arg(short = 'b', long, default_value = "512")]
         batch_size: usize,
 
         /// 模型保存目录
@@ -39,7 +39,7 @@ enum Command {
         model_dir: String,
 
         /// 每隔多少轮保存一次
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "5")]
         save_every: usize,
     },
 
@@ -81,6 +81,7 @@ fn main() {
                 value_loss_weight: 1.0,
                 save_every,
                 model_dir: model_dir.into(),
+                ..Default::default()
             };
             let mut trainer = gomoku_ai::training::Trainer::new(config, device);
             trainer.train();
