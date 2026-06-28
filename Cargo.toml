@@ -10,8 +10,8 @@ burn = { git = "https://github.com/tracel-ai/burn.git", features = [
     "train",
     "ndarray",
     "optim",
-    # "cuda",
-    # "autotune",
+    "cuda",
+    "autotune",
 ], default-features = false }
 rand = "0.10.1"
 rand_distr = "0.6.0"
@@ -19,4 +19,9 @@ rayon = "1.12.0"
 serde = "1.0.228"
 
 [profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
 opt-level = 3
