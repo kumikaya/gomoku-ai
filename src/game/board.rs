@@ -22,6 +22,15 @@ impl Color {
     }
 }
 
+/// 棋盘快照，用于撤销走法
+#[derive(Clone)]
+pub struct BoardSnapshot {
+    pub prev_last_move: Option<(usize, usize)>,
+    pub prev_player: Color,
+    pub prev_game_over: bool,
+    pub prev_winner: Option<Color>,
+}
+
 /// 棋盘状态
 #[derive(Clone)]
 pub struct Board {
@@ -119,6 +128,32 @@ impl Board {
     pub fn play_idx(&mut self, idx: usize) -> bool {
         let (r, c) = Self::idx_to_pos(idx);
         self.play(r, c)
+    }
+
+    /// 撤销上一步走法，恢复棋盘到落子前的状态。
+    ///
+    /// `move_row` / `move_col` 是要撤销的那步落子位置。
+    /// `snapshot` 是落子前通过 `snapshot()` 保存的状态。
+    ///
+    /// MCTS 模拟中替代 `board.clone()`：模拟在单一棋盘上操作，
+    /// 回溯时通过 undo 恢复，将 O(N²) 的 clone 降为 O(1)。
+    pub fn undo(&mut self, move_row: usize, move_col: usize, snapshot: &BoardSnapshot) {
+        self.cells[move_row][move_col] = 0;
+        self.last_move = snapshot.prev_last_move;
+        self.current_player = snapshot.prev_player;
+        self.step_count -= 1;
+        self.game_over = snapshot.prev_game_over;
+        self.winner = snapshot.prev_winner;
+    }
+
+    /// 创建当前状态的快照，用于后续 undo 恢复。
+    pub fn snapshot(&self) -> BoardSnapshot {
+        BoardSnapshot {
+            prev_last_move: self.last_move,
+            prev_player: self.current_player,
+            prev_game_over: self.game_over,
+            prev_winner: self.winner,
+        }
     }
 
     /// 检查在 (row, col) 处落子后是否形成五连。
@@ -308,5 +343,76 @@ mod tests {
             1.0,
             "White stone in opponent channel"
         );
+    }
+
+    #[test]
+    fn test_undo_play() {
+        let mut board = Board::new();
+        board.play(7, 7); // Black 落子
+        let snap = board.snapshot(); // 保存 (7,7) 落子前的状态
+        board.play(7, 8); // White 落子
+        assert_eq!(board.current_player, Color::Black);
+
+        board.undo(7, 8, &snap); // 撤销 White 的 (7,8)
+        // 撤销后应恢复到黑方刚落子在 (7,7) 后的状态（轮到白方）
+        assert_eq!(board.current_player, Color::White);
+        assert_eq!(board.step_count, 1);
+        assert_eq!(board.get(7, 7), 1);
+        assert_eq!(board.get(7, 8), 0); // 白方落子已被清除
+        assert!(!board.game_over);
+    }
+
+    #[test]
+    fn test_undo_with_win() {
+        let mut board = Board::new();
+        // 黑方在 (7,6)-(7,10) 连五胜
+        let moves = [
+            (7, 6),
+            (0, 0),
+            (7, 7),
+            (1, 1),
+            (7, 8),
+            (2, 2),
+            (7, 9),
+            (3, 3),
+        ];
+        for &(r, c) in moves.iter() {
+            board.play(r, c);
+        }
+        assert!(!board.game_over);
+
+        // 黑方即将走 (7,10)，保存当前状态
+        let snap_before_win = board.snapshot();
+        board.play(7, 10); // 黑方获胜
+        assert!(board.game_over);
+        assert_eq!(board.winner, Some(Color::Black));
+
+        board.undo(7, 10, &snap_before_win);
+        assert!(!board.game_over);
+        assert_eq!(board.winner, None);
+        assert_eq!(board.current_player, Color::Black); // 回到黑方回合
+        assert_eq!(board.get(7, 10), 0);
+    }
+
+    #[test]
+    fn test_snapshot_and_undo_sequence() {
+        let mut board = Board::new();
+        let mut snapshots = Vec::new();
+        let mut positions = Vec::new();
+
+        for i in 0..5 {
+            snapshots.push(board.snapshot());
+            positions.push((i, i));
+            board.play(i, i);
+        }
+        assert_eq!(board.step_count, 5);
+
+        // 逆序撤销
+        for i in (0..5).rev() {
+            let (r, c) = positions[i];
+            board.undo(r, c, &snapshots[i]);
+        }
+        assert_eq!(board.step_count, 0);
+        assert_eq!(board.current_player, Color::Black);
     }
 }

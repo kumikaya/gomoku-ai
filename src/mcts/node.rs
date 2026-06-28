@@ -189,8 +189,9 @@ impl MCTS {
             .map(|tid| {
                 let sims = if tid < remainder { base + 1 } else { base };
                 let mut local_mcts = self.clone();
+                // 每个线程一份棋盘副本；simulate 内部通过 undo 自动平衡
+                let mut sim_board = board.clone();
                 for _ in 0..sims {
-                    let mut sim_board = board.clone();
                     local_mcts.simulate(&mut sim_board, 0, network, device);
                 }
                 local_mcts.nodes
@@ -341,8 +342,11 @@ impl MCTS {
         self.nodes[best_child_idx].add_virtual_loss();
         self.nodes[node_idx].add_virtual_loss();
 
+        let snap = board.snapshot(); // 保存落子前状态
         board.play_idx(best_move_idx);
         let value = self.simulate(board, best_child_idx, network, device);
+        let (mr, mc) = Board::idx_to_pos(best_move_idx);
+        board.undo(mr, mc, &snap); // 撤销本次落子，恢复棋盘
 
         // 撤销虚拟损失
         self.nodes[best_child_idx].remove_virtual_loss();
