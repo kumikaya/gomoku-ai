@@ -117,6 +117,7 @@ impl Node {
 }
 
 /// MCTS 搜索器
+#[derive(Clone)]
 pub struct MCTS {
     nodes: Vec<Node>,
 }
@@ -165,7 +166,7 @@ impl MCTS {
         }
 
         let (policy_logits, value) = self.evaluate(board, network, device);
-        let policy_probs = self.masked_softmax(&policy_logits, board);
+        let policy_probs = self.masked_softmax(&policy_logits, &legal_moves);
         let root_value: f32 = value.into_scalar();
 
         // 展开根节点（带 Dirichlet 噪声）
@@ -179,7 +180,6 @@ impl MCTS {
         self.nodes[root_idx].expanded = true;
 
         // ── 并行模拟 ──
-        // 将模拟均匀分配给线程，每个线程在独立的树副本上运行
         let num_threads = rayon::current_num_threads().min(num_simulations).max(1);
         let base = num_simulations / num_threads;
         let remainder = num_simulations % num_threads;
@@ -189,10 +189,10 @@ impl MCTS {
             .map(|tid| {
                 let sims = if tid < remainder { base + 1 } else { base };
                 let mut local_mcts = self.clone();
-                // 每个线程一份棋盘副本；simulate 内部通过 undo 自动平衡
                 let mut sim_board = board.clone();
+                let mut legal = Vec::with_capacity(NUM_POSITIONS);
                 for _ in 0..sims {
-                    local_mcts.simulate(&mut sim_board, 0, network, device);
+                    local_mcts.simulate(&mut sim_board, 0, network, device, &mut legal);
                 }
                 local_mcts.nodes
             })
@@ -287,18 +287,17 @@ impl MCTS {
         node_idx: usize,
         network: &GobangNetwork,
         device: &Device,
+        legal: &mut Vec<(usize, usize)>,
     ) -> f32 {
         // 终局：上一手玩家已获胜或平局
         if board.game_over {
-            // board.play() 获胜后不翻转 current_player，因此 winner 即刚走完的一方。
-            // 从调用者（父节点）视角，父节点刚走完并获胜 → +1.0。
             return match board.winner {
-                Some(_) => 1.0, // 父节点获胜
-                None => 0.0,    // 平局
+                Some(_) => 1.0,
+                None => 0.0,
             };
         }
 
-        let legal = board.legal_moves();
+        board.fill_legal_moves(legal);
         if legal.is_empty() {
             return 0.0;
         }
@@ -306,20 +305,16 @@ impl MCTS {
         if !self.nodes[node_idx].expanded {
             let (policy_logits, value) = self.evaluate(board, network, device);
             let val: f32 = value.into_scalar();
-            let probs = self.masked_softmax(&policy_logits, board);
-            self.expand_node(node_idx, &legal, &probs, None);
+            let probs = self.masked_softmax(&policy_logits, legal);
+            self.expand_node(node_idx, legal, &probs, None);
             self.nodes[node_idx].expanded = true;
-            // 网络评估从当前玩家视角，返回给父节点时取反
             return -val;
         }
 
-        // ── PUCT 选择：在合法走法中选出得分最高的子节点 ──
-        //
-        // PUCT 公式：score = Q(s,a) + C_PUCT * P(s,a) * √(N_parent) / (1 + N_child)
         let parent_sqrt_n = self.nodes[node_idx].effective_n().sqrt();
-        let mut best: Option<(usize, usize, f32)> = None; // (move_idx, child_idx, score)
+        let mut best: Option<(usize, usize, f32)> = None;
 
-        for &(r, c) in &legal {
+        for &(r, c) in legal.iter() {
             let idx = Board::pos_to_idx(r, c);
             if let Some(ci) = self.nodes[node_idx].children[idx] {
                 let child = &self.nodes[ci];
@@ -333,33 +328,26 @@ impl MCTS {
 
         let (best_move_idx, best_child_idx) =
             best.map(|(mi, ci, _)| (mi, ci)).unwrap_or_else(|| {
-                // 理论不可达：legal 非空则 children 必有匹配项
                 let idx = Board::pos_to_idx(legal[0].0, legal[0].1);
                 (idx, self.nodes[node_idx].children[idx].unwrap())
             });
 
-        // 施加虚拟损失
         self.nodes[best_child_idx].add_virtual_loss();
         self.nodes[node_idx].add_virtual_loss();
 
-        let snap = board.snapshot(); // 保存落子前状态
+        let snap = board.snapshot();
         board.play_idx(best_move_idx);
-        let value = self.simulate(board, best_child_idx, network, device);
+        let value = self.simulate(board, best_child_idx, network, device, legal);
         let (mr, mc) = Board::idx_to_pos(best_move_idx);
-        board.undo(mr, mc, &snap); // 撤销本次落子，恢复棋盘
+        board.undo(mr, mc, &snap);
 
-        // 撤销虚拟损失
         self.nodes[best_child_idx].remove_virtual_loss();
         self.nodes[node_idx].remove_virtual_loss();
 
-        // ── 反向传播 ──
-        // value 是从调用者（本节点）视角的值，累加到子节点统计量中
-        // 父节点的 visit_count 同步递增，为后续 PUCT 选择提供 √N_parent
         self.nodes[best_child_idx].visit_count += 1.0;
         self.nodes[best_child_idx].total_value += value;
         self.nodes[node_idx].visit_count += 1.0;
 
-        // 向上传递时翻转视角：对父节点有利 = 对本节点不利
         -value
     }
 
@@ -407,12 +395,11 @@ impl MCTS {
 
     /// 掩码 Softmax：仅对合法走法计算概率分布。
     ///
+    /// `legal` 是当前棋盘的所有合法走法列表。
     /// 先取合法走法中 logit 的最大值做数值稳定，再 exp + 归一化。
     /// 如果所有合法走法的 logit 都极小（sum ≈ 0），退化为均匀分布。
-    fn masked_softmax(&self, logits: &Tensor<1>, board: &Board) -> Vec<f32> {
+    fn masked_softmax(&self, logits: &Tensor<1>, legal: &[(usize, usize)]) -> Vec<f32> {
         let bytes = logits.clone().into_data().to_vec::<f32>().unwrap();
-
-        let legal = board.legal_moves();
 
         let max_logit = legal
             .iter()
@@ -421,7 +408,7 @@ impl MCTS {
 
         let mut probs = vec![0.0f32; NUM_POSITIONS];
         let mut sum = 0.0f32;
-        for &(r, c) in &legal {
+        for &(r, c) in legal {
             let idx = Board::pos_to_idx(r, c);
             let exp = (bytes[idx] - max_logit).exp();
             probs[idx] = exp;
@@ -429,13 +416,13 @@ impl MCTS {
         }
 
         if sum > 0.0 {
-            for &(r, c) in &legal {
+            for &(r, c) in legal {
                 let idx = Board::pos_to_idx(r, c);
                 probs[idx] /= sum;
             }
         } else {
             let count = legal.len() as f32;
-            for &(r, c) in &legal {
+            for &(r, c) in legal {
                 probs[Board::pos_to_idx(r, c)] = 1.0 / count;
             }
         }
@@ -472,14 +459,6 @@ impl MCTS {
             .collect();
         let dist = WeightedIndex::new(&scaled).unwrap();
         dist.sample(&mut rand::rng())
-    }
-}
-
-impl Clone for MCTS {
-    fn clone(&self) -> Self {
-        Self {
-            nodes: self.nodes.clone(),
-        }
     }
 }
 
@@ -602,9 +581,10 @@ mod tests {
         let board = Board::new();
         let device = Device::default();
 
+        let legal = board.legal_moves();
         let data = vec![0.0f32; NUM_POSITIONS];
         let logits = Tensor::<1>::from_floats(data.as_slice(), &device);
-        let probs = mcts.masked_softmax(&logits, &board);
+        let probs = mcts.masked_softmax(&logits, &legal);
         assert_eq!(probs.len(), NUM_POSITIONS);
         let expected = 1.0 / NUM_POSITIONS as f32;
         for (i, &p) in probs.iter().enumerate() {
@@ -628,7 +608,7 @@ mod tests {
 
         let data = vec![1.0f32; NUM_POSITIONS];
         let logits = Tensor::<1>::from_floats(data.as_slice(), &device);
-        let probs = mcts.masked_softmax(&logits, &board);
+        let probs = mcts.masked_softmax(&logits, &legal);
         let expected = 1.0 / legal.len() as f32;
 
         for (i, &p) in probs.iter().enumerate() {

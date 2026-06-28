@@ -65,18 +65,26 @@ impl Board {
     }
 
     pub fn legal_moves(&self) -> Vec<(usize, usize)> {
+        let mut moves = Vec::with_capacity(NUM_POSITIONS);
+        self.fill_legal_moves(&mut moves);
+        moves
+    }
+
+    /// 将合法走法写入预分配的缓冲区，避免重复分配。
+    ///
+    /// MCTS 模拟中使用此方法以减少每步的 Vec 分配。
+    pub fn fill_legal_moves(&self, buffer: &mut Vec<(usize, usize)>) {
+        buffer.clear();
         if self.game_over {
-            return Vec::new();
+            return;
         }
-        let mut moves = Vec::with_capacity(NUM_POSITIONS - self.step_count);
         for r in 0..BOARD_SIZE {
             for c in 0..BOARD_SIZE {
                 if self.cells[r][c] == 0 {
-                    moves.push((r, c));
+                    buffer.push((r, c));
                 }
             }
         }
-        moves
     }
 
     #[inline]
