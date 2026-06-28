@@ -16,7 +16,7 @@
 //! 回溯时只更新子节点的统计量；父节点的 visit_count 同步递增即可。
 
 use crate::game::board::{Board, NUM_POSITIONS};
-use crate::network::residual::{GobangNetwork, POLICY_OUT};
+use crate::network::residual::{BOARD_SIZE, GobangNetwork, INPUT_CHANNELS, POLICY_OUT};
 use burn::tensor::{Device, Tensor};
 use rayon::prelude::*;
 
@@ -168,7 +168,12 @@ impl MCTS {
         let (policy_logits, value) = {
             let mut buf = vec![0.0f32; 4 * NUM_POSITIONS];
             board.encode_into(&mut buf);
-            let state = Tensor::<1>::from_floats(buf.as_slice(), device).reshape([1, 4, 15, 15]);
+            let state = Tensor::<1>::from_floats(buf.as_slice(), device).reshape([
+                1,
+                INPUT_CHANNELS as i32,
+                BOARD_SIZE as i32,
+                BOARD_SIZE as i32,
+            ]);
             network.forward(state)
         };
         let policy_probs =
@@ -395,7 +400,12 @@ impl MCTS {
                     }
 
                     let state_tensor = Tensor::<1>::from_floats(batch_buffer.as_slice(), device)
-                        .reshape([n_eval, 4, 15, 15]);
+                        .reshape([
+                            n_eval as i32,
+                            INPUT_CHANNELS as i32,
+                            BOARD_SIZE as i32,
+                            BOARD_SIZE as i32,
+                        ]);
 
                     let (policy_logits, values) = network.forward(state_tensor);
 
