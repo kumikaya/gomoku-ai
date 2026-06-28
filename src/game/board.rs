@@ -209,27 +209,10 @@ impl Board {
 
     /// 编码棋盘为网络输入：[4 × 225] 的 f32 张量
     ///
-    /// ## 四个通道的设计
-    ///
-    /// | 通道 | 含义 | 编码规则 |
-    /// |------|------|---------|
-    /// | 0 | 当前玩家棋子 | 当前玩家的棋子为 1.0，其余为 0.0 |
-    /// | 1 | 对手棋子 | 对手的棋子为 1.0，其余为 0.0 |
-    /// | 2 | 最后一步 | 上一步落子位置为 1.0，其余为 0.0 |
-    /// | 3 | 当前颜色 | 黑方为 1.0，白方为 0.0（全通道常量）|
-    ///
-    /// 通道 0 和 1 让网络知道双方棋子分布；
-    /// 通道 2 提供最近一步的位置信息（有助于判断对手意图）；
-    /// 通道 3 提供当前回合颜色（网络内部没有颜色概念，需要显式告知）。
-    ///
-    /// 注意：通道编码随当前玩家而变化。例如黑方视角下，黑子出现在通道 0，
-    /// 白子出现在通道 1；轮到白方时翻转。这确保网络从任意玩家视角看到的
-    /// 输入模式一致，利于学习对称性。
-    ///
-    /// 通道 0: 当前玩家棋子 | 通道 1: 对手棋子 | 通道 2: 最后一步 | 通道 3: 颜色
-    pub fn encode_state(&self) -> Vec<f32> {
+    /// 将编码写入预分配缓冲区，避免频繁分配。
+    pub fn encode_into(&self, data: &mut [f32]) {
         let size = NUM_POSITIONS;
-        let mut data = vec![0.0f32; 4 * size];
+        debug_assert!(data.len() >= 4 * size, "encode_into buffer too small");
 
         let (current_stone, opponent_stone) = match self.current_player {
             Color::Black => (1u8, 2u8),
@@ -253,6 +236,13 @@ impl Board {
         if let Some((lr, lc)) = self.last_move {
             data[2 * size + lr * BOARD_SIZE + lc] = 1.0;
         }
+    }
+
+    /// 编码棋盘为网络输入（分配新 Vec）。
+    /// MCTS evaluate 中使用 `encode_into` 替代此方法避免重复分配。
+    pub fn encode_state(&self) -> Vec<f32> {
+        let mut data = vec![0.0f32; 4 * NUM_POSITIONS];
+        self.encode_into(&mut data);
         data
     }
 }

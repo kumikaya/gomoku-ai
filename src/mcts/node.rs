@@ -120,6 +120,8 @@ impl Node {
 #[derive(Clone)]
 pub struct MCTS {
     nodes: Vec<Node>,
+    /// 单次评估编码缓冲区 [4 * 225] f32
+    eval_buffer: Vec<f32>,
 }
 
 /// 搜索返回结果
@@ -134,7 +136,10 @@ pub struct SearchResult {
 
 impl MCTS {
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self {
+            nodes: Vec::new(),
+            eval_buffer: vec![0.0f32; 4 * NUM_POSITIONS],
+        }
     }
 
     /// 执行 MCTS 搜索，返回最佳走法和策略。
@@ -378,16 +383,16 @@ impl MCTS {
 
     /// 神经网络前向评估
     fn evaluate(
-        &self,
+        &mut self,
         board: &Board,
         network: &GobangNetwork,
         device: &Device,
     ) -> (Tensor<1>, Tensor<1>) {
-        let state_data = board.encode_state();
-        let state = Tensor::<1>::from_floats(state_data.as_slice(), device).reshape([1, 4, 15, 15]);
+        board.encode_into(&mut self.eval_buffer);
+        let state =
+            Tensor::<1>::from_floats(self.eval_buffer.as_slice(), device).reshape([1, 4, 15, 15]);
 
         let (policy_logits, value) = network.forward(state);
-        // [1, 225] -> [225]; [1, 1] -> [1]
         let policy_1d = policy_logits.reshape([POLICY_OUT]);
         let value_1d = value.reshape([1]);
         (policy_1d, value_1d)
