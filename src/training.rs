@@ -3,16 +3,19 @@
 //! 自对弈 → 收集数据 → 采样训练 → 更新参数 → 重复。
 
 use crate::game::board::NUM_POSITIONS;
-use crate::network::residual::GobangNetwork;
+use crate::network::residual::{BOARD_SIZE, GobangNetwork, INPUT_CHANNELS};
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 
+use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::{
     module::AutodiffModule,
     optim::{AdamConfig, GradientsParams},
+    store::ModuleRecord,
     tensor::{Device, Tensor, activation::log_softmax},
 };
 use rayon::prelude::*;
+use std::path::PathBuf;
 
 pub struct TrainConfig {
     pub num_simulations: usize,
@@ -22,6 +25,10 @@ pub struct TrainConfig {
     pub num_iterations: usize,
     pub learning_rate: f64,
     pub value_loss_weight: f32,
+    /// 每 N 轮保存一次模型权重
+    pub save_every: usize,
+    /// 模型保存目录
+    pub model_dir: PathBuf,
 }
 
 impl Default for TrainConfig {
@@ -34,6 +41,8 @@ impl Default for TrainConfig {
             num_iterations: 100,
             learning_rate: 1e-3,
             value_loss_weight: 1.0,
+            save_every: 10,
+            model_dir: PathBuf::from("checkpoints"),
         }
     }
 }
@@ -50,6 +59,46 @@ impl Trainer {
             config,
             device,
             replay_buffer: Vec::new(),
+        }
+    }
+
+    /// 模型文件路径（不含扩展名，Burn 会自动加 .bpk）
+    fn model_path(&self, label: &str) -> PathBuf {
+        self.config.model_dir.join(format!("gobang_{}", label))
+    }
+
+    /// 从磁盘加载模型（若存在），否则创建新模型。
+    fn load_or_create_model(&self, autodiff_device: &Device) -> GobangNetwork {
+        // 尝试加载 latest 模型
+        let latest_path = self.model_path("latest");
+        if latest_path.exists() {
+            if let Ok(record) = ModuleRecord::load(&latest_path) {
+                println!("Loaded existing model from disk.");
+                return GobangNetwork::new(autodiff_device).load_record(record);
+            }
+        }
+
+        // 尝试加载 initial 模型
+        let init_path = self.model_path("initial");
+        if init_path.exists() {
+            if let Ok(record) = ModuleRecord::load(&init_path) {
+                println!("Loaded initial model from disk.");
+                return GobangNetwork::new(autodiff_device).load_record(record);
+            }
+        }
+
+        println!("Creating new model.");
+        GobangNetwork::new(autodiff_device)
+    }
+
+    /// 保存模型到 `checkpoints/gobang_{label}.bpk`
+    fn save_model(&self, model: &GobangNetwork, label: &str) {
+        let path = self.model_path(label);
+        // valid() 去除 autodiff 追踪后才能保存到磁盘
+        if let Err(e) = model.clone().valid().save_file(&path) {
+            eprintln!("Warning: failed to save model {}: {}", label, e);
+        } else {
+            println!("Model saved: {:?}", path);
         }
     }
 
@@ -71,11 +120,15 @@ impl Trainer {
     /// 设备上创建，推理时通过 `valid()` 获取无自动微分的版本。这样避免了 fork 的
     /// Conv2d 兼容性问题。
     pub fn train(&mut self) {
+        std::fs::create_dir_all(&self.config.model_dir).ok();
+
         let train_device = self.device.clone().autodiff();
 
-        // 直接在 autodiff 设备上创建训练模型
-        let mut model = GobangNetwork::new(&train_device);
+        let mut model = self.load_or_create_model(&train_device);
         let mut optim = AdamConfig::new().init();
+
+        // 保存初始模型
+        self.save_model(&model, "initial");
 
         for iteration in 0..self.config.num_iterations {
             println!(
@@ -150,10 +203,21 @@ impl Trainer {
             let avg_loss = total_loss / self.config.train_steps as f32;
             println!("  Average loss: {:.4}", avg_loss);
 
-            // 训练完成，准备下一轮：clone 出推理副本给自对弈用，
-            // 原始模型继续在 autodiff 设备上训练（避免 fork 往返丢失 require_grad）
-            // 无需额外操作——model 已在 autodiff 设备上，下一轮 clone().valid() 获取推理网络即可
+            // 定期保存
+            let epoch = iteration + 1;
+            if epoch % self.config.save_every == 0 || epoch == self.config.num_iterations {
+                self.save_model(&model, &format!("epoch_{}", epoch));
+                // 同时更新 latest
+                model
+                    .clone()
+                    .to_device(&self.device)
+                    .save_file(self.model_path("latest"))
+                    .unwrap_or_else(|e| eprintln!("Warning: failed to save latest: {}", e));
+            }
         }
+
+        // 保存最终模型
+        self.save_model(&model, "final");
         println!("Training complete!");
     }
 
@@ -187,7 +251,7 @@ impl Trainer {
     ) -> Tensor<1> {
         let batch_size = batch.len();
 
-        let mut states: Vec<f32> = Vec::with_capacity(batch_size * 4 * NUM_POSITIONS);
+        let mut states: Vec<f32> = Vec::with_capacity(batch_size * INPUT_CHANNELS * NUM_POSITIONS);
         let mut target_policies: Vec<f32> = Vec::with_capacity(batch_size * NUM_POSITIONS);
         let mut target_values: Vec<f32> = Vec::with_capacity(batch_size);
 
@@ -197,8 +261,12 @@ impl Trainer {
             target_values.push(record.value);
         }
 
-        let state_tensor = Tensor::<1>::from_floats(states.as_slice(), autodiff_device)
-            .reshape([batch_size, 4, 15, 15]);
+        let state_tensor = Tensor::<1>::from_floats(states.as_slice(), autodiff_device).reshape([
+            batch_size,
+            INPUT_CHANNELS,
+            BOARD_SIZE,
+            BOARD_SIZE,
+        ]);
 
         let policy_target = Tensor::<1>::from_floats(target_policies.as_slice(), autodiff_device)
             .reshape([batch_size, NUM_POSITIONS]);
