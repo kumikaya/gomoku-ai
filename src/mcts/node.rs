@@ -56,7 +56,7 @@ const WIN_VALUE: f32 = 1.0;
 const DRAW_VALUE: f32 = 0.0;
 
 /// 批量评估上限。太小无法发挥批处理优势，太大增加延迟。
-const BATCH_CAP: usize = 128;
+const BATCH_CAP: usize = 256;
 
 /// MCTS 树节点
 ///

@@ -10,6 +10,7 @@ use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::{
+    grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
     optim::{AdamConfig, GradientsParams},
     store::ModuleRecord,
@@ -37,6 +38,8 @@ pub struct TrainConfig {
     pub kl_targ: f32,
     /// 经验回放缓冲区最大容量（FIFO 自动淘汰）
     pub buffer_capacity: usize,
+    /// 梯度裁剪阈值（L2 norm），0 表示不裁剪
+    pub max_grad_norm: f32,
 }
 
 impl Default for TrainConfig {
@@ -53,6 +56,7 @@ impl Default for TrainConfig {
             model_dir: PathBuf::from("checkpoints"),
             kl_targ: 0.02,
             buffer_capacity: 12000,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -131,6 +135,10 @@ impl Trainer {
 
         let mut model = self.load_or_create_model(&train_device);
         let mut optim = AdamConfig::new().init();
+        if self.config.max_grad_norm > 0.0 {
+            optim = optim
+                .with_grad_clipping(GradientClippingConfig::Norm(self.config.max_grad_norm).init());
+        }
 
         // 保存初始模型
         self.save_model(&model, "initial");
