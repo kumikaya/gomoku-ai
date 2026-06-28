@@ -12,6 +12,7 @@ burn = { git = "https://github.com/tracel-ai/burn.git", features = [
     "optim",
     "cuda",
 ], default-features = false }
+clap = { version = "4.6.1", features = ["derive"] }
 rand = "0.10.1"
 rand_distr = "0.6.0"
 rayon = "1.12.0"
