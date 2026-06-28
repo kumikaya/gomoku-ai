@@ -55,6 +55,9 @@ const WIN_VALUE: f32 = 1.0;
 /// 平局模拟的价值
 const DRAW_VALUE: f32 = 0.0;
 
+/// 批量评估上限。太小无法发挥批处理优势，太大增加延迟。
+const BATCH_CAP: usize = 128;
+
 /// MCTS 树节点
 ///
 /// `virtual_loss` 记录当前有多少个模拟正在经过此节点（计数），
@@ -306,9 +309,6 @@ impl MCTS {
         device: &Device,
         legal: &mut Vec<(usize, usize)>,
     ) {
-        /// 批量评估上限。太小无法发挥批处理优势，太大增加延迟。
-        const BATCH_CAP: usize = 32;
-
         // 每个模拟独立维护路径栈和棋盘状态
         struct SimState {
             path: Vec<(usize, usize, usize)>, // (node, move, child)

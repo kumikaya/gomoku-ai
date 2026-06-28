@@ -36,8 +36,8 @@ impl Default for TrainConfig {
         Self {
             num_simulations: 200,
             games_per_iteration: 4,
-            batch_size: 64,
-            train_steps: 50,
+            batch_size: 128,
+            train_steps: 25,
             num_iterations: 100,
             learning_rate: 1e-3,
             value_loss_weight: 1.0,
@@ -54,6 +54,9 @@ pub struct Trainer {
 }
 
 impl Trainer {
+    /// 以 50% 概率保留原样（不做增强）
+    const AUGMENT_IDENTITY_PROB: f32 = 0.50;
+
     pub fn new(config: TrainConfig, device: Device) -> Self {
         Self {
             config,
@@ -181,8 +184,28 @@ impl Trainer {
                     continue;
                 }
 
-                let loss =
-                    Self::train_step(&model, &batch, self.config.value_loss_weight, &train_device);
+                // 1. 数据增强 + 扁平化
+                let (aug_states, aug_policies, aug_values) = Self::augment_batch(&batch);
+                let batch_size = batch.len();
+
+                // 2. 构造张量
+                let state_tensor = Tensor::<1>::from_floats(aug_states.as_slice(), &train_device)
+                    .reshape([batch_size, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE]);
+                let policy_target =
+                    Tensor::<1>::from_floats(aug_policies.as_slice(), &train_device)
+                        .reshape([batch_size, NUM_POSITIONS]);
+                let value_target = Tensor::<1>::from_floats(aug_values.as_slice(), &train_device)
+                    .reshape([batch_size, 1]);
+
+                // 3. 前向 + 损失
+                let loss = Self::train_step(
+                    &model,
+                    state_tensor,
+                    policy_target,
+                    value_target,
+                    self.config.value_loss_weight,
+                    &train_device,
+                );
 
                 let scalar: f32 = loss.clone().into_scalar();
                 total_loss += scalar;
@@ -191,7 +214,7 @@ impl Trainer {
                 let grads = GradientsParams::from_grads(grads, &model);
                 model = optim.step(self.config.learning_rate, model, grads);
 
-                if step % 10 == 0 {
+                if step % 5 == 0 {
                     println!(
                         "    Step {}: avg_loss={:.4}",
                         step,
@@ -231,29 +254,11 @@ impl Trainer {
         buffer.sample(&mut rng, actual).cloned().collect()
     }
 
-    /// 单步训练：前向传播 → 计算损失 → 反向传播
+    /// 对一批样本做 D4 数据增强，转化为扁平浮点数组（供构造张量使用）。
     ///
-    /// ## 损失函数
-    ///
-    /// 总损失 = 策略损失 + value_weight × 价值损失
-    ///
-    /// - **策略损失（交叉熵）**：`-Σ target_p * log(softmax(logits))`
-    ///   MCTS 搜索得到的策略分布作为目标，引导网络学会输出更准确的先验概率。
-    ///   这里是 AlphaZero 的核心创新——用 MCTS 改进策略作为监督信号。
-    ///
-    /// - **价值损失（MSE）**：`(pred_value - actual_outcome)²`
-    ///   让网络学会准确评估当前局面的胜负概率。
-    ///
-    /// ## 数据增强
-    ///
-    /// 训练时对每个样本以 50% 概率应用随机 D4 变换（旋转/翻转），
-    /// 等价于将训练数据扩充 8 倍。五子棋在这些变换下保持局面不变性。
-    fn train_step(
-        model: &GomokuNetwork,
-        batch: &[PlayRecord],
-        value_weight: f32,
-        autodiff_device: &Device,
-    ) -> Tensor<1> {
+    /// 以 50% 概率对每个样本保留原样，否则随机应用旋转/翻转。
+    /// 五子棋在这些 D4 变换下保持局面不变性，等价于将训练数据扩充 8 倍。
+    fn augment_batch(batch: &[PlayRecord]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let batch_size = batch.len();
 
         let mut states: Vec<f32> = Vec::with_capacity(batch_size * INPUT_CHANNELS * NUM_POSITIONS);
@@ -261,34 +266,42 @@ impl Trainer {
         let mut target_values: Vec<f32> = Vec::with_capacity(batch_size);
         let mut rng = rand::rng();
 
-        // 以 50% 概率对每个样本做随机 D4 增强
-        const AUGMENT_IDENTITY_PROB: f32 = 0.50;
-
         for record in batch {
             let (aug_state, aug_policy) = D4Symmetry::random_augment(
                 &record.state,
                 &record.policy,
                 &mut rng,
-                AUGMENT_IDENTITY_PROB,
+                Self::AUGMENT_IDENTITY_PROB,
             );
             states.extend(&aug_state);
             target_policies.extend(&aug_policy);
             target_values.push(record.value);
         }
 
-        let state_tensor = Tensor::<1>::from_floats(states.as_slice(), autodiff_device).reshape([
-            batch_size,
-            INPUT_CHANNELS,
-            BOARD_SIZE,
-            BOARD_SIZE,
-        ]);
+        (states, target_policies, target_values)
+    }
 
-        let policy_target = Tensor::<1>::from_floats(target_policies.as_slice(), autodiff_device)
-            .reshape([batch_size, NUM_POSITIONS]);
-
-        let value_target = Tensor::<1>::from_floats(target_values.as_slice(), autodiff_device)
-            .reshape([batch_size, 1]);
-
+    /// 单步训练：前向传播 → 计算损失 → 反向传播
+    ///
+    /// 这是一个纯函数，只负责张量计算。数据增强和批处理由调用方负责。
+    ///
+    /// ## 损失函数
+    ///
+    /// 总损失 = 策略损失 + value_weight × 价值损失
+    ///
+    /// - **策略损失（交叉熵）**：`-Σ target_p * log(softmax(logits))`
+    ///   MCTS 搜索得到的策略分布作为目标，引导网络学会输出更准确的先验概率。
+    ///
+    /// - **价值损失（MSE）**：`(pred_value - actual_outcome)²`
+    ///   让网络学会准确评估当前局面的胜负概率。
+    fn train_step(
+        model: &GomokuNetwork,
+        state_tensor: Tensor<4>,
+        policy_target: Tensor<2>,
+        value_target: Tensor<2>,
+        value_weight: f32,
+        autodiff_device: &Device,
+    ) -> Tensor<1> {
         let (policy_logits, value_pred) = model.forward(state_tensor);
 
         // 策略损失：交叉熵
