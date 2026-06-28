@@ -1,9 +1,9 @@
 use burn::module::Module;
 use clap::{Parser, Subcommand};
-use gobang_ai::network::residual::GobangNetwork;
+use gomoku_ai::network::residual::GomokuNetwork;
 
 #[derive(Parser)]
-#[command(name = "gobang-ai")]
+#[command(name = "gomoku-ai")]
 #[command(about = "五子棋 AI — AlphaZero 训练与推理")]
 struct Cli {
     #[command(subcommand)]
@@ -50,7 +50,7 @@ enum Command {
         simulations: usize,
 
         /// 模型文件路径（.bpk）
-        #[arg(short = 'm', long, default_value = "checkpoints/gobang_latest")]
+        #[arg(short = 'm', long, default_value = "checkpoints/gomoku_latest")]
         model_path: String,
     },
 }
@@ -68,10 +68,10 @@ fn main() {
             model_dir,
             save_every,
         } => {
-            println!("=== Gobang AI (AlphaZero) - Training ===\n");
+            println!("=== Gomoku AI (AlphaZero) - Training ===\n");
 
             let device = burn::tensor::Device::default();
-            let config = gobang_ai::training::TrainConfig {
+            let config = gomoku_ai::training::TrainConfig {
                 num_simulations: simulations,
                 games_per_iteration: games,
                 batch_size,
@@ -82,7 +82,7 @@ fn main() {
                 save_every,
                 model_dir: model_dir.into(),
             };
-            let mut trainer = gobang_ai::training::Trainer::new(config, device);
+            let mut trainer = gomoku_ai::training::Trainer::new(config, device);
             trainer.train();
         }
 
@@ -95,7 +95,7 @@ fn main() {
 
             if !path.exists() {
                 eprintln!("Error: model file not found: {}", path.display());
-                eprintln!("Run 'gobang-ai train' first to create a model.");
+                eprintln!("Run 'gomoku-ai train' first to create a model.");
                 std::process::exit(1);
             }
 
@@ -103,10 +103,10 @@ fn main() {
                 eprintln!("Error: failed to load model: {}", e);
                 std::process::exit(1);
             });
-            let model = GobangNetwork::new(&device).load_record(record);
+            let model = GomokuNetwork::new(&device).load_record(record);
 
             println!("Model loaded. Starting game...");
-            gobang_ai::game::play::play_game(&model, &device, simulations);
+            gomoku_ai::game::play::play_game(&model, &device, simulations);
         }
     }
 }

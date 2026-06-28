@@ -20,7 +20,7 @@
 //! visit_count 之和为分母）；根的 visit_count 仅用于性能观测。
 
 use crate::game::board::{Board, ENCODE_CHANNELS, NUM_POSITIONS};
-use crate::network::residual::{BOARD_SIZE, GobangNetwork, INPUT_CHANNELS, POLICY_OUT};
+use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS, POLICY_OUT};
 use burn::tensor::{Device, Tensor};
 use rayon::prelude::*;
 
@@ -159,7 +159,7 @@ impl MCTS {
     pub fn search(
         &mut self,
         board: &mut Board,
-        network: &GobangNetwork,
+        network: &GomokuNetwork,
         device: &Device,
         num_simulations: usize,
         temperature: f32,
@@ -185,8 +185,10 @@ impl MCTS {
             ]);
             network.forward(state)
         };
-        let policy_probs =
-            self.masked_softmax(&policy_logits.clone().reshape([POLICY_OUT]), &legal_moves);
+        let policy_probs = {
+            let policy_bytes = policy_logits.into_data().to_vec::<f32>().unwrap();
+            Self::softmax_legal(&policy_bytes, &legal_moves)
+        };
         let root_value: f32 = value.reshape([1]).into_scalar();
 
         // 展开根节点（带 Dirichlet 噪声）
@@ -300,7 +302,7 @@ impl MCTS {
         &mut self,
         num_simulations: usize,
         board: &mut Board,
-        network: &GobangNetwork,
+        network: &GomokuNetwork,
         device: &Device,
         legal: &mut Vec<(usize, usize)>,
     ) {
@@ -427,19 +429,23 @@ impl MCTS {
 
                     let (policy_logits, values) = network.forward(state_tensor);
 
+                    // 一次性转换为 CPU Vec，避免循环内逐个 clone+slice Tensor
+                    let policy_flat: Vec<f32> = policy_logits.into_data().to_vec::<f32>().unwrap();
+                    let values_flat: Vec<f32> = values.into_data().to_vec::<f32>().unwrap();
+
                     // 处理每个评估结果
                     for (bi, &si) in eval_indices.iter().enumerate() {
                         let node_idx = sims[si].path.last().map(|&(_, _, ci)| ci).unwrap_or(0);
 
-                        let val: f32 = values.clone().slice([bi..bi + 1]).into_scalar();
+                        let val: f32 = values_flat[bi];
 
-                        // 掩码 softmax
+                        // 掩码 softmax：直接在 &[f32] 切片上计算
                         sims[si].board.fill_legal_moves(legal);
-                        let logit_slice = policy_logits
-                            .clone()
-                            .slice([bi..bi + 1])
-                            .reshape([POLICY_OUT]);
-                        let probs = self.masked_softmax(&logit_slice, legal);
+                        let logit_start = bi * POLICY_OUT;
+                        let probs = Self::softmax_legal(
+                            &policy_flat[logit_start..logit_start + POLICY_OUT],
+                            legal,
+                        );
 
                         self.expand_node(node_idx, legal, &probs, None);
                         self.nodes[node_idx].expanded = true;
@@ -498,24 +504,25 @@ impl MCTS {
         }
     }
 
-    /// 掩码 Softmax：仅对合法走法计算概率分布。
+    /// CPU 原生的掩码 Softmax（无 tensor 依赖）。
     ///
-    /// `legal` 是当前棋盘的所有合法走法列表。
-    /// 先取合法走法中 logit 的最大值做数值稳定，再 exp + 归一化。
+    /// 供热循环批量评估使用，避免逐元素 clone Tensor 导致的 GPU↔CPU 同步开销。
+    /// `logits` 是一整行（225 维）的策略 logit 切片，`legal` 是当前局面的合法走法。
+    ///
     /// 如果所有合法走法的 logit 都极小（sum ≈ 0），退化为均匀分布。
-    fn masked_softmax(&self, logits: &Tensor<1>, legal: &[(usize, usize)]) -> Vec<f32> {
-        let bytes = logits.clone().into_data().to_vec::<f32>().unwrap();
-
+    #[inline]
+    fn softmax_legal(logits: &[f32], legal: &[(usize, usize)]) -> Vec<f32> {
+        // 数值稳定：先取合法走法中的最大 logit
         let max_logit = legal
             .iter()
-            .map(|&(r, c)| bytes[Board::pos_to_idx(r, c)])
+            .map(|&(r, c)| logits[Board::pos_to_idx(r, c)])
             .fold(f32::NEG_INFINITY, f32::max);
 
         let mut probs = vec![0.0f32; NUM_POSITIONS];
         let mut sum = 0.0f32;
         for &(r, c) in legal {
             let idx = Board::pos_to_idx(r, c);
-            let exp = (bytes[idx] - max_logit).exp();
+            let exp = (logits[idx] - max_logit).exp();
             probs[idx] = exp;
             sum += exp;
         }
@@ -682,14 +689,10 @@ mod tests {
 
     #[test]
     fn test_masked_softmax_all_legal() {
-        let mcts = MCTS::new();
         let board = Board::new();
-        let device = Device::default();
-
         let legal = board.legal_moves();
         let data = vec![0.0f32; NUM_POSITIONS];
-        let logits = Tensor::<1>::from_floats(data.as_slice(), &device);
-        let probs = mcts.masked_softmax(&logits, &legal);
+        let probs = MCTS::softmax_legal(&data, &legal);
         assert_eq!(probs.len(), NUM_POSITIONS);
         let expected = 1.0 / NUM_POSITIONS as f32;
         for (i, &p) in probs.iter().enumerate() {
@@ -702,9 +705,7 @@ mod tests {
 
     #[test]
     fn test_masked_softmax_partial_legal() {
-        let mcts = MCTS::new();
         let mut board = Board::new();
-        let device = Device::default();
 
         board.play(7, 7);
         board.play(7, 8);
@@ -712,8 +713,7 @@ mod tests {
         assert_eq!(legal.len(), NUM_POSITIONS - 2);
 
         let data = vec![1.0f32; NUM_POSITIONS];
-        let logits = Tensor::<1>::from_floats(data.as_slice(), &device);
-        let probs = mcts.masked_softmax(&logits, &legal);
+        let probs = MCTS::softmax_legal(&data, &legal);
         let expected = 1.0 / legal.len() as f32;
 
         for (i, &p) in probs.iter().enumerate() {

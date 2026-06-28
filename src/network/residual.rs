@@ -29,14 +29,14 @@ pub const POLICY_OUT: usize = BOARD_SIZE * BOARD_SIZE;
 // ============================================================
 
 #[derive(Debug, Clone)]
-pub struct GobangNetworkConfig {
+pub struct GomokuNetworkConfig {
     pub input_channels: usize,
     pub board_size: usize,
     pub num_res_blocks: usize,
     pub res_channels: usize,
 }
 
-impl Default for GobangNetworkConfig {
+impl Default for GomokuNetworkConfig {
     fn default() -> Self {
         Self {
             input_channels: INPUT_CHANNELS,
@@ -106,7 +106,7 @@ impl ResidualBlock {
 // ============================================================
 
 #[derive(Module, Debug)]
-pub struct GobangNetwork {
+pub struct GomokuNetwork {
     conv_in: Conv2d,
     bn_in: BatchNorm,
     res_blocks: Vec<ResidualBlock>,
@@ -119,9 +119,9 @@ pub struct GobangNetwork {
     value_fc2: Linear,
 }
 
-impl GobangNetwork {
+impl GomokuNetwork {
     pub fn new(device: &Device) -> Self {
-        Self::with_config(&GobangNetworkConfig::default(), device)
+        Self::with_config(&GomokuNetworkConfig::default(), device)
     }
 
     /// 根据配置构建 AlphaZero 网络。
@@ -133,7 +133,7 @@ impl GobangNetwork {
     /// - **价值头**：先用 1×1 卷积降维到 1 通道，展平后经 64 维隐藏层到标量价值
     ///
     /// 两个输出头共享残差骨干网络，确保特征表示同时服务于走子决策和局势评估。
-    pub fn with_config(config: &GobangNetworkConfig, device: &Device) -> Self {
+    pub fn with_config(config: &GomokuNetworkConfig, device: &Device) -> Self {
         let board_sq = config.board_size * config.board_size;
         let res_c = config.res_channels;
 

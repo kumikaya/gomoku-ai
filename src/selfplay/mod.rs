@@ -4,7 +4,7 @@
 
 use crate::game::board::{Board, Color};
 use crate::mcts::node::MCTS;
-use crate::network::residual::GobangNetwork;
+use crate::network::residual::GomokuNetwork;
 use burn::tensor::Device;
 
 #[derive(Clone, Debug)]
@@ -58,7 +58,7 @@ impl Default for SelfPlayConfig {
 /// 前 `temperature_decay_steps` 步使用 temperature=1.0 做概率采样，
 /// 之后用极低温度（≈1e-6）做确定性选择。这是 AlphaZero 的标准做法：
 /// 前期鼓励探索产生多样化数据，后期确保高质量终局。
-pub fn self_play(network: &GobangNetwork, config: &SelfPlayConfig, device: Device) -> SelfPlayGame {
+pub fn self_play(network: &GomokuNetwork, config: &SelfPlayConfig, device: Device) -> SelfPlayGame {
     let mut board = Board::new();
     let mut mcts = MCTS::new();
     let mut records = Vec::new();

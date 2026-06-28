@@ -3,7 +3,7 @@
 //! 自对弈 → 收集数据 → 采样训练（含 D4 数据增强） → 更新参数 → 重复。
 
 use crate::game::board::{D4Symmetry, NUM_POSITIONS};
-use crate::network::residual::{BOARD_SIZE, GobangNetwork, INPUT_CHANNELS};
+use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS};
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 
 use burn::module::Module;
@@ -64,17 +64,17 @@ impl Trainer {
 
     /// 模型文件路径（不含扩展名，Burn 会自动加 .bpk）
     fn model_path(&self, label: &str) -> PathBuf {
-        self.config.model_dir.join(format!("gobang_{}", label))
+        self.config.model_dir.join(format!("gomoku_{}", label))
     }
 
     /// 从磁盘加载模型（若存在），否则创建新模型。
-    fn load_or_create_model(&self, autodiff_device: &Device) -> GobangNetwork {
+    fn load_or_create_model(&self, autodiff_device: &Device) -> GomokuNetwork {
         // 尝试加载 latest 模型
         let latest_path = self.model_path("latest");
         if latest_path.exists() {
             if let Ok(record) = ModuleRecord::load(&latest_path) {
                 println!("Loaded existing model from disk.");
-                return GobangNetwork::new(autodiff_device).load_record(record);
+                return GomokuNetwork::new(autodiff_device).load_record(record);
             }
         }
 
@@ -83,16 +83,16 @@ impl Trainer {
         if init_path.exists() {
             if let Ok(record) = ModuleRecord::load(&init_path) {
                 println!("Loaded initial model from disk.");
-                return GobangNetwork::new(autodiff_device).load_record(record);
+                return GomokuNetwork::new(autodiff_device).load_record(record);
             }
         }
 
         println!("Creating new model.");
-        GobangNetwork::new(autodiff_device)
+        GomokuNetwork::new(autodiff_device)
     }
 
-    /// 保存模型到 `checkpoints/gobang_{label}.bpk`
-    fn save_model(&self, model: &GobangNetwork, label: &str) {
+    /// 保存模型到 `checkpoints/gomoku_{label}.bpk`
+    fn save_model(&self, model: &GomokuNetwork, label: &str) {
         let path = self.model_path(label);
         // valid() 去除 autodiff 追踪后才能保存到磁盘
         if let Err(e) = model.clone().valid().save_file(&path) {
@@ -249,7 +249,7 @@ impl Trainer {
     /// 训练时对每个样本以 50% 概率应用随机 D4 变换（旋转/翻转），
     /// 等价于将训练数据扩充 8 倍。五子棋在这些变换下保持局面不变性。
     fn train_step(
-        model: &GobangNetwork,
+        model: &GomokuNetwork,
         batch: &[PlayRecord],
         value_weight: f32,
         autodiff_device: &Device,

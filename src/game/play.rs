@@ -7,7 +7,7 @@ use std::io;
 
 use crate::game::board::{BOARD_SIZE, Board, Color, NUM_POSITIONS};
 use crate::mcts::node::MCTS;
-use crate::network::residual::GobangNetwork;
+use crate::network::residual::GomokuNetwork;
 use burn::tensor::Device;
 
 use crossterm::{
@@ -22,7 +22,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
-pub fn play_game(model: &GobangNetwork, device: &Device, num_simulations: usize) {
+pub fn play_game(model: &GomokuNetwork, device: &Device, num_simulations: usize) {
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).unwrap();
@@ -53,7 +53,7 @@ struct GameState {
 
 fn run_game_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    model: &GobangNetwork,
+    model: &GomokuNetwork,
     device: &Device,
     num_simulations: usize,
 ) -> io::Result<()> {
@@ -123,7 +123,7 @@ fn run_game_loop(
     }
 }
 
-fn ai_move(state: &mut GameState, model: &GobangNetwork, device: &Device, num_simulations: usize) {
+fn ai_move(state: &mut GameState, model: &GomokuNetwork, device: &Device, num_simulations: usize) {
     let result = state.mcts.search(
         &mut state.board,
         model,

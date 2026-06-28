@@ -1,5 +1,5 @@
 [package]
-name = "gobang-ai"
+name = "gomoku-ai"
 version = "0.1.0"
 edition = "2024"
 
