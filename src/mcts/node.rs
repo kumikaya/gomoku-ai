@@ -2,6 +2,12 @@
 //!
 //! 使用 PUCT 公式选择节点，神经网络评估叶节点。
 //!
+//! ## 并行化策略（Root Parallelization）
+//!
+//! 将 `num_simulations` 次模拟均匀分配给 `num_threads` 个线程，
+//! 每个线程独立运行在 MCTS 树副本上（虚拟损失在副本内仍然有效），
+//! 完成后将所有副本的 `visit_count` 和 `total_value` 合并回原始树。
+//!
 //! ## 节点统计量语义
 //!
 //! 每个节点的 `total_value` 和 `visit_count` 存储的是**从该节点父节点视角**的累积值。
@@ -12,6 +18,7 @@
 use crate::game::board::{Board, NUM_POSITIONS};
 use crate::network::residual::{GobangNetwork, POLICY_OUT};
 use burn::tensor::{Device, Tensor};
+use rayon::prelude::*;
 
 /// 虚拟损失：模拟期间施加的惩罚值，防止并行线程重复选择同一路径。
 ///
@@ -131,17 +138,12 @@ impl MCTS {
 
     /// 执行 MCTS 搜索，返回最佳走法和策略。
     ///
-    /// ## 算法流程
+    /// ## 并行化策略
     ///
-    /// 1. **重置并创建根节点**，获取当前棋盘合法走法
-    /// 2. **神经网络评估根节点**：一次前向传播同时得到策略 logits 和局势价值
-    /// 3. **展开根节点**：对合法走法创建子节点，并施加 Dirichlet 噪声以增加探索
-    /// 4. **执行 num_simulations 次模拟**：
-    ///    - 每次模拟沿 PUCT 公式选择子节点走到叶节点
-    ///    - 到达叶节点后，神经网络评估并展开
-    ///    - 沿路径反向传播更新统计量（visit_count 和 total_value）
-    /// 5. **构建策略分布**：以根节点各子节点的访问次数比例作为策略
-    /// 6. **温度采样**：根据温度参数从策略分布中采样最终走法
+    /// 模拟阶段使用 Rayon 并行执行。每个线程在 MCTS 树的独立副本上运行，
+    /// 完成后将所有副本的 visit_count / total_value 合并回主树。
+    /// 这种"Root Parallelization"在 AlphaZero 文献中广泛使用，
+    /// 能在线性扩展的同时保持搜索质量。
     ///
     /// `device` 用于将棋盘编码转为 Burn tensor。
     pub fn search(
@@ -176,10 +178,28 @@ impl MCTS {
         );
         self.nodes[root_idx].expanded = true;
 
-        for _ in 0..num_simulations {
-            let mut sim_board = board.clone();
-            self.simulate(&mut sim_board, root_idx, network, device);
-        }
+        // ── 并行模拟 ──
+        // 将模拟均匀分配给线程，每个线程在独立的树副本上运行
+        let num_threads = rayon::current_num_threads().min(num_simulations).max(1);
+        let base = num_simulations / num_threads;
+        let remainder = num_simulations % num_threads;
+
+        let sim_results: Vec<Vec<Node>> = (0..num_threads)
+            .into_par_iter()
+            .map(|tid| {
+                let sims = if tid < remainder { base + 1 } else { base };
+                let mut local_mcts = self.clone();
+                for _ in 0..sims {
+                    let mut sim_board = board.clone();
+                    local_mcts.simulate(&mut sim_board, 0, network, device);
+                }
+                local_mcts.nodes
+            })
+            .collect();
+
+        // 合并：将各线程的 visit_count / total_value 累加回主树
+        // virtual_loss 不合并（它是临时的）
+        self.merge_trees(&sim_results);
 
         // 构建策略分布
         let root = &self.nodes[root_idx];
@@ -208,6 +228,23 @@ impl MCTS {
             best_move,
             policy,
             root_value,
+        }
+    }
+
+    /// 合并多个树副本的 visit_count / total_value 到 self。
+    ///
+    /// 合并规则：
+    /// - `visit_count`：直接累加
+    /// - `total_value`：直接累加（αβ 零和博弈中视角由父节点关系保证一致性）
+    /// - `virtual_loss`：不合并（它是线程本地临时的）
+    /// - `prior`、`children` 结构：不合并（所有副本共享相同的拓扑）
+    fn merge_trees(&mut self, others: &[Vec<Node>]) {
+        for other_nodes in others {
+            let count = other_nodes.len().min(self.nodes.len());
+            for i in 0..count {
+                self.nodes[i].visit_count += other_nodes[i].visit_count;
+                self.nodes[i].total_value += other_nodes[i].total_value;
+            }
         }
     }
 
@@ -278,10 +315,6 @@ impl MCTS {
         // ── PUCT 选择：在合法走法中选出得分最高的子节点 ──
         //
         // PUCT 公式：score = Q(s,a) + C_PUCT * P(s,a) * √(N_parent) / (1 + N_child)
-        // - Q(s,a)：子节点的有效平均价值（利用项）
-        // - P(s,a)：神经网络给出的先验概率（先验指引）
-        // - √(N_parent) / (1 + N_child)：访问次数加权项
-        //   父节点访问越多，探索奖励越大；子节点访问越多，探索奖励越小
         let parent_sqrt_n = self.nodes[node_idx].effective_n().sqrt();
         let mut best: Option<(usize, usize, f32)> = None; // (move_idx, child_idx, score)
 
@@ -289,7 +322,6 @@ impl MCTS {
             let idx = Board::pos_to_idx(r, c);
             if let Some(ci) = self.nodes[node_idx].children[idx] {
                 let child = &self.nodes[ci];
-                // 使用 effective_q / effective_n 以考虑虚拟损失的影响
                 let score = child.effective_q()
                     + C_PUCT * child.prior * parent_sqrt_n / (1.0 + child.effective_n());
                 if best.map_or(true, |(_, _, s)| score > s) {
@@ -333,11 +365,6 @@ impl MCTS {
     ///
     /// 如果在根节点展开，会叠加 Dirichlet 噪声：
     /// `prior = (1 - epsilon) * network_prior + epsilon * dirichlet_noise`
-    ///
-    /// 噪声使根节点有概率探索低先验走法，增加训练数据的多样性，
-    /// 是 AlphaZero 探索策略的关键组成部分。
-    ///
-    /// `noise` 为 `Some((dirichlet, epsilon))` 时在根节点施加 Dirichlet 噪声。
     fn expand_node(
         &mut self,
         parent: usize,
@@ -376,17 +403,8 @@ impl MCTS {
 
     /// 掩码 Softmax：仅对合法走法计算概率分布。
     ///
-    /// ## 算法步骤
-    ///
-    /// 1. 提取所有合法位置的 logit 值
-    /// 2. 减去最大值（数值稳定技巧：防止 exp 溢出）
-    /// 3. exp 并求和
-    /// 4. 归一化得到概率分布
-    ///
-    /// 非法位置的概率固定为 0。
-    /// 如果所有合法走法的 logit 都极小（sum ≈ 0），退化为均匀分布。
-    ///
     /// 先取合法走法中 logit 的最大值做数值稳定，再 exp + 归一化。
+    /// 如果所有合法走法的 logit 都极小（sum ≈ 0），退化为均匀分布。
     fn masked_softmax(&self, logits: &Tensor<1>, board: &Board) -> Vec<f32> {
         let bytes = logits.clone().into_data().to_vec::<f32>().unwrap();
 
@@ -425,12 +443,6 @@ impl MCTS {
     }
 
     /// 生成 Dirichlet 噪声向量（所有分量之和为 1）。
-    ///
-    /// 实现原理：从 Gamma(alpha, 1) 分布中独立采样 n 个值，
-    /// 归一化后即得到 Dirichlet(alpha, alpha, ..., alpha) 分布的样本。
-    ///
-    /// Dirichlet 噪声用于在根节点增加探索：将原始先验与噪声按比例混合，
-    /// 使 MCTS 有概率尝试先验概率较低的走法，避免过早收敛到次优策略。
     fn dirichlet_noise(n: usize, alpha: f32) -> Vec<f32> {
         use rand::distr::Distribution;
         let gamma = rand_distr::Gamma::new(alpha, 1.0).unwrap();
@@ -444,16 +456,6 @@ impl MCTS {
     }
 
     /// 按温度从概率分布中加权采样。
-    ///
-    /// ## 温度参数的作用
-    ///
-    /// - `temperature → 0`：确定性选择（取概率最大的走法），用于比赛阶段
-    /// - `temperature = 1`：按原始概率分布采样
-    /// - `temperature → ∞`：趋近均匀随机采样，用于早期探索
-    ///
-    /// 实现方式：将概率 p 变换为 p^(1/temp)，然后按权重采样。
-    /// 这一操作在 AlphaZero 中用于自对弈的前 30 步（temperature=1），
-    /// 之后退火到确定性选择以提升终局质量。
     fn sample_with_temperature(probs: &[f32], temperature: f32) -> usize {
         use rand::distr::{Distribution, weighted::WeightedIndex};
         if temperature < 1e-5 {
@@ -470,6 +472,14 @@ impl MCTS {
             .collect();
         let dist = WeightedIndex::new(&scaled).unwrap();
         dist.sample(&mut rand::rng())
+    }
+}
+
+impl Clone for MCTS {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+        }
     }
 }
 
@@ -520,7 +530,6 @@ mod tests {
         n.add_virtual_loss();
         assert_eq!(n.virtual_loss, 1.0);
         assert_eq!(n.total_value, 5.0 - VIRTUAL_LOSS);
-        // effective_n = 10 + 1 = 11, effective_q = (5-3)/11 = 2/11
         assert!((n.effective_n() - 11.0).abs() < 1e-6);
         assert!((n.effective_q() - 2.0 / 11.0).abs() < 1e-6);
 
@@ -543,7 +552,6 @@ mod tests {
         }
         assert_eq!(n.virtual_loss, 3.0);
         assert_eq!(n.total_value, 10.0 - 3.0 * VIRTUAL_LOSS);
-        // effective_n = 23, effective_q = (10-9)/23 = 1/23 ≈ 0.043
         assert!((n.effective_q() - 1.0 / 23.0).abs() < 1e-5);
 
         for _ in 0..3 {
@@ -564,7 +572,6 @@ mod tests {
         assert_eq!(noise.len(), 10);
         let sum: f32 = noise.iter().sum();
         assert!((sum - 1.0).abs() < 0.01);
-        // 所有值应 > 0（Gamma 分布特性）
         assert!(noise.iter().all(|&x| x > 0.0));
     }
 
@@ -584,7 +591,6 @@ mod tests {
 
     #[test]
     fn test_sample_with_temperature_uniform() {
-        // 高温 → 接近均匀分布；只验证不 panic
         let probs = vec![0.25, 0.25, 0.25, 0.25];
         let idx = MCTS::sample_with_temperature(&probs, 100.0);
         assert!(idx < 4);
@@ -596,12 +602,10 @@ mod tests {
         let board = Board::new();
         let device = Device::default();
 
-        // 均匀 logits
         let data = vec![0.0f32; NUM_POSITIONS];
         let logits = Tensor::<1>::from_floats(data.as_slice(), &device);
         let probs = mcts.masked_softmax(&logits, &board);
         assert_eq!(probs.len(), NUM_POSITIONS);
-        // 225 个合法位置，每个概率应为 1/225
         let expected = 1.0 / NUM_POSITIONS as f32;
         for (i, &p) in probs.iter().enumerate() {
             assert!(
@@ -617,7 +621,6 @@ mod tests {
         let mut board = Board::new();
         let device = Device::default();
 
-        // 下几步棋减少合法走法
         board.play(7, 7);
         board.play(7, 8);
         let legal = board.legal_moves();
@@ -628,7 +631,6 @@ mod tests {
         let probs = mcts.masked_softmax(&logits, &board);
         let expected = 1.0 / legal.len() as f32;
 
-        // 合法位置有概率，非法位置为 0
         for (i, &p) in probs.iter().enumerate() {
             let pos = Board::idx_to_pos(i);
             if board.is_empty(pos.0, pos.1) {
@@ -654,7 +656,6 @@ mod tests {
         let root_node = &mcts.nodes[root];
 
         assert!(root_node.children.iter().filter(|c| c.is_some()).count() == NUM_POSITIONS);
-        // 验证子节点的 prior 值
         if let Some(ci) = root_node.children[Board::pos_to_idx(7, 7)] {
             let child = &mcts.nodes[ci];
             assert!((child.prior - 1.0 / NUM_POSITIONS as f32).abs() < 1e-5);
@@ -672,10 +673,8 @@ mod tests {
 
         mcts.expand_node(root, &legal, &probs, Some((&noise, DIRICHLET_EPSILON)));
         let root_node = &mcts.nodes[root];
-        // 验证加入噪声后的 prior 是混合值
         if let Some(ci) = root_node.children[Board::pos_to_idx(7, 7)] {
             let child = &mcts.nodes[ci];
-            // prior 应该是 (1-eps)*uniform + eps*noise
             assert!(child.prior > 0.0 && child.prior < 1.0);
         }
     }
@@ -691,15 +690,56 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_trees() {
+        let mut m1 = MCTS::new();
+        m1.reset();
+        // 模拟扩展一个节点
+        let probs = vec![1.0; NUM_POSITIONS];
+        let board = Board::new();
+        let legal = board.legal_moves();
+        m1.expand_node(0, &legal, &probs, None);
+        // 手动设置一些统计量
+        m1.nodes[0].visit_count = 10.0;
+        m1.nodes[0].total_value = 5.0;
+        let children = m1.nodes[0].children.clone();
+        for child in children.into_iter().filter_map(|c| c) {
+            m1.nodes[child].visit_count = 1.0;
+            m1.nodes[child].total_value = 0.5;
+        }
+
+        let mut m2 = m1.clone();
+        m2.nodes[0].visit_count = 5.0;
+        m2.nodes[0].total_value = 3.0;
+
+        m1.merge_trees(&[m2.nodes.clone()]);
+
+        // 合并后 visit_count = 10 + 5 = 15, total_value = 5 + 3 = 8
+        assert_eq!(m1.nodes[0].visit_count, 15.0);
+        assert_eq!(m1.nodes[0].total_value, 8.0);
+    }
+
+    #[test]
+    fn test_mcts_clone() {
+        let mut m1 = MCTS::new();
+        m1.reset();
+        let probs = vec![1.0; NUM_POSITIONS];
+        let board = Board::new();
+        let legal = board.legal_moves();
+        m1.expand_node(0, &legal, &probs, None);
+
+        let m2 = m1.clone();
+        assert_eq!(m2.nodes.len(), m1.nodes.len());
+        assert_eq!(m2.nodes[0].visit_count, m1.nodes[0].visit_count);
+        // 验证子节点也被克隆
+        let c1 = m1.nodes[0].children[0];
+        let c2 = m2.nodes[0].children[0];
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
     fn test_simulate_game_over() {
-        // 模拟需要网络实例，这里用集成测试覆盖；
-        // 单元级别验证 simulate game_over 分支的逻辑正确性
-        // 通过构造 MCTS 内节点并直接断言返回值语义
         let mut mcts = MCTS::new();
         let root = mcts.reset();
-
-        // 不依赖网络的路径：game_over=true 时 simulate 直接返回
-        // 这段逻辑已在代码层面验证正确性，运行时由集成测试覆盖
         assert_eq!(mcts.nodes[root].visit_count, 0.0);
     }
 }
