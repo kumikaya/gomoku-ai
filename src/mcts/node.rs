@@ -413,10 +413,6 @@ impl MCTS {
         let bytes = logits.clone().into_data().to_vec::<f32>().unwrap();
 
         let legal = board.legal_moves();
-        let mut mask = vec![false; NUM_POSITIONS];
-        for &(r, c) in &legal {
-            mask[Board::pos_to_idx(r, c)] = true;
-        }
 
         let max_logit = legal
             .iter()

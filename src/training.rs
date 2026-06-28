@@ -12,6 +12,7 @@ use burn::{
     optim::{AdamConfig, GradientsParams},
     tensor::{Device, Tensor, activation::log_softmax},
 };
+use rayon::prelude::*;
 
 pub struct TrainConfig {
     pub num_simulations: usize,
@@ -83,25 +84,27 @@ impl Trainer {
                 self.config.num_iterations
             );
 
-            // 1. 自对弈 —— clone 出推理副本，原始模型保持在 autodiff 设备上
+            // 1. 自对弈 —— 并行执行多局游戏，克隆推理网络给每个线程
             let inference_network = model.clone().valid();
             println!("  Self-play: {} games...", self.config.games_per_iteration);
-            let mut all_records = Vec::new();
             let sp_config = SelfPlayConfig {
                 num_simulations: self.config.num_simulations,
                 temperature: 1.0,
                 temperature_decay_steps: 30,
             };
 
-            for _ in 0..self.config.games_per_iteration {
-                let game = self_play(&inference_network, &sp_config, self.device.clone());
-                println!(
-                    "    Game finished: {} steps, winner: {:?}",
-                    game.num_steps(),
-                    game.winner
-                );
-                all_records.extend(game.records);
-            }
+            let all_records: Vec<PlayRecord> = (0..self.config.games_per_iteration)
+                .into_par_iter()
+                .flat_map(|_| {
+                    let game = self_play(&inference_network, &sp_config, self.device.clone());
+                    println!(
+                        "    Game finished: {} steps, winner: {:?}",
+                        game.num_steps(),
+                        game.winner
+                    );
+                    game.records
+                })
+                .collect();
 
             self.replay_buffer.extend(all_records);
             let max_cap = 5000;
