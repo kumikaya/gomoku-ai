@@ -10,12 +10,16 @@
 //!
 //! ## 节点统计量语义
 //!
-//! 每个节点的 `total_value` 和 `visit_count` 存储的是**从该节点父节点视角**的累积值。
-//! 这样父节点的 PUCT 选择可以直接使用 `child.q()` 而无需取反。
+//! 每个节点的 `visit_count` 和 `total_value` 存储的是**父节点视角**下
+//! 选择该子节点的模拟统计：
+//! - `visit_count`: 有多少次模拟选择了该子节点（即父→子的边被穿越的次数）
+//! - `total_value`: 这些模拟从父节点视角累积的价值和
+//! - `Q = total_value / visit_count`：该边的平均价值
 //!
-//! 回溯时只更新子节点的统计量；父节点的 visit_count 同步递增即可。
+//! 父节点的 `visit_count` 不作为有效语义使用（策略归一化时以子节点
+//! visit_count 之和为分母）；根的 visit_count 仅用于性能观测。
 
-use crate::game::board::{Board, NUM_POSITIONS};
+use crate::game::board::{Board, ENCODE_CHANNELS, NUM_POSITIONS};
 use crate::network::residual::{BOARD_SIZE, GobangNetwork, INPUT_CHANNELS, POLICY_OUT};
 use burn::tensor::{Device, Tensor};
 use rayon::prelude::*;
@@ -46,15 +50,20 @@ const DIRICHLET_ALPHA: f32 = 0.3;
 /// 这一比例在 AlphaZero 原始论文中被证明能在探索和利用之间取得良好平衡。
 const DIRICHLET_EPSILON: f32 = 0.25;
 
+/// 获胜模拟的价值
+const WIN_VALUE: f32 = 1.0;
+/// 平局模拟的价值
+const DRAW_VALUE: f32 = 0.0;
+
 /// MCTS 树节点
 ///
 /// `virtual_loss` 记录当前有多少个模拟正在经过此节点（计数），
 /// 施加时同步从 `total_value` 减去 `VIRTUAL_LOSS`。
 #[derive(Clone)]
 pub struct Node {
-    /// 访问次数（从父节点视角的模拟次数）
+    /// 访问次数（父节点视角下该边被穿越的次数）
     pub visit_count: f32,
-    /// 累积价值（从父节点视角）
+    /// 累积价值（父节点视角）
     pub total_value: f32,
     /// 神经网络先验概率
     pub prior: f32,
@@ -166,7 +175,7 @@ impl MCTS {
         }
 
         let (policy_logits, value) = {
-            let mut buf = vec![0.0f32; 4 * NUM_POSITIONS];
+            let mut buf = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
             board.encode_into(&mut buf);
             let state = Tensor::<1>::from_floats(buf.as_slice(), device).reshape([
                 1,
@@ -211,9 +220,13 @@ impl MCTS {
         // virtual_loss 不合并（它是临时的）
         self.merge_trees(&sim_results);
 
-        // 构建策略分布
+        // 构建策略分布：以根节点各子节点 visit_count 之和为分母
         let root = &self.nodes[root_idx];
-        let sum_n = root.visit_count;
+        let sum_n: f32 = root
+            .children
+            .iter()
+            .filter_map(|c| c.map(|ci| self.nodes[ci].visit_count))
+            .sum();
         let mut policy = vec![0.0f32; NUM_POSITIONS];
         if sum_n > 0.0 {
             for (idx, child_opt) in root.children.iter().enumerate() {
@@ -277,6 +290,12 @@ impl MCTS {
     /// 3. 收集完一组后，将所有叶节点棋盘编码为 batch tensor
     /// 4. 一次网络前向得到所有叶节点的策略和价值
     /// 5. 展开各叶节点并按照各自 value 做反向传播
+    ///
+    /// ## 棋盘独立性
+    ///
+    /// 每个 `SimState` 持有自己的 `Board` 副本。由于模拟是步进式
+    /// （每个活跃模拟每轮只推进一步，而非深度优先），clone 的成本
+    /// 低于 undo/snapshot 的 replay 开销。
     fn simulate_batch(
         &mut self,
         num_simulations: usize,
@@ -288,8 +307,7 @@ impl MCTS {
         /// 批量评估上限。太小无法发挥批处理优势，太大增加延迟。
         const BATCH_CAP: usize = 32;
 
-        // 每个模拟独立维护路径栈：(node_idx, move_idx, child_idx)
-        // 用于反向传播
+        // 每个模拟独立维护路径栈和棋盘状态
         struct SimState {
             path: Vec<(usize, usize, usize)>, // (node, move, child)
             board: Board,
@@ -331,10 +349,9 @@ impl MCTS {
                     if sim.board.game_over {
                         // 终局：从当前玩家视角看，上一手获胜
                         let winner_val = match sim.board.winner {
-                            Some(_) => 1.0,
-                            None => 0.0,
+                            Some(_) => WIN_VALUE,
+                            None => DRAW_VALUE,
                         };
-                        // 反向传播
                         self.backprop_path(&sim.path, winner_val);
                         sim.done = true;
                         continue;
@@ -342,7 +359,7 @@ impl MCTS {
 
                     sim.board.fill_legal_moves(legal);
                     if legal.is_empty() {
-                        self.backprop_path(&sim.path, 0.0);
+                        self.backprop_path(&sim.path, DRAW_VALUE);
                         sim.done = true;
                         continue;
                     }
@@ -389,14 +406,15 @@ impl MCTS {
                 // ── 阶段 2: 批量网络评估 ──
                 if !eval_indices.is_empty() {
                     let n_eval = eval_indices.len();
-                    let mut batch_buffer: Vec<f32> = vec![0.0f32; n_eval * 4 * NUM_POSITIONS];
+                    let mut batch_buffer: Vec<f32> =
+                        vec![0.0f32; n_eval * ENCODE_CHANNELS * NUM_POSITIONS];
 
                     // 编码所有待评估棋盘
                     for (bi, &si) in eval_indices.iter().enumerate() {
-                        let offset = bi * 4 * NUM_POSITIONS;
-                        sims[si]
-                            .board
-                            .encode_into(&mut batch_buffer[offset..offset + 4 * NUM_POSITIONS]);
+                        let offset = bi * ENCODE_CHANNELS * NUM_POSITIONS;
+                        sims[si].board.encode_into(
+                            &mut batch_buffer[offset..offset + ENCODE_CHANNELS * NUM_POSITIONS],
+                        );
                     }
 
                     let state_tensor = Tensor::<1>::from_floats(batch_buffer.as_slice(), device)
@@ -436,8 +454,9 @@ impl MCTS {
 
     /// 沿路径反向传播结果。
     ///
-    /// value 从根模拟调用者的视角传入（路径起点的视角）。
-    /// 路径中每步翻转符号并撤销虚拟损失、更新统计量。
+    /// `value` 从根模拟调用者的视角传入（路径起点的视角）。
+    /// 路径中每步翻转符号、撤销虚拟损失，并更新**子节点**的统计量
+    /// （父节点 visit_count 不递增 — 策略归一化以子节点 visit_count 之和为分母）。
     fn backprop_path(&mut self, path: &[(usize, usize, usize)], mut value: f32) {
         // 从叶到根回溯
         for &(node_idx, _move_idx, child_idx) in path.iter().rev() {
@@ -445,12 +464,11 @@ impl MCTS {
             self.nodes[child_idx].remove_virtual_loss();
             self.nodes[node_idx].remove_virtual_loss();
 
-            // 累积统计量（从父节点视角）
+            // 累积统计量（仅子节点，从父节点视角）
             self.nodes[child_idx].visit_count += 1.0;
             self.nodes[child_idx].total_value += value;
-            self.nodes[node_idx].visit_count += 1.0;
 
-            // 向上翻转视角
+            // 向上翻转视角（零和博弈）
             value = -value;
         }
     }
@@ -808,5 +826,92 @@ mod tests {
         let mut mcts = MCTS::new();
         let root = mcts.reset();
         assert_eq!(mcts.nodes[root].visit_count, 0.0);
+    }
+
+    /// 验证 backprop 后子节点 visit_count 之和等于模拟次数
+    #[test]
+    fn test_backprop_visit_count_consistency() {
+        let mut mcts = MCTS::new();
+        let root = mcts.reset();
+        let board = Board::new();
+        let legal = board.legal_moves();
+        let probs = vec![1.0 / NUM_POSITIONS as f32; NUM_POSITIONS];
+        mcts.expand_node(root, &legal, &probs, None);
+
+        // 手动模拟 3 条路径，每条走 root → 某个 child
+        let children: Vec<usize> = mcts.nodes[root]
+            .children
+            .iter()
+            .take(3)
+            .filter_map(|&c| c)
+            .collect();
+
+        for &ci in &children {
+            let path = vec![(0, 0, ci)];
+            // root 赢了（value=1.0 从 root 视角）
+            mcts.backprop_path(&path, 1.0);
+        }
+
+        // 子节点 visit_count 之和应 = 3
+        let sum_n: f32 = mcts.nodes[root]
+            .children
+            .iter()
+            .filter_map(|&c| c.map(|ci| mcts.nodes[ci].visit_count))
+            .sum();
+        assert_eq!(sum_n, 3.0, "children visit_count should sum to num_sims");
+
+        // 被访问的 3 个 child 各被访问 1 次
+        for &ci in &children {
+            assert_eq!(mcts.nodes[ci].visit_count, 1.0);
+        }
+
+        // 策略分布：每个被访问子节点 = 1/3
+        for &ci in &children {
+            let policy = mcts.nodes[ci].visit_count / sum_n;
+            assert!((policy - 1.0 / 3.0).abs() < 1e-5);
+        }
+    }
+
+    /// 验证多层路径的 visit_count 一致性
+    #[test]
+    fn test_backprop_multilevel_consistency() {
+        let mut mcts = MCTS::new();
+        let root = mcts.reset();
+        let board = Board::new();
+        let legal = board.legal_moves();
+        let probs = vec![1.0 / NUM_POSITIONS as f32; NUM_POSITIONS];
+
+        // 展开 root → 选择第一个合法走法作为 child_a
+        mcts.expand_node(root, &legal, &probs, None);
+        let first_legal_idx = Board::pos_to_idx(legal[0].0, legal[0].1);
+        let child_a = mcts.nodes[root].children[first_legal_idx].unwrap();
+
+        // 展开 child_a → 选择它的第一个合法走法作为 grandchild
+        let mut board_a = board.clone();
+        board_a.play_idx(first_legal_idx);
+        let legal_a = board_a.legal_moves();
+        mcts.nodes[child_a].expanded = true;
+        mcts.expand_node(child_a, &legal_a, &probs, None);
+        let a_first_legal_idx = Board::pos_to_idx(legal_a[0].0, legal_a[0].1);
+        let gc = mcts.nodes[child_a].children[a_first_legal_idx].unwrap();
+
+        // 模拟路径 root → child_A → grandchild
+        let path = vec![
+            (0, first_legal_idx, child_a),
+            (child_a, a_first_legal_idx, gc),
+        ];
+        mcts.backprop_path(&path, 1.0);
+
+        // child_A 作为子节点被访问 1 次
+        assert_eq!(mcts.nodes[child_a].visit_count, 1.0);
+        // grandchild 被访问 1 次
+        assert_eq!(mcts.nodes[gc].visit_count, 1.0);
+        // root 子节点 visit_count 之和 = 1
+        let sum_n: f32 = mcts.nodes[root]
+            .children
+            .iter()
+            .filter_map(|&c| c.map(|ci| mcts.nodes[ci].visit_count))
+            .sum();
+        assert_eq!(sum_n, 1.0);
     }
 }

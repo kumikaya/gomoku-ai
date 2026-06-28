@@ -1,8 +1,8 @@
 //! AlphaZero 训练循环
 //!
-//! 自对弈 → 收集数据 → 采样训练 → 更新参数 → 重复。
+//! 自对弈 → 收集数据 → 采样训练（含 D4 数据增强） → 更新参数 → 重复。
 
-use crate::game::board::NUM_POSITIONS;
+use crate::game::board::{D4Symmetry, NUM_POSITIONS};
 use crate::network::residual::{BOARD_SIZE, GobangNetwork, INPUT_CHANNELS};
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 
@@ -243,6 +243,11 @@ impl Trainer {
     ///
     /// - **价值损失（MSE）**：`(pred_value - actual_outcome)²`
     ///   让网络学会准确评估当前局面的胜负概率。
+    ///
+    /// ## 数据增强
+    ///
+    /// 训练时对每个样本以 50% 概率应用随机 D4 变换（旋转/翻转），
+    /// 等价于将训练数据扩充 8 倍。五子棋在这些变换下保持局面不变性。
     fn train_step(
         model: &GobangNetwork,
         batch: &[PlayRecord],
@@ -254,10 +259,20 @@ impl Trainer {
         let mut states: Vec<f32> = Vec::with_capacity(batch_size * INPUT_CHANNELS * NUM_POSITIONS);
         let mut target_policies: Vec<f32> = Vec::with_capacity(batch_size * NUM_POSITIONS);
         let mut target_values: Vec<f32> = Vec::with_capacity(batch_size);
+        let mut rng = rand::rng();
+
+        // 以 50% 概率对每个样本做随机 D4 增强
+        const AUGMENT_IDENTITY_PROB: f32 = 0.50;
 
         for record in batch {
-            states.extend(&record.state);
-            target_policies.extend(&record.policy);
+            let (aug_state, aug_policy) = D4Symmetry::random_augment(
+                &record.state,
+                &record.policy,
+                &mut rng,
+                AUGMENT_IDENTITY_PROB,
+            );
+            states.extend(&aug_state);
+            target_policies.extend(&aug_policy);
             target_values.push(record.value);
         }
 

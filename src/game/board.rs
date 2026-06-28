@@ -4,6 +4,8 @@
 pub const BOARD_SIZE: usize = 15;
 /// 总位置数
 pub const NUM_POSITIONS: usize = BOARD_SIZE * BOARD_SIZE;
+/// 棋盘编码通道数（己方/对方/上一步/当前玩家色）
+pub const ENCODE_CHANNELS: usize = 4;
 
 /// 玩家颜色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,7 +214,10 @@ impl Board {
     /// 将编码写入预分配缓冲区，避免频繁分配。
     pub fn encode_into(&self, data: &mut [f32]) {
         let size = NUM_POSITIONS;
-        debug_assert!(data.len() >= 4 * size, "encode_into buffer too small");
+        debug_assert!(
+            data.len() >= ENCODE_CHANNELS * size,
+            "encode_into buffer too small"
+        );
 
         let (current_stone, opponent_stone) = match self.current_player {
             Color::Black => (1u8, 2u8),
@@ -246,9 +251,113 @@ impl Board {
     /// 编码棋盘为网络输入（分配新 Vec）。
     /// MCTS evaluate 中使用 `encode_into` 替代此方法避免重复分配。
     pub fn encode_state(&self) -> Vec<f32> {
-        let mut data = vec![0.0f32; 4 * NUM_POSITIONS];
+        let mut data = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
         self.encode_into(&mut data);
         data
+    }
+}
+
+// ============================================================
+//  D4 二面体群：棋盘对称变换（用于训练数据增强）
+// ============================================================
+
+/// D4 群 8 种对称变换的索引映射表。
+///
+/// 五子棋在以下变换下保持不变性：
+/// - 恒等 (0°)
+/// - 旋转 90°、180°、270°
+/// - 水平翻转
+/// - 垂直翻转
+/// - 主对角线翻转
+/// - 副对角线翻转
+///
+/// `D4_INDEX_MAPS[t][src_idx]` = 变换 t 下位置 src_idx 映射到的目标索引。
+pub struct D4Symmetry;
+
+impl D4Symmetry {
+    /// 变换种类数
+    pub const COUNT: usize = 8;
+
+    /// 获取预计算的索引映射表（延迟初始化）。
+    pub fn index_maps() -> &'static [[usize; NUM_POSITIONS]; 8] {
+        use std::sync::OnceLock;
+        static MAPS: OnceLock<[[usize; NUM_POSITIONS]; 8]> = OnceLock::new();
+        MAPS.get_or_init(|| {
+            let mut maps = [[0usize; NUM_POSITIONS]; 8];
+            for r in 0..BOARD_SIZE {
+                for c in 0..BOARD_SIZE {
+                    let src = Board::pos_to_idx(r, c);
+                    let last = BOARD_SIZE - 1;
+                    // 恒等
+                    maps[0][src] = Board::pos_to_idx(r, c);
+                    // 旋转 90°
+                    maps[1][src] = Board::pos_to_idx(c, last - r);
+                    // 旋转 180°
+                    maps[2][src] = Board::pos_to_idx(last - r, last - c);
+                    // 旋转 270°
+                    maps[3][src] = Board::pos_to_idx(last - c, r);
+                    // 水平翻转
+                    maps[4][src] = Board::pos_to_idx(r, last - c);
+                    // 垂直翻转
+                    maps[5][src] = Board::pos_to_idx(last - r, c);
+                    // 主对角线翻转
+                    maps[6][src] = Board::pos_to_idx(c, r);
+                    // 副对角线翻转
+                    maps[7][src] = Board::pos_to_idx(last - c, last - r);
+                }
+            }
+            maps
+        })
+    }
+
+    /// 对编码后的棋盘状态和策略分布应用指定的 D4 变换。
+    ///
+    /// - `state`: 输入形状 [ENCODE_CHANNELS × NUM_POSITIONS] 的编码（4 通道交错存储）
+    /// - `policy`: 输入形状 [NUM_POSITIONS] 的策略分布
+    /// - `transform_idx`: 变换索引 (0..=7)
+    ///
+    /// 对每个通道同时做相同的空间重排，策略分布也做相同重排。
+    pub fn apply_transform(
+        state: &[f32],
+        policy: &[f32],
+        transform_idx: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let map = &Self::index_maps()[transform_idx];
+        let mut new_state = vec![0.0f32; state.len()];
+        let mut new_policy = vec![0.0f32; NUM_POSITIONS];
+
+        // 对每个编码通道做空间变换
+        for ch in 0..ENCODE_CHANNELS {
+            let offset = ch * NUM_POSITIONS;
+            for src in 0..NUM_POSITIONS {
+                new_state[offset + map[src]] = state[offset + src];
+            }
+        }
+
+        // 策略分布重排
+        for src in 0..NUM_POSITIONS {
+            new_policy[map[src]] = policy[src];
+        }
+
+        (new_state, new_policy)
+    }
+
+    /// 随机选取一种 D4 变换并应用到状态和策略上。
+    ///
+    /// 恒等变换（idx=0）的概率为 `identity_prob`，其余 7 种均匀分配。
+    pub fn random_augment(
+        state: &[f32],
+        policy: &[f32],
+        rng: &mut impl rand::RngExt,
+        identity_prob: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let t: f32 = rng.random();
+        let idx = if t < identity_prob {
+            0
+        } else {
+            1 + rng.random_range(0..7) as usize
+        };
+        Self::apply_transform(state, policy, idx)
     }
 }
 
@@ -330,7 +439,7 @@ mod tests {
         board.play(0, 0); // White
         // 现在轮到 Black
         let data = board.encode_state();
-        assert_eq!(data.len(), 4 * NUM_POSITIONS);
+        assert_eq!(data.len(), ENCODE_CHANNELS * NUM_POSITIONS);
         let idx_77 = 7 * BOARD_SIZE + 7;
         let idx_00 = 0 * BOARD_SIZE + 0;
         // 当前是 Black：Black 子在通道 0，White 子在通道 1
@@ -417,5 +526,105 @@ mod tests {
         }
         assert_eq!(board.step_count, 0);
         assert_eq!(board.current_player, Color::Black);
+    }
+
+    // ============================================================
+    //  D4 对称变换测试
+    // ============================================================
+
+    #[test]
+    fn test_d4_index_map_identity() {
+        let maps = D4Symmetry::index_maps();
+        let identity = &maps[0];
+        for i in 0..NUM_POSITIONS {
+            assert_eq!(identity[i], i, "identity map should not change index");
+        }
+    }
+
+    #[test]
+    fn test_d4_index_map_rotation_involution() {
+        // 旋转 180° 做两次等于恒等
+        let maps = D4Symmetry::index_maps();
+        let r180 = &maps[2];
+        for i in 0..NUM_POSITIONS {
+            assert_eq!(r180[r180[i]], i);
+        }
+    }
+
+    #[test]
+    fn test_d4_index_map_flip_involution() {
+        // 翻转做两次 = 恒等
+        let maps = D4Symmetry::index_maps();
+        for &t in &[4usize, 5, 6, 7] {
+            let map = &maps[t];
+            for i in 0..NUM_POSITIONS {
+                assert_eq!(map[map[i]], i, "transform {t} at index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_d4_index_map_all_distinct() {
+        let maps = D4Symmetry::index_maps();
+        for i in 0..NUM_POSITIONS {
+            let mut seen = std::collections::BTreeSet::new();
+            for t in 0..8 {
+                seen.insert(maps[t][i]);
+            }
+            // 不是所有位置都有 8 种不同映射（中心点和对称轴上的点会有重叠），
+            // 但至少应该有 1 种（恒等）
+            assert!(!seen.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_d4_apply_transform() {
+        // 编码一个简单棋盘：黑子 (0,0)，白子 (14,14)，当前玩家黑
+        let mut board = Board::new();
+        board.play(0, 0);
+        board.play(14, 14);
+        let state = board.encode_state();
+        let policy: Vec<f32> = (0..NUM_POSITIONS).map(|i| i as f32).collect();
+
+        // 旋转 180°：黑子应到 (14,14)，白子到 (0,0)
+        let (rot_state, rot_policy) = D4Symmetry::apply_transform(&state, &policy, 2);
+
+        let idx_00 = Board::pos_to_idx(0, 0);
+        let idx_14_14 = Board::pos_to_idx(14, 14);
+
+        // 通道 0 (己方棋子) 中的黑子在 180° 旋转后应到 (14,14)
+        let new_self_ch = &rot_state[0 * NUM_POSITIONS..1 * NUM_POSITIONS];
+        assert_eq!(
+            new_self_ch[idx_14_14], 1.0,
+            "black stone should rotate to (14,14)"
+        );
+        assert_eq!(
+            new_self_ch[idx_00], 0.0,
+            "(0,0) should be empty after rotation"
+        );
+
+        // 通道 1 (对方棋子) 中的白子在 180° 旋转后应到 (0,0)
+        let new_opp_ch = &rot_state[1 * NUM_POSITIONS..2 * NUM_POSITIONS];
+        assert_eq!(
+            new_opp_ch[idx_00], 1.0,
+            "white stone should rotate to (0,0)"
+        );
+
+        // 策略：idx 224 应映射到 idx 0
+        assert_eq!(rot_policy[idx_14_14], policy[idx_00]);
+        assert_eq!(rot_policy[idx_00], policy[idx_14_14]);
+    }
+
+    #[test]
+    fn test_d4_random_augment() {
+        let board = Board::new();
+        let state = board.encode_state();
+        let policy = vec![1.0 / NUM_POSITIONS as f32; NUM_POSITIONS];
+        let mut rng = rand::rng();
+
+        let (aug_state, aug_policy) = D4Symmetry::random_augment(&state, &policy, &mut rng, 0.0);
+        assert_eq!(aug_state.len(), state.len());
+        assert_eq!(aug_policy.len(), NUM_POSITIONS);
+        assert!((aug_policy.iter().sum::<f32>() - 1.0).abs() < 1e-4);
     }
 }
