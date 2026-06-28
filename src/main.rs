@@ -1,4 +1,6 @@
+use burn::module::Module;
 use clap::{Parser, Subcommand};
+use gobang_ai::network::residual::GobangNetwork;
 
 #[derive(Parser)]
 #[command(name = "gobang-ai")]
@@ -40,6 +42,17 @@ enum Command {
         #[arg(long, default_value = "10")]
         save_every: usize,
     },
+
+    /// 人机对弈
+    Play {
+        /// MCTS 模拟次数
+        #[arg(short = 's', long, default_value = "800")]
+        simulations: usize,
+
+        /// 模型文件路径（.bpk）
+        #[arg(short = 'm', long, default_value = "checkpoints/gobang_latest")]
+        model_path: String,
+    },
 }
 
 fn main() {
@@ -71,6 +84,29 @@ fn main() {
             };
             let mut trainer = gobang_ai::training::Trainer::new(config, device);
             trainer.train();
+        }
+
+        Command::Play {
+            simulations,
+            model_path,
+        } => {
+            let device = burn::tensor::Device::default();
+            let path = std::path::PathBuf::from(&model_path);
+
+            if !path.exists() {
+                eprintln!("Error: model file not found: {}", path.display());
+                eprintln!("Run 'gobang-ai train' first to create a model.");
+                std::process::exit(1);
+            }
+
+            let record = burn::store::ModuleRecord::load(&path).unwrap_or_else(|e| {
+                eprintln!("Error: failed to load model: {}", e);
+                std::process::exit(1);
+            });
+            let model = GobangNetwork::new(&device).load_record(record);
+
+            println!("Model loaded. Starting game...");
+            gobang_ai::game::play::play_game(&model, &device, simulations);
         }
     }
 }

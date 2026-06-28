@@ -207,10 +207,10 @@ impl Trainer {
             let epoch = iteration + 1;
             if epoch % self.config.save_every == 0 || epoch == self.config.num_iterations {
                 self.save_model(&model, &format!("epoch_{}", epoch));
-                // 同时更新 latest
+                // 同时更新 latest — valid() 去 autodiff 后保存
                 model
                     .clone()
-                    .to_device(&self.device)
+                    .valid()
                     .save_file(self.model_path("latest"))
                     .unwrap_or_else(|e| eprintln!("Warning: failed to save latest: {}", e));
             }
