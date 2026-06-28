@@ -75,7 +75,7 @@ fn main() {
                 num_simulations: simulations,
                 games_per_iteration: games,
                 batch_size,
-                train_steps: 50,
+                epochs: 4,
                 num_iterations: iterations,
                 learning_rate,
                 value_loss_weight: 1.0,

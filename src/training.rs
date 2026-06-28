@@ -14,14 +14,18 @@ use burn::{
     store::ModuleRecord,
     tensor::{Device, Tensor, activation::log_softmax},
 };
+use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use std::path::PathBuf;
+
+const AUGMENT_IDENTITY_PROB: f32 = 0.75;
 
 pub struct TrainConfig {
     pub num_simulations: usize,
     pub games_per_iteration: usize,
     pub batch_size: usize,
-    pub train_steps: usize,
+    /// buffer 内每个样本被重复训练的遍数（默认 1）
+    pub epochs: usize,
     pub num_iterations: usize,
     pub learning_rate: f64,
     pub value_loss_weight: f32,
@@ -36,8 +40,8 @@ impl Default for TrainConfig {
         Self {
             num_simulations: 200,
             games_per_iteration: 4,
-            batch_size: 128,
-            train_steps: 25,
+            batch_size: 64,
+            epochs: 4,
             num_iterations: 100,
             learning_rate: 1e-3,
             value_loss_weight: 1.0,
@@ -54,9 +58,6 @@ pub struct Trainer {
 }
 
 impl Trainer {
-    /// 以 50% 概率保留原样（不做增强）
-    const AUGMENT_IDENTITY_PROB: f32 = 0.50;
-
     pub fn new(config: TrainConfig, device: Device) -> Self {
         Self {
             config,
@@ -67,7 +68,7 @@ impl Trainer {
 
     /// 模型文件路径（不含扩展名，Burn 会自动加 .bpk）
     fn model_path(&self, label: &str) -> PathBuf {
-        self.config.model_dir.join(format!("gomoku_{}", label))
+        self.config.model_dir.join(format!("gomoku_{}.bpk", label))
     }
 
     /// 从磁盘加载模型（若存在），否则创建新模型。
@@ -169,61 +170,91 @@ impl Trainer {
                 self.replay_buffer.drain(0..drain);
             }
 
-            // 2. 训练
+            // 2. 训练 —— PPO 风格：epoch 内遍历所有样本
+            let buffer_size = self.replay_buffer.len();
             println!(
-                "  Training: {} steps, buffer size={}",
-                self.config.train_steps,
-                self.replay_buffer.len()
+                "  Training: epochs={}, buffer size={}",
+                self.config.epochs, buffer_size
             );
 
-            let mut total_loss = 0.0;
-
-            for step in 0..self.config.train_steps {
-                let batch = Self::sample_batch(&self.replay_buffer, self.config.batch_size);
-                if batch.is_empty() {
-                    continue;
-                }
-
-                // 1. 数据增强 + 扁平化
-                let (aug_states, aug_policies, aug_values) = Self::augment_batch(&batch);
-                let batch_size = batch.len();
-
-                // 2. 构造张量
-                let state_tensor = Tensor::<1>::from_floats(aug_states.as_slice(), &train_device)
-                    .reshape([batch_size, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE]);
-                let policy_target =
-                    Tensor::<1>::from_floats(aug_policies.as_slice(), &train_device)
-                        .reshape([batch_size, NUM_POSITIONS]);
-                let value_target = Tensor::<1>::from_floats(aug_values.as_slice(), &train_device)
-                    .reshape([batch_size, 1]);
-
-                // 3. 前向 + 损失
-                let loss = Self::train_step(
-                    &model,
-                    state_tensor,
-                    policy_target,
-                    value_target,
-                    self.config.value_loss_weight,
-                    &train_device,
-                );
-
-                let scalar: f32 = loss.clone().into_scalar();
-                total_loss += scalar;
-
-                let grads = loss.backward();
-                let grads = GradientsParams::from_grads(grads, &model);
-                model = optim.step(self.config.learning_rate, model, grads);
-
-                if step % 5 == 0 {
-                    println!(
-                        "    Step {}: avg_loss={:.4}",
-                        step,
-                        total_loss / (step + 1) as f32
-                    );
-                }
+            if buffer_size == 0 {
+                println!("    Buffer empty, skipping training.");
+                continue;
             }
 
-            let avg_loss = total_loss / self.config.train_steps as f32;
+            let mut total_loss = 0.0;
+            let mut total_steps: usize = 0;
+
+            // 每轮开始时打乱缓冲区
+            let mut rng = rand::rng();
+
+            for epoch in 0..self.config.epochs {
+                self.replay_buffer.shuffle(&mut rng);
+
+                let mut epoch_loss = 0.0;
+                let mut epoch_steps: usize = 0;
+
+                for mini_batch in self.replay_buffer.chunks(self.config.batch_size) {
+                    // 1. 数据增强 + 扁平化
+                    let (aug_states, aug_policies, aug_values) = Self::augment_batch(mini_batch);
+                    let batch_size = mini_batch.len();
+
+                    // 2. 构造张量
+                    let state_tensor =
+                        Tensor::<1>::from_floats(aug_states.as_slice(), &train_device).reshape([
+                            batch_size,
+                            INPUT_CHANNELS,
+                            BOARD_SIZE,
+                            BOARD_SIZE,
+                        ]);
+                    let policy_target =
+                        Tensor::<1>::from_floats(aug_policies.as_slice(), &train_device)
+                            .reshape([batch_size, NUM_POSITIONS]);
+                    let value_target =
+                        Tensor::<1>::from_floats(aug_values.as_slice(), &train_device)
+                            .reshape([batch_size, 1]);
+
+                    // 3. 前向 + 损失
+                    let loss = Self::train_step(
+                        &model,
+                        state_tensor,
+                        policy_target,
+                        value_target,
+                        self.config.value_loss_weight,
+                        &train_device,
+                    );
+
+                    let scalar: f32 = loss.clone().into_scalar();
+                    epoch_loss += scalar;
+                    epoch_steps += 1;
+
+                    let grads = loss.backward();
+                    let grads = GradientsParams::from_grads(grads, &model);
+                    model = optim.step(self.config.learning_rate, model, grads);
+                }
+
+                let epoch_avg = if epoch_steps > 0 {
+                    epoch_loss / epoch_steps as f32
+                } else {
+                    0.0
+                };
+                println!(
+                    "    Epoch {}/{}: {} mini-batches, avg_loss={:.4}",
+                    epoch + 1,
+                    self.config.epochs,
+                    epoch_steps,
+                    epoch_avg
+                );
+
+                total_loss += epoch_loss;
+                total_steps += epoch_steps;
+            }
+
+            let avg_loss = if total_steps > 0 {
+                total_loss / total_steps as f32
+            } else {
+                0.0
+            };
             println!("  Average loss: {:.4}", avg_loss);
 
             // 定期保存
@@ -244,16 +275,6 @@ impl Trainer {
         println!("Training complete!");
     }
 
-    fn sample_batch(buffer: &[PlayRecord], batch_size: usize) -> Vec<PlayRecord> {
-        if buffer.is_empty() {
-            return vec![];
-        }
-        use rand::prelude::IndexedRandom;
-        let mut rng = rand::rng();
-        let actual = batch_size.min(buffer.len());
-        buffer.sample(&mut rng, actual).cloned().collect()
-    }
-
     /// 对一批样本做 D4 数据增强，转化为扁平浮点数组（供构造张量使用）。
     ///
     /// 以 50% 概率对每个样本保留原样，否则随机应用旋转/翻转。
@@ -271,7 +292,7 @@ impl Trainer {
                 &record.state,
                 &record.policy,
                 &mut rng,
-                Self::AUGMENT_IDENTITY_PROB,
+                AUGMENT_IDENTITY_PROB,
             );
             states.extend(&aug_state);
             target_policies.extend(&aug_policy);
