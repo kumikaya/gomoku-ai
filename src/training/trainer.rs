@@ -131,6 +131,12 @@ impl Trainer {
     /// ### 阶段二：训练
     ///
     /// 从缓冲区采样 → D4 增强 → f16 前向 → Loss Scaling → 反向传播 → 梯度更新。
+    ///
+    /// ### GPU 线程复用
+    ///
+    /// `InferenceServer` 在训练开始时创建一次，之后通过 `update_model()`
+    /// 热更新权重，不再每轮创建新 GPU 线程。这避免了 cubecl CUDA backend
+    /// 为每个线程分配独立的 workspace pool 导致显存线性增长。
     pub fn train(&mut self) {
         std::fs::create_dir_all(&self.config.model_dir).ok();
 
@@ -149,6 +155,9 @@ impl Trainer {
         // 保存初始模型
         self.save_model(&model, "initial");
 
+        // ── 创建 InferenceServer（全局复用，避免每轮新建 GPU 线程）──
+        let inference_server = InferenceServer::new(model.clone().valid(), self.device.clone());
+
         for iteration in 0..self.config.num_iterations {
             println!(
                 "========== Iteration {}/{} ==========",
@@ -157,7 +166,7 @@ impl Trainer {
             );
 
             // ── 1. 自对弈 ──
-            self.run_self_play(&model);
+            self.run_self_play(&inference_server);
 
             // ── 2. 训练 ──
             let buffer_size = self.replay_buffer.len();
@@ -189,6 +198,9 @@ impl Trainer {
             };
             println!("  Average loss: {:.4}", avg_loss);
 
+            // ── 训练后热更新 GPU 线程中的模型权重 ──
+            inference_server.update_model(model.clone().valid());
+
             // 定期保存
             let epoch = iteration + 1;
             if epoch % self.config.save_every == 0 || epoch == self.config.num_iterations {
@@ -208,9 +220,8 @@ impl Trainer {
 
     // ── 自对弈阶段 ──
 
-    /// 用当前 model 的快照创建 InferenceServer，并行自对弈，结果入队。
-    fn run_self_play(&mut self, model: &GomokuNetwork) {
-        let inference_server = InferenceServer::new(model.clone().valid(), self.device.clone());
+    /// 用 InferenceServer（复用同一个 GPU 线程）并行自对弈，结果入队。
+    fn run_self_play(&mut self, inference_server: &InferenceServer) {
         println!("  Self-play: {} games...", self.config.games_per_iteration);
 
         let sp_config = SelfPlayConfig {
@@ -222,7 +233,7 @@ impl Trainer {
         let all_records: Vec<PlayRecord> = (0..self.config.games_per_iteration)
             .into_par_iter()
             .flat_map(|_| {
-                let game = self_play(&inference_server, &sp_config);
+                let game = self_play(inference_server, &sp_config);
                 println!(
                     "    Game finished: {} steps, winner: {:?}",
                     game.num_steps(),
