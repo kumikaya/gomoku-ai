@@ -60,7 +60,7 @@ impl Default for SelfPlayConfig {
 /// 前期鼓励探索产生多样化数据，后期确保高质量终局。
 pub fn self_play(network: &GomokuNetwork, config: &SelfPlayConfig, device: Device) -> SelfPlayGame {
     let mut board = Board::new();
-    let mut mcts = MCTS::new();
+    let mcts = MCTS::new();
     let mut records = Vec::new();
 
     loop {

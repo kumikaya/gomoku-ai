@@ -13,7 +13,10 @@ burn = { git = "https://github.com/tracel-ai/burn.git", features = [
     "cuda",
 ], default-features = false }
 clap = { version = "4.6.1", features = ["derive"] }
+boxcar = "0.2"
+crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
+parking_lot = "0.12"
 rand = "0.10.1"
 rand_distr = "0.6.0"
 ratatui = "0.30.2"
