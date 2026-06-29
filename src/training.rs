@@ -67,8 +67,6 @@ pub struct Trainer {
     device: Device,
     /// 固定容量 FIFO 缓冲区（自动淘汰最旧数据）
     replay_buffer: VecDeque<PlayRecord>,
-    /// 自适应学习率倍率（根据 KL 散度动态调整）
-    lr_multiplier: f32,
 }
 
 impl Trainer {
@@ -77,7 +75,6 @@ impl Trainer {
             config,
             device,
             replay_buffer: VecDeque::new(),
-            lr_multiplier: 1.0,
         }
     }
 
@@ -194,8 +191,8 @@ impl Trainer {
             // ============================================================
             let buffer_size = self.replay_buffer.len();
             println!(
-                "  Training: epochs={}, buffer size={}, lr_multiplier={:.3}",
-                self.config.epochs, buffer_size, self.lr_multiplier
+                "  Training: epochs={}, buffer size={}",
+                self.config.epochs, buffer_size
             );
 
             if buffer_size < self.config.batch_size {
@@ -219,12 +216,12 @@ impl Trainer {
 
                 let mut epoch_loss = 0.0_f32;
                 let mut epoch_steps: usize = 0;
-                let mut epoch_kl_sum = 0.0_f32;
-                let mut epoch_kl_count: usize = 0;
+                let mut epoch_entropy_sum = 0.0_f32;
+                let mut epoch_entropy_count: usize = 0;
                 let mut all_value_preds: Vec<f32> = Vec::new();
                 let mut all_value_targets: Vec<f32> = Vec::new();
 
-                let epoch_effective_lr = self.config.learning_rate * self.lr_multiplier as f64;
+                let epoch_effective_lr = self.config.learning_rate;
                 let identity_prob = 1.0 / D4Symmetry::COUNT as f32;
                 for chunk in indices.chunks(self.config.batch_size) {
                     let mini_batch: Vec<PlayRecord> = chunk
@@ -268,9 +265,7 @@ impl Trainer {
                     let state_for_new = state_tensor.clone();
                     let (policy_logits, value_pred) = model.forward(state_tensor);
 
-                    // 保存旧策略分布用于 KL 计算（detach 切断 AD 计算图）
                     let log_probs = log_softmax(policy_logits.clone(), 1);
-                    let old_log_probs = log_probs.clone().detach();
 
                     // ---- 损失计算 ----
                     let policy_loss = -(log_probs * policy_target.clone()).sum_dim(1).mean();
@@ -296,14 +291,18 @@ impl Trainer {
                     let grads = GradientsParams::from_grads(grads, &model);
                     model = optim.step(epoch_effective_lr, model, grads);
 
-                    // ---- 新策略分布（更新后） + KL 散度 ----
+                    // ---- 新策略分布（更新后） + 熵 ----
                     let (new_policy_logits, new_value_pred) = model.forward(state_for_new);
-                    let new_log_probs = log_softmax(new_policy_logits, 1);
+                    let new_log_probs = log_softmax(new_policy_logits.clone(), 1);
 
-                    // old_log_probs 已 detach，不受后续参数更新影响
-                    let kl = Self::compute_kl(old_log_probs, new_log_probs);
-                    epoch_kl_sum += kl;
-                    epoch_kl_count += 1;
+                    // 策略熵 H = -Σ p * log p
+                    let probs = new_log_probs.clone().exp();
+                    let entropy: f32 = -(probs * new_log_probs)
+                        .sum_dim(1)
+                        .mean()
+                        .into_scalar::<f32>();
+                    epoch_entropy_sum += entropy;
+                    epoch_entropy_count += 1;
 
                     // 收集价值预测用于 explained variance
                     let new_val_pred: Vec<f32> = new_value_pred
@@ -313,17 +312,6 @@ impl Trainer {
                         .unwrap();
                     all_value_preds.extend(new_val_pred);
                     all_value_targets.extend(flat_values.iter());
-
-                    // ---- KL 早停 ----
-                    if kl > self.config.kl_targ * 4.0 {
-                        println!(
-                            "    Epoch {} early stop: KL={:.5} > kl_targ*4={:.5}",
-                            epoch + 1,
-                            kl,
-                            self.config.kl_targ * 4.0
-                        );
-                        break;
-                    }
                 }
 
                 let epoch_avg_loss = if epoch_steps > 0 {
@@ -332,8 +320,8 @@ impl Trainer {
                     0.0
                 };
 
-                let avg_kl = if epoch_kl_count > 0 {
-                    epoch_kl_sum / epoch_kl_count as f32
+                let avg_entropy = if epoch_entropy_count > 0 {
+                    epoch_entropy_sum / epoch_entropy_count as f32
                 } else {
                     0.0
                 };
@@ -341,36 +329,17 @@ impl Trainer {
                 let explained_var = Self::explained_variance(&all_value_preds, &all_value_targets);
 
                 println!(
-                    "    Epoch {}/{}: {} steps, avg_loss={:.4}, avg_kl={:.5}, explained_var={:.3}",
+                    "    Epoch {}/{}: {} steps, avg_loss={:.4}, explained_var={:.3}, avg_entropy={:.4}",
                     epoch + 1,
                     self.config.epochs,
                     epoch_steps,
                     epoch_avg_loss,
-                    avg_kl,
-                    explained_var
+                    explained_var,
+                    avg_entropy,
                 );
 
                 total_loss += epoch_loss;
                 total_steps += epoch_steps;
-
-                // ---- 自适应学习率 ----
-                if avg_kl > self.config.kl_targ * 2.0 && self.lr_multiplier > 0.1 {
-                    self.lr_multiplier /= 1.5;
-                    println!(
-                        "    lr_multiplier ↓ {:.3} (KL={:.5} > target*2={:.5})",
-                        self.lr_multiplier,
-                        avg_kl,
-                        self.config.kl_targ * 2.0
-                    );
-                } else if avg_kl < self.config.kl_targ / 2.0 && self.lr_multiplier < 10.0 {
-                    self.lr_multiplier *= 1.5;
-                    println!(
-                        "    lr_multiplier ↑ {:.3} (KL={:.5} < target/2={:.5})",
-                        self.lr_multiplier,
-                        avg_kl,
-                        self.config.kl_targ / 2.0
-                    );
-                }
             }
 
             let avg_loss = if total_steps > 0 {
@@ -415,21 +384,6 @@ impl Trainer {
         }
 
         (states, policies, values)
-    }
-
-    // ============================================================
-    //  KL 散度
-    // ============================================================
-
-    /// 计算两个策略分布之间的 KL 散度（标量）。
-    ///
-    /// KL(p_old || p_new) = Σ p_old * (log p_old - log p_new)
-    ///
-    /// 输入为 log-softmax 后的对数概率，形状 [batch, NUM_POSITIONS]。
-    fn compute_kl(old_log_probs: Tensor<2>, new_log_probs: Tensor<2>) -> f32 {
-        let old_probs = old_log_probs.clone().exp();
-        let kl_per_sample = (old_probs * (old_log_probs - new_log_probs)).sum_dim(1);
-        kl_per_sample.mean().into_scalar()
     }
 
     // ============================================================

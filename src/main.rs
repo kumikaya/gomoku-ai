@@ -75,10 +75,8 @@ fn main() {
                 num_simulations: simulations,
                 games_per_iteration: games,
                 batch_size,
-                epochs: 2,
                 num_iterations: iterations,
                 learning_rate,
-                value_loss_weight: 1.0,
                 save_every,
                 model_dir: model_dir.into(),
                 ..Default::default()
