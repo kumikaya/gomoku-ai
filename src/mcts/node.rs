@@ -23,9 +23,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::game::board::{Board, ENCODE_CHANNELS, NUM_POSITIONS};
-use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS, POLICY_OUT};
-use burn::tensor::{Device, Tensor};
-use rayon::prelude::*;
+use crate::inference::Evaluator;
 
 // ============================================================
 //  常量
@@ -203,15 +201,11 @@ pub struct SearchResult {
 
 // ── Evaluator / Worker 通信 ──
 
+/// Worker 提交的 leaf 评估请求（不携带 reply channel）
 struct LeafRequest {
     path: Vec<(usize, usize, usize)>,
     encoding: Vec<f32>,
     legal_moves_at_leaf: Vec<(usize, usize)>,
-    reply_tx: crossbeam_channel::Sender<LeafReply>,
-}
-
-struct LeafReply {
-    value: f32,
 }
 
 impl MCTS {
@@ -269,11 +263,10 @@ impl MCTS {
 
     // ── 公共搜索入口 ──
 
-    pub fn search(
+    pub fn search<E: Evaluator>(
         &self,
         board: &mut Board,
-        network: &GomokuNetwork,
-        device: &Device,
+        evaluator: &E,
         num_simulations: usize,
         temperature: f32,
     ) -> SearchResult {
@@ -287,23 +280,12 @@ impl MCTS {
             };
         }
 
-        // ── 根节点评估 ──
-        let (policy_logits, value) = {
-            let mut buf = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
-            board.encode_into(&mut buf);
-            let state = Tensor::<1>::from_floats(buf.as_slice(), device).reshape([
-                1,
-                INPUT_CHANNELS as i32,
-                BOARD_SIZE as i32,
-                BOARD_SIZE as i32,
-            ]);
-            network.forward(state)
-        };
-        let policy_probs = {
-            let policy_bytes = policy_logits.into_data().to_vec::<f32>().unwrap();
-            Self::softmax_legal(&policy_bytes, &legal_moves)
-        };
-        let root_value: f32 = value.reshape([1]).into_scalar();
+        // ── 根节点评估（通过 Evaluator，多对局时可被 InferenceServer 攒批）──
+        let mut root_encoding = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
+        board.encode_into(&mut root_encoding);
+        let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]);
+        let policy_probs = Self::softmax_legal(&root_logits[0], &legal_moves);
+        let root_value: f32 = root_values[0];
 
         let dirichlet = Self::dirichlet_noise(legal_moves.len(), DIRICHLET_ALPHA);
         self.expand_node(
@@ -312,37 +294,47 @@ impl MCTS {
             &policy_probs,
             Some((&dirichlet, DIRICHLET_EPSILON)),
         );
-        self.root().expanded.store(true, Ordering::Release);
+        self.root().expanded.store(true, Ordering::Relaxed);
 
-        // ── 并行模拟阶段 ──
+        // ── 并行模拟阶段，GPU forward 仅在主线程执行 ──
+        //
+        // 显存限制方案：让 cubecl CUDA backend 只被一个线程（主线程）使用，
+        // 避免为每个线程分配独立的 workspace pool。
+        //
+        // 主线程：接收 leaf → 攒 batch → GPU forward → 发结果到 result_tx
+        // worker pool (scoped): PUCT walk + 提交 leaf（纯 CPU，不碰 GPU）
+        // backprop 线程 (rayon): 消费 result → expand + backprop（纯 CPU）
         let (leaf_tx, leaf_rx) = crossbeam_channel::bounded::<LeafRequest>(BATCH_CAP * 4);
 
-        // 使用 scoped thread：evaluator 在独立线程运行，workers 通过 rayon 并发
-        // 所有 channel sender 的生命周期由 move closure 管理
-        std::thread::scope(move |s| {
-            // Evaluator 线程：拥有 leaf_rx，攒 batch 做 forward
-            s.spawn(move || {
-                Self::evaluator_run(self, leaf_rx, network, device);
-            });
+        let num_workers = rayon::current_num_threads().min(num_simulations).max(1);
 
-            // Worker 池（rayon，阻塞直到全部完成）
-            let num_workers = rayon::current_num_threads().min(num_simulations).max(1);
+        std::thread::scope(|s| {
             let sims_per_worker = num_simulations / num_workers;
             let remainder = num_simulations % num_workers;
 
-            (0..num_workers).into_par_iter().for_each(|tid| {
+            // 克隆 leaf_tx 给每个 worker
+            for tid in 0..num_workers {
                 let sims = if tid < remainder {
                     sims_per_worker + 1
                 } else {
                     sims_per_worker
                 };
+                let leaf_tx = leaf_tx.clone();
                 let mut sim_board = board.clone();
-                let mut legal = Vec::with_capacity(NUM_POSITIONS);
-                self.worker_loop(sims, &mut sim_board, &mut legal, &leaf_tx);
-            });
+                s.spawn(move || {
+                    let mut legal = Vec::with_capacity(NUM_POSITIONS);
+                    self.worker_loop(sims, &mut sim_board, &mut legal, &leaf_tx);
+                });
+            }
 
-            // Workers 结束，显式丢弃最后一个 sender 以关闭 channel
+            // drop 原始 sender，只保留 worker 中的 clone。
+            // 当所有 worker 完成并 drop 各自的 sender 后，channel 关闭，
+            // evaluator_run 收到 Err 后退出。
             drop(leaf_tx);
+
+            // 主线程：evaluator + expand + backprop
+            // GPU forward 通过 Evaluator trait 委派给 InferenceServer
+            Self::evaluator_run(leaf_rx, evaluator, self);
         });
 
         // ── 构建策略分布 ──
@@ -380,8 +372,10 @@ impl MCTS {
         }
     }
 
-    // ── Worker：走树 + 提交叶子 + 等待回传 ──
-
+    // ── Worker 池：走树 + 提交叶子（不等回复，虚拟损失阻止冲突） ──
+    //
+    // 异步 continuation：到达未展开节点后，提交 leaf 请求并立即开始下一条模拟，
+    // 不再同步等待 NN 结果。虚拟损失确保并行 worker 不会踩踏同一路径。
     fn worker_loop(
         &self,
         num_sims: usize,
@@ -389,8 +383,6 @@ impl MCTS {
         legal: &mut Vec<(usize, usize)>,
         leaf_tx: &crossbeam_channel::Sender<LeafRequest>,
     ) {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded::<LeafReply>(1);
-
         for _ in 0..num_sims {
             let mut path: Vec<(usize, usize, usize)> = Vec::new();
             let mut sim_board = board.clone();
@@ -413,21 +405,19 @@ impl MCTS {
                 }
 
                 let node = self.node(node_idx);
-                if !node.expanded.load(Ordering::Acquire) {
-                    // 叶子：提交评估请求
+                if !node.expanded.load(Ordering::Relaxed) {
+                    // 叶子：编码棋盘 → 提交请求 → 立刻开始下一条模拟
                     let mut encoding = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
                     sim_board.encode_into(&mut encoding);
                     leaf_tx
                         .send(LeafRequest {
-                            path: path.clone(),
+                            path,
                             encoding,
-                            legal_moves_at_leaf: legal.clone(),
-                            reply_tx: reply_tx.clone(),
+                            legal_moves_at_leaf: std::mem::take(legal),
                         })
                         .expect("evaluator died");
-
-                    let reply = reply_rx.recv().expect("evaluator dropped reply");
-                    self.backprop_path(&path, -reply.value);
+                    // 不等回复！虚拟损失已加在路径上，其他 worker 会避开这条路径
+                    // path 的所有权已移交给 LeafRequest
                     break;
                 }
 
@@ -456,7 +446,7 @@ impl MCTS {
                     }
                 };
 
-                // 虚拟损失（原子）
+                // 虚拟损失（原子）—— 这是异步模型的核心保障
                 self.node(child_idx).add_virtual_loss();
                 node.add_virtual_loss();
 
@@ -467,24 +457,22 @@ impl MCTS {
         }
     }
 
-    // ── Evaluator：批量收集 + forward + 展开节点 ──
+    // ── Evaluator：批量收集 + GPU forward（不做 expand/backprop） ──
 
-    fn evaluator_run(
-        mcts: &MCTS,
+    /// Evaluator 阻塞收集 leaf → 攒 batch → 通过 Evaluator trait 评估 → expand + backprop
+    fn evaluator_run<E: Evaluator>(
         leaf_rx: crossbeam_channel::Receiver<LeafRequest>,
-        network: &GomokuNetwork,
-        device: &Device,
+        evaluator: &E,
+        mcts: &MCTS,
     ) {
         let mut batch: Vec<LeafRequest> = Vec::with_capacity(BATCH_CAP);
 
         loop {
-            // 阻塞等待第一个请求
             match leaf_rx.recv() {
                 Ok(req) => batch.push(req),
                 Err(_) => break,
             }
 
-            // 在 BATCH_CAP 内尽量多收
             while batch.len() < BATCH_CAP {
                 match leaf_rx.recv_timeout(std::time::Duration::from_micros(200)) {
                     Ok(req) => batch.push(req),
@@ -492,41 +480,37 @@ impl MCTS {
                 }
             }
 
-            let n = batch.len();
-            let mut buf = vec![0.0f32; n * ENCODE_CHANNELS * NUM_POSITIONS];
-            for (i, req) in batch.iter().enumerate() {
-                let off = i * ENCODE_CHANNELS * NUM_POSITIONS;
-                buf[off..off + ENCODE_CHANNELS * NUM_POSITIONS].copy_from_slice(&req.encoding);
-            }
+            // 收集编码，委托给 Evaluator（支持跨 MCTS 实例攒批）
+            let encodings: Vec<Vec<f32>> = batch.iter().map(|req| req.encoding.clone()).collect();
+            let (policies_batch, values_batch) = evaluator.evaluate_batch(&encodings);
 
-            let state = Tensor::<1>::from_floats(buf.as_slice(), device).reshape([
-                n as i32,
-                INPUT_CHANNELS as i32,
-                BOARD_SIZE as i32,
-                BOARD_SIZE as i32,
-            ]);
-            let (logits, values) = network.forward(state);
-            let policy_flat: Vec<f32> = logits.into_data().to_vec::<f32>().unwrap();
-            let values_flat: Vec<f32> = values.into_data().to_vec::<f32>().unwrap();
-
-            // 展开节点 + 分发结果
+            // 逐个 expand + backprop
             for (i, req) in batch.drain(..).enumerate() {
                 let leaf_node_idx = req.path.last().map(|&(_, _, c)| c).unwrap_or(0);
 
-                let probs = Self::softmax_legal(
-                    &policy_flat[i * POLICY_OUT..(i + 1) * POLICY_OUT],
-                    &req.legal_moves_at_leaf,
-                );
+                let probs = Self::softmax_legal(&policies_batch[i], &req.legal_moves_at_leaf);
 
                 mcts.expand_node(leaf_node_idx, &req.legal_moves_at_leaf, &probs, None);
                 mcts.node(leaf_node_idx)
                     .expanded
-                    .store(true, Ordering::Release);
+                    .store(true, Ordering::Relaxed);
 
-                let _ = req.reply_tx.send(LeafReply {
-                    value: values_flat[i],
-                });
+                mcts.backprop_path_internal(&req.path, -values_batch[i]);
             }
+        }
+    }
+
+    /// 内部 backprop（不移除虚拟损失，因为 worker 提交 leaf 时未加虚拟损失在叶子节点上）
+    ///
+    /// 虚拟损失已在 worker 的 PUCT 路径上加了，这里需要移除并加 visit。
+    fn backprop_path_internal(&self, path: &[(usize, usize, usize)], mut value: f32) {
+        for &(node_idx, _move_idx, child_idx) in path.iter().rev() {
+            let child = self.node(child_idx);
+            let parent = self.node(node_idx);
+            child.remove_virtual_loss();
+            parent.remove_virtual_loss();
+            child.add_visit(value);
+            value = -value;
         }
     }
 

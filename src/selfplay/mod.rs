@@ -3,9 +3,8 @@
 //! 使用 MCTS 指导双方走棋，生成 (状态, 策略, 价值) 训练样本。
 
 use crate::game::board::{Board, Color};
+use crate::inference::Evaluator;
 use crate::mcts::node::MCTS;
-use crate::network::residual::GomokuNetwork;
-use burn::tensor::Device;
 
 #[derive(Clone, Debug)]
 pub struct PlayRecord {
@@ -43,6 +42,9 @@ impl Default for SelfPlayConfig {
 
 /// 运行一局自对弈，生成 (状态, 策略, 价值) 训练样本。
 ///
+/// `evaluator` 可以是 `InferenceServer` 或其他 `Evaluator` 实现。
+/// 多局并发时可共享同一个 evaluator，GPU 线程自动跨对局攒批。
+///
 /// ## 自对弈流程
 ///
 /// 1. 初始化空白棋盘和 MCTS 搜索器
@@ -58,9 +60,8 @@ impl Default for SelfPlayConfig {
 /// 前 `temperature_decay_steps` 步使用 temperature=1.0 做概率采样，
 /// 之后用极低温度（≈1e-6）做确定性选择。这是 AlphaZero 的标准做法：
 /// 前期鼓励探索产生多样化数据，后期确保高质量终局。
-pub fn self_play(network: &GomokuNetwork, config: &SelfPlayConfig, device: Device) -> SelfPlayGame {
+pub fn self_play<E: Evaluator>(evaluator: &E, config: &SelfPlayConfig) -> SelfPlayGame {
     let mut board = Board::new();
-    let mcts = MCTS::new();
     let mut records = Vec::new();
 
     loop {
@@ -70,7 +71,9 @@ pub fn self_play(network: &GomokuNetwork, config: &SelfPlayConfig, device: Devic
             1e-6
         };
 
-        let result = mcts.search(&mut board, network, &device, config.num_simulations, t);
+        // 每步新建 MCTS，arena 在搜索结束后随 MCTS 一起释放
+        let mcts = MCTS::new();
+        let result = mcts.search(&mut board, evaluator, config.num_simulations, t);
 
         records.push(PlayRecord {
             state: board.encode_state(),

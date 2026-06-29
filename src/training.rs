@@ -4,6 +4,7 @@
 //! （KL 早停 + 自适应学习率） → 更新参数 → 重复。
 
 use crate::game::board::{D4Symmetry, ENCODE_CHANNELS, NUM_POSITIONS};
+use crate::inference::InferenceServer;
 use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS};
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 
@@ -151,9 +152,9 @@ impl Trainer {
             );
 
             // ============================================================
-            //  1. 自对弈（原始数据直接入 buffer，训练时随机增强）
+            //  1. 自对弈（rayon 并行，共享 InferenceServer 单 CUDA 上下文）
             // ============================================================
-            let inference_network = model.clone().valid();
+            let inference_server = InferenceServer::new(model.clone().valid(), self.device.clone());
             println!("  Self-play: {} games...", self.config.games_per_iteration);
             let sp_config = SelfPlayConfig {
                 num_simulations: self.config.num_simulations,
@@ -164,13 +165,12 @@ impl Trainer {
             let all_records: Vec<PlayRecord> = (0..self.config.games_per_iteration)
                 .into_par_iter()
                 .flat_map(|_| {
-                    let game = self_play(&inference_network, &sp_config, self.device.clone());
+                    let game = self_play(&inference_server, &sp_config);
                     println!(
                         "    Game finished: {} steps, winner: {:?}",
                         game.num_steps(),
                         game.winner
                     );
-                    // 原始记录直接存入 buffer，训练时再做随机 D4 增强
                     game.records
                 })
                 .collect();

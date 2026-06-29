@@ -6,9 +6,8 @@
 use std::io;
 
 use crate::game::board::{BOARD_SIZE, Board, Color, NUM_POSITIONS};
+use crate::inference::Evaluator;
 use crate::mcts::node::MCTS;
-use crate::network::residual::GomokuNetwork;
-use burn::tensor::Device;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -22,14 +21,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
-pub fn play_game(model: &GomokuNetwork, device: &Device, num_simulations: usize) {
+pub fn play_game<E: Evaluator>(evaluator: &E, num_simulations: usize) {
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).unwrap();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let result = run_game_loop(&mut terminal, model, device, num_simulations);
+    let result = run_game_loop(&mut terminal, evaluator, num_simulations);
 
     disable_raw_mode().unwrap();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
@@ -51,10 +50,9 @@ struct GameState {
     game_over: bool,
 }
 
-fn run_game_loop(
+fn run_game_loop<E: Evaluator>(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    model: &GomokuNetwork,
-    device: &Device,
+    evaluator: &E,
     num_simulations: usize,
 ) -> io::Result<()> {
     let player_color = Color::Black;
@@ -98,7 +96,7 @@ fn run_game_loop(
                             // 如果人类落子后游戏未结束，轮到 AI
                             if !state.board.game_over {
                                 terminal.draw(|f| render(f, &state))?;
-                                ai_move(&mut state, model, device, num_simulations);
+                                ai_move(&mut state, evaluator, num_simulations);
                             }
                         } else {
                             state.message = "该位置已有棋子！".into();
@@ -123,11 +121,10 @@ fn run_game_loop(
     }
 }
 
-fn ai_move(state: &mut GameState, model: &GomokuNetwork, device: &Device, num_simulations: usize) {
+fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
     let result = state.mcts.search(
         &mut state.board,
-        model,
-        device,
+        evaluator,
         num_simulations,
         0.0, // 确定性选择
     );

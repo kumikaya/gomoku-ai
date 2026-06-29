@@ -1,4 +1,4 @@
-use burn::module::Module;
+use burn::module::{AutodiffModule, Module};
 use clap::{Parser, Subcommand};
 use gomoku_ai::network::residual::GomokuNetwork;
 
@@ -106,8 +106,9 @@ fn main() {
             });
             let model = GomokuNetwork::new(&device).load_record(record);
 
+            let server = gomoku_ai::inference::InferenceServer::new(model.valid(), device.clone());
             println!("Model loaded. Starting game...");
-            gomoku_ai::game::play::play_game(&model, &device, simulations);
+            gomoku_ai::game::play::play_game(&server, simulations);
         }
     }
 }

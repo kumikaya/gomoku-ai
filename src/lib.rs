@@ -8,6 +8,7 @@
 //! - `training`: 训练循环
 
 pub mod game;
+pub mod inference;
 pub mod mcts;
 pub mod network;
 pub mod selfplay;
