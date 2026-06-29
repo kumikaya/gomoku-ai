@@ -71,7 +71,7 @@ fn main() {
             println!("=== Gomoku AI (AlphaZero) - Training ===\n");
 
             let device = burn::tensor::Device::default();
-            let config = gomoku_ai::training::TrainConfig {
+            let config = gomoku_ai::training::trainer::TrainConfig {
                 num_simulations: simulations,
                 games_per_iteration: games,
                 batch_size,
@@ -81,7 +81,7 @@ fn main() {
                 model_dir: model_dir.into(),
                 ..Default::default()
             };
-            let mut trainer = gomoku_ai::training::Trainer::new(config, device);
+            let mut trainer = gomoku_ai::training::trainer::Trainer::new(config, device);
             trainer.train();
         }
 

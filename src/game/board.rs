@@ -4,8 +4,8 @@
 pub const BOARD_SIZE: usize = 15;
 /// 总位置数
 pub const NUM_POSITIONS: usize = BOARD_SIZE * BOARD_SIZE;
-/// 棋盘编码通道数（己方/对方/上一步/当前玩家色）
-pub const ENCODE_CHANNELS: usize = 4;
+/// 棋盘编码通道数（单通道：-1=对方, 0=空, 1=己方）
+pub const ENCODE_CHANNELS: usize = 1;
 
 /// 玩家颜色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,28 +223,20 @@ impl Board {
             Color::Black => (1u8, 2u8),
             Color::White => (2u8, 1u8),
         };
-        let color_channel_val = match self.current_player {
-            Color::Black => 1.0f32,
-            Color::White => 0.0f32,
-        };
 
         for r in 0..BOARD_SIZE {
             for c in 0..BOARD_SIZE {
                 let idx = r * BOARD_SIZE + c;
                 let cell = self.cells[r][c];
-                data[idx] = if cell == current_stone { 1.0 } else { 0.0 };
-                data[size + idx] = if cell == opponent_stone { 1.0 } else { 0.0 };
-                data[3 * size + idx] = color_channel_val;
+                // 单通道编码：己方=1, 对方=-1, 空=0
+                data[idx] = if cell == current_stone {
+                    1.0
+                } else if cell == opponent_stone {
+                    -1.0
+                } else {
+                    0.0
+                };
             }
-        }
-
-        // 清零通道 2（last_move），避免上一帧残留
-        for idx in 0..size {
-            data[2 * size + idx] = 0.0;
-        }
-
-        if let Some((lr, lc)) = self.last_move {
-            data[2 * size + lr * BOARD_SIZE + lc] = 1.0;
         }
     }
 
@@ -442,19 +434,14 @@ mod tests {
         assert_eq!(data.len(), ENCODE_CHANNELS * NUM_POSITIONS);
         let idx_77 = 7 * BOARD_SIZE + 7;
         let idx_00 = 0 * BOARD_SIZE + 0;
-        // 当前是 Black：Black 子在通道 0，White 子在通道 1
-        assert_eq!(data[idx_77], 1.0, "Black stone should be in channel 0");
+        let idx_empty = 1 * BOARD_SIZE + 1;
+        // 单通道 (-1, 0, 1) 编码：己方=1, 对方=-1, 空=0
         assert_eq!(
-            data[NUM_POSITIONS + idx_77],
-            0.0,
-            "Non-opponent at Black stone"
+            data[idx_77], 1.0,
+            "Black stone (current player) should be 1"
         );
-        assert_eq!(data[idx_00], 0.0, "Non-current at White stone");
-        assert_eq!(
-            data[NUM_POSITIONS + idx_00],
-            1.0,
-            "White stone in opponent channel"
-        );
+        assert_eq!(data[idx_00], -1.0, "White stone (opponent) should be -1");
+        assert_eq!(data[idx_empty], 0.0, "Empty cell should be 0");
     }
 
     #[test]
@@ -592,21 +579,15 @@ mod tests {
         let idx_00 = Board::pos_to_idx(0, 0);
         let idx_14_14 = Board::pos_to_idx(14, 14);
 
-        // 通道 0 (己方棋子) 中的黑子在 180° 旋转后应到 (14,14)
-        let new_self_ch = &rot_state[0 * NUM_POSITIONS..1 * NUM_POSITIONS];
+        // 单通道编码：己方=1, 对方=-1, 空=0
+        // 旋转 180° 后，黑子 (己方=1) 应到 (14,14)
         assert_eq!(
-            new_self_ch[idx_14_14], 1.0,
+            rot_state[idx_14_14], 1.0,
             "black stone should rotate to (14,14)"
         );
+        // 旋转 180° 后，白子 (对方=-1) 应到 (0,0)
         assert_eq!(
-            new_self_ch[idx_00], 0.0,
-            "(0,0) should be empty after rotation"
-        );
-
-        // 通道 1 (对方棋子) 中的白子在 180° 旋转后应到 (0,0)
-        let new_opp_ch = &rot_state[1 * NUM_POSITIONS..2 * NUM_POSITIONS];
-        assert_eq!(
-            new_opp_ch[idx_00], 1.0,
+            rot_state[idx_00], -1.0,
             "white stone should rotate to (0,0)"
         );
 

@@ -1,6 +1,6 @@
 //! 残差块与 AlphaZero 五子棋网络
 //!
-//! 输入：[batch, 4, 15, 15]  四通道棋盘编码
+//! 输入：[batch, 1, 15, 15]  单通道棋盘编码（-1=对方, 0=空, 1=己方）
 //! 输出：
 //!   - 策略 logits：[batch, 225]  各落子点未归一化分数
 //!   - 局势价值：  [batch, 1]  范围 [-1, 1]（Tanh）
@@ -12,13 +12,13 @@ use burn::{
         BatchNorm, BatchNormConfig, Linear, LinearConfig, PaddingConfig2d, conv::Conv2d,
         conv::Conv2dConfig,
     },
-    tensor::{Device, Tensor},
+    tensor::{Device, FloatDType, Tensor},
 };
 
 /// 棋盘大小
 pub const BOARD_SIZE: usize = 15;
-/// 输入通道数
-pub const INPUT_CHANNELS: usize = 4;
+/// 输入通道数（单通道：-1=对方, 0=空, 1=己方）
+pub const INPUT_CHANNELS: usize = 1;
 /// 残差块隐藏层通道数
 pub const RES_CHANNELS: usize = 128;
 /// 策略输出维度
@@ -177,12 +177,12 @@ impl GomokuNetwork {
         }
     }
 
-    /// AlphaZero 网络前向传播
+    /// AlphaZero 网络前向传播（f16 半精度计算）
     ///
     /// ## 网络结构
     ///
     /// ```text
-    /// 输入 [batch, 4, 15, 15]
+    /// 输入 [batch, 1, 15, 15]
     ///   │
     ///   ▼
     /// Conv(3×3, 128) → BN → ReLU          ← 输入卷积层
@@ -210,6 +210,9 @@ impl GomokuNetwork {
         let batch = state.dims()[0];
         let board_sq = POLICY_OUT;
 
+        // 转为 f16 半精度计算
+        let state = state.cast(FloatDType::F16);
+
         let mut x = self.conv_in.forward(state);
         x = self.bn_in.forward(x);
         x = relu(x);
@@ -234,6 +237,10 @@ impl GomokuNetwork {
         let v = relu(v);
         let v = self.value_fc2.forward(v);
         let value = tanh(v);
+
+        // 转回 f32 输出
+        let policy_logits = policy_logits.cast(FloatDType::F32);
+        let value = value.cast(FloatDType::F32);
 
         (policy_logits, value)
     }
