@@ -20,7 +20,7 @@
 //! - `total_value`: 这些模拟从父节点视角累积的价值和
 //! - `Q = total_value / visit_count`：该边的平均价值
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::game::board::{Board, ENCODE_CHANNELS, NUM_POSITIONS};
 use crate::inference::Evaluator;
@@ -30,7 +30,7 @@ use crate::inference::Evaluator;
 // ============================================================
 
 /// 虚拟损失：模拟期间施加的惩罚值，防止并行线程重复选择同一路径。
-const VIRTUAL_LOSS: f32 = 3.0;
+const VIRTUAL_LOSS: f32 = 1.0;
 
 /// PUCT 探索常数
 const C_PUCT: f32 = 1.0;
@@ -72,7 +72,8 @@ pub struct Node {
     pub prior: f32,
     pub virtual_loss: AtomicU32,
     pub children: parking_lot::RwLock<Vec<Option<usize>>>,
-    pub expanded: AtomicBool,
+    /// 0=未扩展, 1=正在扩展, 2=已扩展
+    pub expanded: AtomicU32,
 }
 
 impl Node {
@@ -83,7 +84,7 @@ impl Node {
             prior,
             virtual_loss: AtomicU32::new(0),
             children: parking_lot::RwLock::new(vec![None; NUM_POSITIONS]),
-            expanded: AtomicBool::new(false),
+            expanded: AtomicU32::new(0),
         }
     }
 
@@ -189,7 +190,7 @@ impl Node {
 /// arena 用 `Mutex` 包裹以支持 `reset()`（需要 `&mut` 以调用 `clear()`），
 /// 但 `node()` 每次锁一次读取——`parking_lot::Mutex` 在此场景下足够轻量。
 pub struct MCTS {
-    arena: boxcar::Vec<Node>,
+    pub arena: boxcar::Vec<Node>,
 }
 
 /// 搜索返回结果
@@ -283,9 +284,8 @@ impl MCTS {
         // ── 根节点评估（通过 Evaluator，多对局时可被 InferenceServer 攒批）──
         let mut root_encoding = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
         board.encode_into(&mut root_encoding);
-        let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]);
+        let (root_logits, _root_values) = evaluator.evaluate_batch(&[root_encoding]);
         let policy_probs = Self::softmax_legal(&root_logits[0], &legal_moves);
-        let root_value: f32 = root_values[0];
 
         let dirichlet = Self::dirichlet_noise(legal_moves.len(), DIRICHLET_ALPHA);
         self.expand_node(
@@ -294,7 +294,7 @@ impl MCTS {
             &policy_probs,
             Some((&dirichlet, DIRICHLET_EPSILON)),
         );
-        self.root().expanded.store(true, Ordering::Relaxed);
+        self.root().expanded.store(2, Ordering::Relaxed);
 
         // ── 并行模拟阶段，GPU forward 仅在主线程执行 ──
         //
@@ -352,6 +352,27 @@ impl MCTS {
                 }
             }
         }
+
+        // root_value = 子节点 Q 的加权平均
+        // Q 存的是从父节点（root）视角的价值，不加负号
+        let root_value = if sum_n > 0.0 {
+            children
+                .iter()
+                .filter_map(|c| {
+                    c.and_then(|ci| {
+                        let child = self.node(ci);
+                        let n = child.visit_count_f32();
+                        if n > 0.0 {
+                            Some(n / sum_n * child.q())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .sum::<f32>()
+        } else {
+            0.0
+        };
         drop(children);
 
         let best_move = if temperature > 0.0 {
@@ -405,20 +426,34 @@ impl MCTS {
                 }
 
                 let node = self.node(node_idx);
-                if !node.expanded.load(Ordering::Relaxed) {
-                    // 叶子：编码棋盘 → 提交请求 → 立刻开始下一条模拟
-                    let mut encoding = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
-                    sim_board.encode_into(&mut encoding);
-                    leaf_tx
-                        .send(LeafRequest {
-                            path,
-                            encoding,
-                            legal_moves_at_leaf: std::mem::take(legal),
-                        })
-                        .expect("evaluator died");
-                    // 不等回复！虚拟损失已加在路径上，其他 worker 会避开这条路径
-                    // path 的所有权已移交给 LeafRequest
-                    break;
+                if node.expanded.load(Ordering::Relaxed) != 2 {
+                    // 叶子节点：用 CAS 抢 expanding 状态（0→1），避免重复 expand
+                    let was_zero = node
+                        .expanded
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok();
+                    if was_zero {
+                        // 抢到 expanding，提交 evaluator
+                        let mut encoding = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
+                        sim_board.encode_into(&mut encoding);
+                        leaf_tx
+                            .send(LeafRequest {
+                                path,
+                                encoding,
+                                legal_moves_at_leaf: std::mem::take(legal),
+                            })
+                            .expect("evaluator died");
+                        break;
+                    }
+                    // 没抢到：可能正被 evaluator 处理，或已 expand
+                    // 回退当前 path 上的虚拟损失，重新从 root 走
+                    for &(_, _, ci) in path.iter().rev() {
+                        self.node(ci).remove_virtual_loss();
+                    }
+                    node_idx = 0;
+                    sim_board = board.clone();
+                    path.clear();
+                    continue;
                 }
 
                 // PUCT 选择
@@ -446,9 +481,9 @@ impl MCTS {
                     }
                 };
 
-                // 虚拟损失（原子）—— 这是异步模型的核心保障
+                // 虚拟损失（原子）—— 只加在子节点上，parent 不需要
+                // PUCT 公式已经用 child.effective_n() 来惩罚
                 self.node(child_idx).add_virtual_loss();
-                node.add_virtual_loss();
 
                 path.push((node_idx, move_idx, child_idx));
                 sim_board.play_idx(move_idx);
@@ -493,7 +528,7 @@ impl MCTS {
                 mcts.expand_node(leaf_node_idx, &req.legal_moves_at_leaf, &probs, None);
                 mcts.node(leaf_node_idx)
                     .expanded
-                    .store(true, Ordering::Relaxed);
+                    .store(2, Ordering::Relaxed);
 
                 mcts.backprop_path_internal(&req.path, -values_batch[i]);
             }
@@ -609,7 +644,7 @@ mod tests {
         assert_eq!(n.prior, 0.5);
         assert_eq!(n.virtual_loss.load(Ordering::Relaxed), 0);
         assert_eq!(n.children.read().len(), NUM_POSITIONS);
-        assert!(!n.expanded.load(Ordering::Relaxed));
+        assert_eq!(n.expanded.load(Ordering::Relaxed), 0);
         assert!(n.children.read().iter().all(|c| c.is_none()));
     }
 
@@ -897,7 +932,7 @@ mod tests {
         let mut board_a = board.clone();
         board_a.play_idx(first_legal_idx);
         let legal_a = board_a.legal_moves();
-        mcts.node(child_a).expanded.store(true, Ordering::Release);
+        mcts.node(child_a).expanded.store(2, Ordering::Release);
         mcts.expand_node(child_a, &legal_a, &probs, None);
         let a_first_legal_idx = Board::pos_to_idx(legal_a[0].0, legal_a[0].1);
         let gc = mcts.node(child_a).children.read()[a_first_legal_idx].unwrap();
