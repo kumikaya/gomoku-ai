@@ -4,7 +4,7 @@
 //! 实现：单 CUDA 上下文，多 MCTS 实例共享，跨请求自动攒批。
 
 use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS, POLICY_OUT};
-use burn::tensor::{Device, Tensor};
+use burn::tensor::{Device, FloatDType, Tensor};
 use std::time::Duration;
 
 /// 批量评估上限（GPU 线程内部攒批的最大请求数）
@@ -133,8 +133,17 @@ impl InferenceServer {
             BOARD_SIZE as i32,
         ]);
         let (logits, values) = model.forward(state_tensor);
-        let policy_flat: Vec<f32> = logits.into_data().to_vec::<f32>().unwrap();
-        let values_flat: Vec<f32> = values.into_data().to_vec::<f32>().unwrap();
+        // 若 device 配置为 f16，cast 回 f32 才能 to_vec::<f32>()
+        let policy_flat: Vec<f32> = logits
+            .cast(FloatDType::F32)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let values_flat: Vec<f32> = values
+            .cast(FloatDType::F32)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
 
         // 按请求拆分结果
         let mut pol_offset = 0;

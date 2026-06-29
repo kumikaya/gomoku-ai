@@ -426,7 +426,6 @@ dependencies = [
  "burn-autodiff",
  "burn-core",
  "burn-cuda",
- "burn-ndarray",
  "burn-nn",
  "burn-optim",
  "burn-std",

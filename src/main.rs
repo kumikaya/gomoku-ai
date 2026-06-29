@@ -1,4 +1,5 @@
 use burn::module::{AutodiffModule, Module};
+use burn::tensor::{Device, FloatDType, IntDType};
 use clap::{Parser, Subcommand};
 use gomoku_ai::network::residual::GomokuNetwork;
 
@@ -70,7 +71,7 @@ fn main() {
         } => {
             println!("=== Gomoku AI (AlphaZero) - Training ===\n");
 
-            let device = burn::tensor::Device::default();
+            let device = create_device();
             let config = gomoku_ai::training::trainer::TrainConfig {
                 num_simulations: simulations,
                 games_per_iteration: games,
@@ -89,7 +90,7 @@ fn main() {
             simulations,
             model_path,
         } => {
-            let device = burn::tensor::Device::default();
+            let device = create_device();
             let path = std::path::PathBuf::from(&model_path);
 
             if !path.exists() {
@@ -109,4 +110,20 @@ fn main() {
             gomoku_ai::game::play::play_game(&server, simulations);
         }
     }
+}
+
+/// 创建 device 并设置默认精度。
+///
+/// 训练+推理统一使用 BF16（指数位与 F32 相同，避免梯度溢出）。
+/// backend 不支持 BF16 时自动降级 F32。
+fn create_device() -> Device {
+    let mut device = Device::default();
+    match device.configure((FloatDType::BF16, IntDType::I32)) {
+        Ok(()) => println!("Device: float=BF16"),
+        Err(e) => {
+            eprintln!("BF16 not supported ({e}), falling back to F32");
+            device.configure((FloatDType::F32, IntDType::I32)).ok();
+        }
+    }
+    device
 }

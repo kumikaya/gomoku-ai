@@ -36,7 +36,7 @@ pub struct LossScaleConfig {
 impl Default for LossScaleConfig {
     fn default() -> Self {
         Self {
-            init_scale: 4096.0,
+            init_scale: 128.0,
             grow_interval: 2000,
             growth_factor: 2.0,
             backoff_factor: 0.5,

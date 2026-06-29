@@ -15,7 +15,7 @@ use burn::{
     module::AutodiffModule,
     optim::{AdamConfig, GradientsParams},
     store::ModuleRecord,
-    tensor::{Device, Tensor, activation::log_softmax},
+    tensor::{Device, FloatDType, Tensor, activation::log_softmax},
 };
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
@@ -150,7 +150,11 @@ impl Trainer {
         }
 
         let use_amp = self.config.loss_scale_cfg.init_scale > 0.0;
-        let mut scaler = LossScaler::new(self.config.loss_scale_cfg.clone());
+        let mut scaler = if use_amp {
+            Some(LossScaler::new(self.config.loss_scale_cfg.clone()))
+        } else {
+            None
+        };
 
         // 保存初始模型
         self.save_model(&model, "initial");
@@ -183,13 +187,8 @@ impl Trainer {
                 continue;
             }
 
-            let (total_loss, total_steps) = self.run_training_epochs(
-                &mut model,
-                &mut optim,
-                &mut scaler,
-                use_amp,
-                &train_device,
-            );
+            let (total_loss, total_steps) =
+                self.run_training_epochs(&mut model, &mut optim, scaler.as_mut(), &train_device);
 
             let avg_loss = if total_steps > 0 {
                 total_loss / total_steps as f32
@@ -264,8 +263,7 @@ impl Trainer {
         &mut self,
         model: &mut GomokuNetwork,
         optim: &mut burn::optim::ModuleOptimizer,
-        scaler: &mut LossScaler,
-        use_amp: bool,
+        mut scaler: Option<&mut LossScaler>,
         train_device: &Device,
     ) -> (f32, usize) {
         let lr = self.config.learning_rate;
@@ -321,7 +319,7 @@ impl Trainer {
 
                 let state_for_new = state_tensor.clone();
 
-                // 前向（f16 半精度）
+                // 前向
                 let (policy_logits, value_pred) = model.forward(state_tensor);
 
                 // 损失
@@ -344,7 +342,7 @@ impl Trainer {
                 epoch_steps += 1;
 
                 // ── 反向传播 + Loss Scaling ──
-                self.backward_step(model, optim, &loss, scaler, use_amp, lr);
+                self.backward_step(model, optim, &loss, scaler.as_deref_mut(), lr);
 
                 // ── 更新后统计 ──
                 let (new_policy_logits, new_value_pred) = model.forward(state_for_new);
@@ -359,6 +357,7 @@ impl Trainer {
 
                 let new_val_pred: Vec<f32> = new_value_pred
                     .reshape([batch_len])
+                    .cast(FloatDType::F32)
                     .into_data()
                     .to_vec::<f32>()
                     .unwrap();
@@ -401,22 +400,20 @@ impl Trainer {
         model: &mut GomokuNetwork,
         optim: &mut burn::optim::ModuleOptimizer,
         loss: &Tensor<1>,
-        scaler: &mut LossScaler,
-        use_amp: bool,
+        scaler: Option<&mut LossScaler>,
         lr: f64,
     ) {
-        let loss_to_bwd = if use_amp {
-            loss.clone() * scaler.scale()
-        } else {
-            loss.clone()
+        let loss_to_bwd = match scaler.as_ref() {
+            Some(s) => loss.clone() * s.scale(),
+            None => loss.clone(),
         };
 
         let grads = loss_to_bwd.backward();
         let mut grads_params = GradientsParams::from_grads(grads, model);
 
-        if use_amp {
+        if let Some(scaler) = scaler {
             if let Err(()) = scaler.unscale_and_check(&mut grads_params, model) {
-                return; // 溢出，跳过本次更新
+                return;
             }
         }
 

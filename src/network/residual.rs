@@ -4,6 +4,9 @@
 //! 输出：
 //!   - 策略 logits：[batch, 225]  各落子点未归一化分数
 //!   - 局势价值：  [batch, 1]  范围 [-1, 1]（Tanh）
+//!
+//! 精度由 `Device::configure` 在创建时全局设定（f16/f32），
+//! 前向传播无需手动 cast。
 
 use burn::tensor::activation::{relu, tanh};
 use burn::{
@@ -12,7 +15,7 @@ use burn::{
         BatchNorm, BatchNormConfig, Linear, LinearConfig, PaddingConfig2d, conv::Conv2d,
         conv::Conv2dConfig,
     },
-    tensor::{Device, FloatDType, Tensor},
+    tensor::{Device, Tensor},
 };
 
 /// 棋盘大小
@@ -80,12 +83,7 @@ impl ResidualBlock {
         }
     }
 
-    /// 残差块前向传播
-    ///
-    /// 结构：x → Conv → BN → ReLU → Conv → BN → +residual → ReLU
-    ///
-    /// 跳跃连接（Skip Connection）：将输入 x 直接加到第二个 BN 的输出上，
-    /// 解决深层网络的梯度消失问题，使梯度可以通过恒等映射直接回传。
+    /// 残差块前向：x → Conv → BN → ReLU → Conv → BN → +residual → ReLU
     pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let residual = x.clone();
 
@@ -124,15 +122,12 @@ impl GomokuNetwork {
         Self::with_config(&GomokuNetworkConfig::default(), device)
     }
 
-    /// 根据配置构建 AlphaZero 网络。
+    /// 根据配置构建网络。
     ///
-    /// 架构设计要点：
-    /// - **输入卷积** Conv(3×3, input_channels→res_channels)：将 4 通道棋盘编码映射到 128 通道特征空间
-    /// - **残差块** × `num_res_blocks`（默认 5 个）：核心特征提取模块，每个块保持通道数不变
-    /// - **策略头**：先用 1×1 卷积降维到 2 通道，展平后全连接到 225 维 logits
-    /// - **价值头**：先用 1×1 卷积降维到 1 通道，展平后经 64 维隐藏层到标量价值
-    ///
-    /// 两个输出头共享残差骨干网络，确保特征表示同时服务于走子决策和局势评估。
+    /// - **输入卷积**：Conv(3×3, input_channels→res_channels)，将 1 通道映射到 128 通道
+    /// - **残差块** × `num_res_blocks`（默认 5）：保持通道数不变
+    /// - **策略头**：Conv(1×1, 2) → BN → ReLU → flatten → FC(450, 225)
+    /// - **价值头**：Conv(1×1, 1) → BN → ReLU → flatten → FC(225, 64) → ReLU → FC(64, 1) → Tanh
     pub fn with_config(config: &GomokuNetworkConfig, device: &Device) -> Self {
         let board_sq = config.board_size * config.board_size;
         let res_c = config.res_channels;
@@ -177,41 +172,13 @@ impl GomokuNetwork {
         }
     }
 
-    /// AlphaZero 网络前向传播（f16 半精度计算）
+    /// 前向传播。
     ///
-    /// ## 网络结构
-    ///
-    /// ```text
-    /// 输入 [batch, 1, 15, 15]
-    ///   │
-    ///   ▼
-    /// Conv(3×3, 128) → BN → ReLU          ← 输入卷积层
-    ///   │
-    ///   ▼
-    /// ResidualBlock × 5                    ← 残差骨干（共享特征提取）
-    ///   │
-    ///   ├──────────┬──────────┐
-    ///   ▼          ▼          ▼
-    /// 策略头                    价值头
-    /// Conv(1×1, 2)             Conv(1×1, 1)
-    /// → BN → ReLU              → BN → ReLU
-    /// → Flatten [batch, 450]    → Flatten [batch, 225]
-    /// → Linear(450, 225)        → Linear(225, 64) → ReLU
-    /// → policy_logits           → Linear(64, 1) → Tanh
-    /// [batch, 225]              → value [batch, 1]
-    /// ```
-    ///
-    /// 两个输出头的含义：
-    /// - **策略 logits**：225 维，每个位置对应一个落子点的未归一化分数；
-    ///   在 MCTS 中经掩码 Softmax 后作为先验概率 P(s, a)
-    /// - **局势价值**：1 维，范围 [-1, 1]（Tanh 激活）；
-    ///   +1 表示当前玩家必胜，-1 表示必败，0 表示均势
+    /// 精度由 `Device::configure` 全局设定，无需手动 cast。
+    /// 输入 [batch, 1, 15, 15] → 策略 [batch, 225] + 价值 [batch, 1]。
     pub fn forward(&self, state: Tensor<4>) -> (Tensor<2>, Tensor<2>) {
         let batch = state.dims()[0];
         let board_sq = POLICY_OUT;
-
-        // 转为 f16 半精度计算
-        let state = state.cast(FloatDType::F16);
 
         let mut x = self.conv_in.forward(state);
         x = self.bn_in.forward(x);
@@ -237,10 +204,6 @@ impl GomokuNetwork {
         let v = relu(v);
         let v = self.value_fc2.forward(v);
         let value = tanh(v);
-
-        // 转回 f32 输出
-        let policy_logits = policy_logits.cast(FloatDType::F32);
-        let value = value.cast(FloatDType::F32);
 
         (policy_logits, value)
     }
