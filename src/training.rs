@@ -268,9 +268,9 @@ impl Trainer {
                     let state_for_new = state_tensor.clone();
                     let (policy_logits, value_pred) = model.forward(state_tensor);
 
-                    // 保存旧策略分布用于 KL 计算
+                    // 保存旧策略分布用于 KL 计算（detach 切断 AD 计算图）
                     let log_probs = log_softmax(policy_logits.clone(), 1);
-                    let old_log_probs = log_probs.clone();
+                    let old_log_probs = log_probs.clone().detach();
 
                     // ---- 损失计算 ----
                     let policy_loss = -(log_probs * policy_target.clone()).sum_dim(1).mean();
@@ -300,6 +300,7 @@ impl Trainer {
                     let (new_policy_logits, new_value_pred) = model.forward(state_for_new);
                     let new_log_probs = log_softmax(new_policy_logits, 1);
 
+                    // old_log_probs 已 detach，不受后续参数更新影响
                     let kl = Self::compute_kl(old_log_probs, new_log_probs);
                     epoch_kl_sum += kl;
                     epoch_kl_count += 1;

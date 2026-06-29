@@ -19,7 +19,7 @@ enum Command {
         iterations: usize,
 
         /// 每轮自对弈局数
-        #[arg(short = 'g', long, default_value = "64")]
+        #[arg(short = 'g', long, default_value = "4")]
         games: usize,
 
         /// 每次 MCTS 模拟次数
@@ -31,7 +31,7 @@ enum Command {
         learning_rate: f64,
 
         /// 批大小
-        #[arg(short = 'b', long, default_value = "512")]
+        #[arg(short = 'b', long, default_value = "128")]
         batch_size: usize,
 
         /// 模型保存目录
@@ -75,7 +75,7 @@ fn main() {
                 num_simulations: simulations,
                 games_per_iteration: games,
                 batch_size,
-                epochs: 4,
+                epochs: 2,
                 num_iterations: iterations,
                 learning_rate,
                 value_loss_weight: 1.0,
