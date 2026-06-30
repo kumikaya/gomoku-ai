@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use burn::module::{AutodiffModule, Module};
-use burn::tensor::{Device, FloatDType, IntDType};
+use burn::tensor::Device;
 use clap::{Parser, Subcommand};
 use gomoku_ai::game::play::play_game;
 use gomoku_ai::inference::InferenceServer;

@@ -16,6 +16,7 @@
 //!   prior = (1-ε)*NN + ε*Dirichlet，`policy_logit = ln(NN_prior) + gumbel_noise`。
 //!   PUCT walk 用 noisy prior。
 
+use super::table::Table;
 use crate::game::board::{Board, Color, ENCODE_CHANNELS, NUM_POSITIONS};
 use crate::inference::Evaluator;
 
@@ -97,7 +98,7 @@ pub struct Node {
     pub policy_logit: f32,
     /// Gumbel 噪声值（用于 recovered clean logit = policy_logit - gumbel_noise）
     pub gumbel_noise: f32,
-    pub children: Vec<Option<usize>>,
+    pub children: Table<usize>,
     pub expanded: bool,
     /// 该节点对应哪个玩家的回合
     pub player: Color,
@@ -111,7 +112,7 @@ impl Node {
             prior,
             policy_logit: gumbel_logit + gumbel_noise,
             gumbel_noise,
-            children: vec![None; NUM_POSITIONS],
+            children: Table::new(NUM_POSITIONS),
             expanded: false,
             player,
         }
@@ -219,7 +220,7 @@ impl MCTS {
         let parent_node = self.node_mut(parent);
         for (i, &(r, c)) in legal.iter().enumerate() {
             let idx = Board::pos_to_idx(r, c);
-            parent_node.children[idx] = Some(child_ids[i]);
+            parent_node.children.set(idx, child_ids[i]);
         }
     }
 
@@ -240,8 +241,8 @@ impl MCTS {
         let node = self.node(node_idx);
         let mut sum_q = 0.0f32;
         let mut visited = 0.0f32;
-        for c in node.children.iter().flatten() {
-            let child = self.node(*c);
+        for c in node.children.values_copied() {
+            let child = self.node(c);
             if child.visit_count > 0 {
                 sum_q += child.q();
                 visited += 1.0;
@@ -431,12 +432,7 @@ impl MCTS {
 
                 // 推进棋盘到候选子节点对应的局面
                 sim_board.clone_from(board);
-                let move_idx = self
-                    .root()
-                    .children
-                    .iter()
-                    .position(|c| c == &Some(start_ci))
-                    .unwrap_or(0);
+                let move_idx = self.root().children.position_of(&start_ci).unwrap_or(0);
                 sim_board.play_idx(move_idx);
 
                 // puct_walk 返回以 start_ci 开头的 path，前面 prepend root
@@ -531,8 +527,8 @@ impl MCTS {
     fn max_root_count(mcts: &MCTS) -> f32 {
         mcts.root()
             .children
-            .iter()
-            .filter_map(|c| c.map(|ci| mcts.node(ci).visit_count_f32()))
+            .values()
+            .map(|&ci| mcts.node(ci).visit_count_f32())
             .fold(0.0, f32::max)
     }
 
@@ -555,8 +551,8 @@ impl MCTS {
 
         let mut pi_sum = 0.0f32;
         let mut q_sum = 0.0f32;
-        for c in children.iter().flatten() {
-            let child = self.node(*c);
+        for c in children.values_copied() {
+            let child = self.node(c);
             if child.visit_count > 0 {
                 pi_sum += child.prior;
                 q_sum += child.prior * child.q();
@@ -575,19 +571,17 @@ impl MCTS {
 
         let mut scores: Vec<(usize, f32)> = Vec::with_capacity(NUM_POSITIONS);
         let mut max_score = f32::NEG_INFINITY;
-        for (idx, c) in children.iter().enumerate() {
-            if let Some(ci) = c {
-                let child = self.node(*ci);
-                let value = if child.visit_count > 0 {
-                    child.q()
-                } else {
-                    non_visited_value
-                };
-                let score = child.logit_without_noise() + (sv + max_n) * sc * value;
-                scores.push((idx, score));
-                if score > max_score {
-                    max_score = score;
-                }
+        for (idx, ci) in children.occupied() {
+            let child = self.node(*ci);
+            let value = if child.visit_count > 0 {
+                child.q()
+            } else {
+                non_visited_value
+            };
+            let score = child.logit_without_noise() + (sv + max_n) * sc * value;
+            scores.push((idx, score));
+            if score > max_score {
+                max_score = score;
             }
         }
 
@@ -605,21 +599,19 @@ impl MCTS {
         }
 
         let sum_n: f32 = children
-            .iter()
-            .filter_map(|c| c.map(|ci| self.node(ci).visit_count_f32()))
+            .values()
+            .map(|&ci| self.node(ci).visit_count_f32())
             .sum();
         let root_value = if sum_n > 0.0 {
             children
-                .iter()
-                .filter_map(|c| {
-                    c.and_then(|ci| {
-                        let child = self.node(ci);
-                        if child.visit_count > 0 {
-                            Some(child.visit_count_f32() / sum_n * child.q())
-                        } else {
-                            None
-                        }
-                    })
+                .values()
+                .filter_map(|&ci| {
+                    let child = self.node(ci);
+                    if child.visit_count > 0 {
+                        Some(child.visit_count_f32() / sum_n * child.q())
+                    } else {
+                        None
+                    }
                 })
                 .sum()
         } else {
@@ -636,7 +628,7 @@ impl MCTS {
 
         let max_count_child = children
             .iter()
-            .filter_map(|c| *c)
+            .filter_map(|(_, c)| c.copied())
             .max_by_key(|ci| self.node(*ci).visit_count);
         let threshold_q = max_count_child
             .map(|ci| self.node(ci).q() - 0.1)
@@ -644,7 +636,7 @@ impl MCTS {
 
         let probs: Vec<f64> = children
             .iter()
-            .map(|c| {
+            .map(|(_, c)| {
                 if let Some(ci) = c {
                     let child = self.node(*ci);
                     if child.visit_count == 0 || child.q() < threshold_q {
