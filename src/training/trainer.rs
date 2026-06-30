@@ -198,11 +198,26 @@ impl Trainer {
         pb.finish_and_clear();
 
         let added = all_records.len();
+        let mut nan_count = 0;
         for record in all_records {
+            // 过滤 NaN 样本，防止污染回放缓冲区和下游训练
+            if record.policy.iter().any(|x| !x.is_finite())
+                || !record.value.is_finite()
+                || record.state.iter().any(|x| !x.is_finite())
+            {
+                nan_count += 1;
+                continue;
+            }
             if self.replay_buffer.len() >= self.config.buffer_capacity {
                 self.replay_buffer.pop_front();
             }
             self.replay_buffer.push_back(record);
+        }
+        if nan_count > 0 {
+            eprintln!(
+                "  WARNING: {} NaN samples filtered out (MCTS produced invalid policy).",
+                nan_count
+            );
         }
         println!(
             "  Buffer: {} samples (+{})",
@@ -296,6 +311,15 @@ impl Trainer {
                 let loss = policy_loss + value_loss * value_weight_tensor.unsqueeze();
 
                 let scalar: f32 = loss.clone().into_scalar();
+                if !scalar.is_finite() {
+                    eprintln!(
+                        "  WARNING: NaN loss detected at epoch {} step {} — skipping update.",
+                        epoch + 1,
+                        epoch_steps
+                    );
+                    pb.inc(1);
+                    continue;
+                }
                 epoch_loss += scalar;
                 epoch_steps += 1;
 

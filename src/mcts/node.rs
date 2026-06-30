@@ -20,6 +20,9 @@ use super::table::Table;
 use crate::game::board::{Board, Color, ENCODE_CHANNELS, NUM_POSITIONS};
 use crate::inference::Evaluator;
 
+/// 对数计算的最小概率下限，防止 ln(0) = -inf
+const MIN_PROB: f32 = 1e-15;
+
 // ============================================================
 //  常量
 // ============================================================
@@ -345,10 +348,10 @@ impl MCTS {
 
         let policy_probs = Self::softmax_legal(&root_logits[0], &legal_moves);
 
-        // 干净 logit：ln(NN prior)
+        // 干净 logit：ln(NN prior)，加 epsilon 防止 prior=0 导致 -inf
         let clean_logits: Vec<f32> = legal_moves
             .iter()
-            .map(|&(r, c)| policy_probs[Board::pos_to_idx(r, c)].ln())
+            .map(|&(r, c)| policy_probs[Board::pos_to_idx(r, c)].max(MIN_PROB).ln())
             .collect();
 
         // Gumbel 噪声（所有场景下都生成）
@@ -465,7 +468,8 @@ impl MCTS {
                     .iter()
                     .map(|&(r, c)| {
                         let idx = Board::pos_to_idx(r, c);
-                        (probs[idx], probs[idx].ln())
+                        let p = probs[idx];
+                        (p, p.max(MIN_PROB).ln())
                     })
                     .collect();
                 self.expand_children(leaf_idx, &legal_leaf, &gumbel_noises_leaf, &child_data_leaf);
