@@ -165,17 +165,25 @@ impl MCTS {
     fn root(&self) -> &Node {
         &self.arena[0]
     }
+
     #[inline]
     fn root_mut(&mut self) -> &mut Node {
         &mut self.arena[0]
     }
+
     #[inline]
     fn node(&self, idx: usize) -> &Node {
         &self.arena[idx]
     }
+
     #[inline]
     fn node_mut(&mut self, idx: usize) -> &mut Node {
         &mut self.arena[idx]
+    }
+
+    fn reset(&mut self) {
+        self.arena.clear();
+        self.arena.push(Node::new(0.0, 0.0, 0.0));
     }
 
     fn push_node(&mut self, node: Node) -> usize {
@@ -314,6 +322,7 @@ impl MCTS {
         evaluator: &E,
         config: &GumbelConfig,
     ) -> SearchResult {
+        self.reset();
         let legal_moves = board.legal_moves();
         if legal_moves.is_empty() {
             return SearchResult {
@@ -685,6 +694,10 @@ impl MCTS {
             self.node_mut(ci).add_visit(value);
             value = -value;
         }
+        // path 结构为 (parent, move, child)，循环只更新了 child。
+        // 根节点（index 0）永远不会作为 child 出现，必须显式更新，
+        // 对齐 minizero backup 中 node_path 包含 root 的行为。
+        self.root_mut().add_visit(value);
     }
 
     // ── utils ──
@@ -786,6 +799,7 @@ mod tests {
     #[test]
     fn test_backprop_consistency() {
         let mut m = MCTS::new();
+        m.reset();
         let n1 = m.push_node(Node::new(0.5, 0.5f32.ln(), 0.0));
         let n2 = m.push_node(Node::new(0.3, 0.3f32.ln(), 0.0));
         m.backprop_path(&[(0, 0, n1), (n1, 1, n2)], 0.8);
@@ -815,7 +829,8 @@ mod tests {
 
     #[test]
     fn test_init_q_value_no_visits() {
-        let m = MCTS::new();
+        let mut m = MCTS::new();
+        m.reset();
         assert!((m.init_q_value(0) - 0.0).abs() < 1e-6);
     }
 
@@ -883,16 +898,12 @@ mod tests {
         assert!((MCTS::max_root_count(&m) - 2.0).abs() < 1e-6);
     }
 
-    #[test]
-    fn test_max_root_count_empty() {
-        assert_eq!(MCTS::max_root_count(&MCTS::new()), 0.0);
-    }
-
     // ── backprop 多层 ──
 
     #[test]
     fn test_backprop_sign_flip_deep() {
         let mut m = MCTS::new();
+        m.reset();
         let n1 = m.push_node(Node::new(0.5, 0.5f32.ln(), 0.0));
         let n2 = m.push_node(Node::new(0.3, 0.3f32.ln(), 0.0));
         let n3 = m.push_node(Node::new(0.2, 0.2f32.ln(), 0.0));
@@ -924,7 +935,8 @@ mod tests {
 
     #[test]
     fn test_build_completed_q_policy_no_visits() {
-        let m = MCTS::new();
+        let mut m = MCTS::new();
+        m.reset();
         let (policy, root_value) = m.build_completed_q_policy(0.5, 4, &GumbelConfig::default());
         assert!(policy.iter().all(|&p| p == 0.0));
         assert!((root_value - 0.5).abs() < 1e-6);

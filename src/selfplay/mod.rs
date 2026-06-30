@@ -47,12 +47,12 @@ impl Default for SelfPlayConfig {
 pub fn self_play<E: Evaluator>(evaluator: &E, config: &SelfPlayConfig) -> SelfPlayGame {
     let mut board = Board::new();
     let mut records = Vec::new();
+    let mut mcts = MCTS::new();
 
     let search_config = GumbelConfig::pure_gumbel(config.num_simulations);
 
     loop {
         // 每步新建 MCTS
-        let mut mcts = MCTS::new();
         let result = mcts.search(&mut board, evaluator, &search_config);
 
         // V 标签对齐 minizero `getMCTSValue()`：
