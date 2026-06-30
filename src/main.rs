@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use burn::module::{AutodiffModule, Module};
+use burn::module::Module;
 use burn::tensor::Device;
 use clap::{Parser, Subcommand};
 use gomoku_ai::game::play::play_game;
@@ -25,7 +25,7 @@ enum Command {
         iterations: usize,
 
         /// 每轮自对弈局数
-        #[arg(short = 'g', long, default_value = "32")]
+        #[arg(short = 'g', long, default_value = "64")]
         games: usize,
 
         /// 每次 MCTS 模拟次数（Gumbel Zero 只需 16~64）
@@ -104,7 +104,7 @@ fn main() {
             });
             let model = GomokuNetwork::new(&device).load_record(record);
 
-            let server = InferenceServer::new(model.valid(), device.clone());
+            let server = InferenceServer::new(model, device.clone());
             println!("Model loaded. Starting game...");
             play_game(&server, simulations);
         }

@@ -3,7 +3,8 @@
 //! 将 GPU 推理从 MCTS 中解耦，通过 `Evaluator` trait + `InferenceServer`
 //! 实现：单 CUDA 上下文，多 MCTS 实例共享，跨请求自动攒批。
 
-use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS, POLICY_OUT};
+use crate::game::board::BOARD_SIZE;
+use crate::network::residual::{GomokuNetwork, INPUT_CHANNELS, POLICY_OUT};
 use burn::tensor::{Device, FloatDType, Tensor};
 use std::time::Duration;
 

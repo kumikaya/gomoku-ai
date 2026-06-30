@@ -1,7 +1,7 @@
 //! 五子棋棋盘逻辑：15×15 棋盘、落子、胜负判定、状态编码
 
 /// 棋盘大小
-pub const BOARD_SIZE: usize = 15;
+pub const BOARD_SIZE: usize = 8;
 /// 总位置数
 pub const NUM_POSITIONS: usize = BOARD_SIZE * BOARD_SIZE;
 /// 棋盘编码通道数（单通道：-1=对方, 0=空, 1=己方）

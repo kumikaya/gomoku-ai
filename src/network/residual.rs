@@ -1,12 +1,14 @@
 //! 残差块与 AlphaZero 五子棋网络
 //!
-//! 输入：[batch, 1, 15, 15]  单通道棋盘编码（-1=对方, 0=空, 1=己方）
+//! 输入：[batch, 1, BOARD_SIZE, BOARD_SIZE]  单通道棋盘编码（-1=对方, 0=空, 1=己方）
 //! 输出：
-//!   - 策略 logits：[batch, 225]  各落子点未归一化分数
+//!   - 策略 logits：[batch, BOARD_SIZE²]  各落子点未归一化分数
 //!   - 局势价值：  [batch, 1]  范围 [-1, 1]（Tanh）
 //!
 //! 精度由 `Device::configure` 在创建时全局设定（f16/f32），
 //! 前向传播无需手动 cast。
+
+use crate::game::board::BOARD_SIZE;
 
 use burn::tensor::activation::{relu, tanh};
 use burn::{
@@ -18,9 +20,6 @@ use burn::{
     tensor::{Device, Tensor},
 };
 
-/// 棋盘大小
-pub const BOARD_SIZE: usize = 15;
-/// 输入通道数（单通道：-1=对方, 0=空, 1=己方）
 pub const INPUT_CHANNELS: usize = 1;
 /// 残差块隐藏层通道数
 pub const RES_CHANNELS: usize = 128;

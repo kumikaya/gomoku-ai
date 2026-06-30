@@ -2,9 +2,9 @@
 //!
 //! `TrainConfig` 配置训练超参数，`Trainer` 执行完整的 AlphaZero 训练循环。
 
-use crate::game::board::{D4Symmetry, ENCODE_CHANNELS, NUM_POSITIONS};
+use crate::game::board::{BOARD_SIZE, D4Symmetry, ENCODE_CHANNELS, NUM_POSITIONS};
 use crate::inference::InferenceServer;
-use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS};
+use crate::network::residual::{GomokuNetwork, INPUT_CHANNELS};
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 
 use burn::module::Module;

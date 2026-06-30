@@ -159,9 +159,18 @@ struct BoardWidget<'a> {
 
 impl Widget for BoardWidget<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        // 计算棋盘左上角偏移，居中显示
+        // 终端窗口太小时直接提示，不 panic
         let board_width = (BOARD_SIZE * 3 + 1) as u16;
         let board_height = (BOARD_SIZE + 2) as u16;
+        if area.width < board_width || area.height < board_height + 2 {
+            buf.set_string(
+                area.x,
+                area.y,
+                "Terminal too small — resize and restart",
+                Style::default().fg(TuiColor::Red),
+            );
+            return;
+        }
         let x_offset = area.x + (area.width.saturating_sub(board_width)) / 2;
         let y_offset = area.y + (area.height.saturating_sub(board_height)) / 2;
 
