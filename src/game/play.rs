@@ -59,8 +59,8 @@ fn run_game_loop<E: Evaluator>(
 
     let mut state = GameState {
         board: Board::new(),
-        cursor_row: 7,
-        cursor_col: 7,
+        cursor_row: BOARD_SIZE / 2,
+        cursor_col: BOARD_SIZE / 2,
         mcts: MCTS::new(),
         message: format!(
             "你的回合 ({}) — 箭头键移动, 空格落子, Q 退出",
