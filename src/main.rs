@@ -1,7 +1,12 @@
+use std::path::PathBuf;
+
 use burn::module::{AutodiffModule, Module};
 use burn::tensor::{Device, FloatDType, IntDType};
 use clap::{Parser, Subcommand};
+use gomoku_ai::game::play::play_game;
+use gomoku_ai::inference::InferenceServer;
 use gomoku_ai::network::residual::GomokuNetwork;
+use gomoku_ai::training::trainer::{TrainConfig, Trainer};
 
 #[derive(Parser)]
 #[command(name = "gomoku-ai")]
@@ -51,7 +56,7 @@ enum Command {
         simulations: usize,
 
         /// 模型文件路径（.bpk）
-        #[arg(short = 'm', long, default_value = "checkpoints/gomoku_latest")]
+        #[arg(short = 'm', long, default_value = "checkpoints/gomoku_latest.bpk")]
         model_path: String,
     },
 }
@@ -72,7 +77,7 @@ fn main() {
             println!("=== Gomoku AI (AlphaZero) - Training ===\n");
 
             let device = create_device();
-            let config = gomoku_ai::training::trainer::TrainConfig {
+            let config = TrainConfig {
                 num_simulations: simulations,
                 games_per_iteration: games,
                 batch_size,
@@ -82,7 +87,7 @@ fn main() {
                 model_dir: model_dir.into(),
                 ..Default::default()
             };
-            let mut trainer = gomoku_ai::training::trainer::Trainer::new(config, device);
+            let mut trainer = Trainer::new(config, device);
             trainer.train();
         }
 
@@ -91,13 +96,7 @@ fn main() {
             model_path,
         } => {
             let device = create_device();
-            let path = std::path::PathBuf::from(&model_path);
-
-            if !path.exists() {
-                eprintln!("Error: model file not found: {}", path.display());
-                eprintln!("Run 'gomoku-ai train' first to create a model.");
-                std::process::exit(1);
-            }
+            let path = PathBuf::from(&model_path);
 
             let record = burn::store::ModuleRecord::load(&path).unwrap_or_else(|e| {
                 eprintln!("Error: failed to load model: {}", e);
@@ -105,9 +104,9 @@ fn main() {
             });
             let model = GomokuNetwork::new(&device).load_record(record);
 
-            let server = gomoku_ai::inference::InferenceServer::new(model.valid(), device.clone());
+            let server = InferenceServer::new(model.valid(), device.clone());
             println!("Model loaded. Starting game...");
-            gomoku_ai::game::play::play_game(&server, simulations);
+            play_game(&server, simulations);
         }
     }
 }

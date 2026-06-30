@@ -539,11 +539,9 @@ impl MCTS {
     ///
     /// 虚拟损失已在 worker 的 PUCT 路径上加了，这里需要移除并加 visit。
     fn backprop_path_internal(&self, path: &[(usize, usize, usize)], mut value: f32) {
-        for &(node_idx, _move_idx, child_idx) in path.iter().rev() {
+        for &(_node_idx, _move_idx, child_idx) in path.iter().rev() {
             let child = self.node(child_idx);
-            let parent = self.node(node_idx);
             child.remove_virtual_loss();
-            parent.remove_virtual_loss();
             child.add_visit(value);
             value = -value;
         }
@@ -552,11 +550,9 @@ impl MCTS {
     // ── 反向传播 ──
 
     fn backprop_path(&self, path: &[(usize, usize, usize)], mut value: f32) {
-        for &(node_idx, _move_idx, child_idx) in path.iter().rev() {
+        for &(_node_idx, _move_idx, child_idx) in path.iter().rev() {
             let child = self.node(child_idx);
-            let parent = self.node(node_idx);
             child.remove_virtual_loss();
-            parent.remove_virtual_loss();
             child.add_visit(value);
             value = -value;
         }
