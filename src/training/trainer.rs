@@ -4,8 +4,8 @@
 
 use crate::game::board::{D4Symmetry, ENCODE_CHANNELS, NUM_POSITIONS};
 use crate::inference::InferenceServer;
-use crate::network::residual::{GomokuNetwork, BOARD_SIZE, INPUT_CHANNELS};
-use crate::selfplay::{self_play, PlayRecord, SelfPlayConfig};
+use crate::network::residual::{BOARD_SIZE, GomokuNetwork, INPUT_CHANNELS};
+use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 
 use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
@@ -67,7 +67,11 @@ pub struct Trainer {
 
 impl Trainer {
     pub fn new(config: TrainConfig, device: Device) -> Self {
-        Self { config, device, replay_buffer: VecDeque::new() }
+        Self {
+            config,
+            device,
+            replay_buffer: VecDeque::new(),
+        }
     }
 
     // ── 模型持久化 ──
@@ -110,9 +114,8 @@ impl Trainer {
 
         let mut optim = AdamConfig::new().init();
         if self.config.max_grad_norm > 0.0 {
-            optim = optim.with_grad_clipping(
-                GradientClippingConfig::Norm(self.config.max_grad_norm).init(),
-            );
+            optim = optim
+                .with_grad_clipping(GradientClippingConfig::Norm(self.config.max_grad_norm).init());
         }
 
         self.save_model(&model, "initial");
@@ -129,7 +132,10 @@ impl Trainer {
             self.run_self_play(&inference_server);
 
             let buffer_size = self.replay_buffer.len();
-            println!("  Training: epochs={}, buffer size={}", self.config.epochs, buffer_size);
+            println!(
+                "  Training: epochs={}, buffer size={}",
+                self.config.epochs, buffer_size
+            );
 
             if buffer_size < self.config.batch_size {
                 println!("    Buffer too small, skipping.");
@@ -139,7 +145,11 @@ impl Trainer {
             let (total_loss, total_steps) =
                 self.run_training_epochs(&mut model, &mut optim, &train_device);
 
-            let avg_loss = if total_steps > 0 { total_loss / total_steps as f32 } else { 0.0 };
+            let avg_loss = if total_steps > 0 {
+                total_loss / total_steps as f32
+            } else {
+                0.0
+            };
             println!("  Average loss: {:.4}", avg_loss);
 
             inference_server.update_model(model.clone().valid());
@@ -147,7 +157,9 @@ impl Trainer {
             let epoch = iteration + 1;
             if epoch % self.config.save_every == 0 || epoch == self.config.num_iterations {
                 self.save_model(&model, &format!("epoch_{}", epoch));
-                model.clone().valid()
+                model
+                    .clone()
+                    .valid()
                     .save_file(self.model_path("latest"))
                     .unwrap_or_else(|e| eprintln!("Warning: failed to save latest: {}", e));
             }
@@ -164,15 +176,17 @@ impl Trainer {
 
         let sp_config = SelfPlayConfig {
             num_simulations: self.config.num_simulations,
-            temperature: 1.0,
-            temperature_decay_steps: 30,
         };
 
         let all_records: Vec<PlayRecord> = (0..self.config.games_per_iteration)
             .into_par_iter()
             .flat_map(|_| {
                 let game = self_play(inference_server, &sp_config);
-                println!("    Game finished: {} steps, winner: {:?}", game.num_steps(), game.winner);
+                println!(
+                    "    Game finished: {} steps, winner: {:?}",
+                    game.num_steps(),
+                    game.winner
+                );
                 game.records
             })
             .collect();
@@ -184,7 +198,11 @@ impl Trainer {
             }
             self.replay_buffer.push_back(record);
         }
-        println!("  Buffer: {} samples (+{})", self.replay_buffer.len(), added);
+        println!(
+            "  Buffer: {} samples (+{})",
+            self.replay_buffer.len(),
+            added
+        );
     }
 
     // ── 训练阶段 ──
@@ -219,9 +237,16 @@ impl Trainer {
                     .map(|&i| {
                         let record = &self.replay_buffer[i];
                         let (state, policy) = D4Symmetry::random_augment(
-                            &record.state, &record.policy, &mut rng, identity_prob,
+                            &record.state,
+                            &record.policy,
+                            &mut rng,
+                            identity_prob,
                         );
-                        PlayRecord { state, policy, value: record.value }
+                        PlayRecord {
+                            state,
+                            policy,
+                            value: record.value,
+                        }
                     })
                     .collect();
                 let batch_len = mini_batch.len();
@@ -230,8 +255,9 @@ impl Trainer {
 
                 let state_tensor = Tensor::<1>::from_floats(flat_states.as_slice(), train_device)
                     .reshape([batch_len, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE]);
-                let policy_target = Tensor::<1>::from_floats(flat_policies.as_slice(), train_device)
-                    .reshape([batch_len, NUM_POSITIONS]);
+                let policy_target =
+                    Tensor::<1>::from_floats(flat_policies.as_slice(), train_device)
+                        .reshape([batch_len, NUM_POSITIONS]);
                 let value_target_tensor =
                     Tensor::<1>::from_floats(flat_values.as_slice(), train_device)
                         .reshape([batch_len, 1]);
@@ -267,7 +293,10 @@ impl Trainer {
                 let (new_policy_logits, new_value_pred) = model.forward(state_for_new);
                 let new_log_probs = log_softmax(new_policy_logits.clone(), 1);
                 let probs = new_log_probs.clone().exp();
-                let entropy = -(probs * new_log_probs).sum_dim(1).mean().into_scalar::<f32>();
+                let entropy = -(probs * new_log_probs)
+                    .sum_dim(1)
+                    .mean()
+                    .into_scalar::<f32>();
                 epoch_entropy_sum += entropy;
                 epoch_entropy_count += 1;
 
@@ -281,13 +310,26 @@ impl Trainer {
                 all_value_targets.extend(flat_values.iter());
             }
 
-            let avg_loss = if epoch_steps > 0 { epoch_loss / epoch_steps as f32 } else { 0.0 };
-            let avg_entropy = if epoch_entropy_count > 0 { epoch_entropy_sum / epoch_entropy_count as f32 } else { 0.0 };
+            let avg_loss = if epoch_steps > 0 {
+                epoch_loss / epoch_steps as f32
+            } else {
+                0.0
+            };
+            let avg_entropy = if epoch_entropy_count > 0 {
+                epoch_entropy_sum / epoch_entropy_count as f32
+            } else {
+                0.0
+            };
             let explained_var = Self::explained_variance(&all_value_preds, &all_value_targets);
 
             println!(
                 "    Epoch {}/{}: {} steps, avg_loss={:.4}, explained_var={:.3}, avg_entropy={:.4}",
-                epoch + 1, self.config.epochs, epoch_steps, avg_loss, explained_var, avg_entropy,
+                epoch + 1,
+                self.config.epochs,
+                epoch_steps,
+                avg_loss,
+                explained_var,
+                avg_entropy,
             );
 
             total_loss += epoch_loss;
@@ -322,11 +364,20 @@ impl Trainer {
         }
         let nf = n as f32;
         let mean_target: f32 = targets.iter().sum::<f32>() / nf;
-        let var_target: f32 = targets.iter().map(|t| (t - mean_target).powi(2)).sum::<f32>() / (nf - 1.0);
+        let var_target: f32 = targets
+            .iter()
+            .map(|t| (t - mean_target).powi(2))
+            .sum::<f32>()
+            / (nf - 1.0);
         if var_target < 1e-10 {
             return 1.0;
         }
-        let var_residual: f32 = targets.iter().zip(predictions).map(|(t, p)| (t - p).powi(2)).sum::<f32>() / (nf - 1.0);
+        let var_residual: f32 = targets
+            .iter()
+            .zip(predictions)
+            .map(|(t, p)| (t - p).powi(2))
+            .sum::<f32>()
+            / (nf - 1.0);
         1.0 - var_residual / var_target
     }
 }

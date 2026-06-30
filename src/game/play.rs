@@ -7,7 +7,7 @@ use std::io;
 
 use crate::game::board::{BOARD_SIZE, Board, Color, NUM_POSITIONS};
 use crate::inference::Evaluator;
-use crate::mcts::node::MCTS;
+use crate::mcts::node::{GumbelConfig, MCTS};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -122,12 +122,8 @@ fn run_game_loop<E: Evaluator>(
 }
 
 fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
-    let result = state.mcts.search(
-        &mut state.board,
-        evaluator,
-        num_simulations,
-        0.0, // 确定性选择
-    );
+    let config = GumbelConfig::pure_gumbel(num_simulations);
+    let result = state.mcts.search(&mut state.board, evaluator, &config);
 
     if result.best_move < NUM_POSITIONS {
         state.board.play_idx(result.best_move);

@@ -25,11 +25,11 @@ enum Command {
         iterations: usize,
 
         /// 每轮自对弈局数
-        #[arg(short = 'g', long, default_value = "4")]
+        #[arg(short = 'g', long, default_value = "32")]
         games: usize,
 
-        /// 每次 MCTS 模拟次数
-        #[arg(short = 's', long, default_value = "200")]
+        /// 每次 MCTS 模拟次数（Gumbel Zero 只需 16~64）
+        #[arg(short = 's', long, default_value = "16")]
         simulations: usize,
 
         /// 学习率
@@ -37,7 +37,7 @@ enum Command {
         learning_rate: f64,
 
         /// 批大小
-        #[arg(short = 'b', long, default_value = "128")]
+        #[arg(short = 'b', long, default_value = "256")]
         batch_size: usize,
 
         /// 模型保存目录
@@ -51,8 +51,8 @@ enum Command {
 
     /// 人机对弈
     Play {
-        /// MCTS 模拟次数
-        #[arg(short = 's', long, default_value = "800")]
+        /// MCTS 模拟次数（Gumbel Zero 只需 32~64）
+        #[arg(short = 's', long, default_value = "64")]
         simulations: usize,
 
         /// 模型文件路径（.bpk）
@@ -116,13 +116,13 @@ fn main() {
 /// 训练+推理统一使用 BF16（指数位与 F32 相同，避免梯度溢出）。
 /// backend 不支持 BF16 时自动降级 F32。
 fn create_device() -> Device {
-    let mut device = Device::default();
-    match device.configure((FloatDType::BF16, IntDType::I32)) {
-        Ok(()) => println!("Device: float=BF16"),
-        Err(e) => {
-            eprintln!("BF16 not supported ({e}), falling back to F32");
-            device.configure((FloatDType::F32, IntDType::I32)).ok();
-        }
-    }
+    let device = Device::default();
+    // match device.configure((FloatDType::BF16, IntDType::I32)) {
+    //     Ok(()) => println!("Device: float=BF16"),
+    //     Err(e) => {
+    //         eprintln!("BF16 not supported ({e}), falling back to F32");
+    //         device.configure((FloatDType::F32, IntDType::I32)).ok();
+    //     }
+    // }
     device
 }
