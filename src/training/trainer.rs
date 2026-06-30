@@ -16,6 +16,7 @@ use burn::{
     store::ModuleRecord,
     tensor::{Device, FloatDType, Tensor, activation::log_softmax},
 };
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -44,14 +45,14 @@ impl Default for TrainConfig {
             num_simulations: 200,
             games_per_iteration: 64,
             batch_size: 512,
-            epochs: 2,
+            epochs: 1,
             num_iterations: 100,
             learning_rate: 1e-3,
             value_loss_weight: 1.0,
             save_every: 5,
             model_dir: PathBuf::from("checkpoints"),
             kl_targ: 0.02,
-            buffer_capacity: 12000,
+            buffer_capacity: 24000,
             max_grad_norm: 1.0,
         }
     }
@@ -172,24 +173,29 @@ impl Trainer {
     // ── 自对弈 ──
 
     fn run_self_play(&mut self, inference_server: &InferenceServer) {
-        println!("  Self-play: {} games...", self.config.games_per_iteration);
+        let total = self.config.games_per_iteration;
+
+        let pb = ProgressBar::new(total as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("  Self-play: {bar:40.cyan/blue} {pos}/{len} ({eta})")
+                .unwrap(),
+        );
 
         let sp_config = SelfPlayConfig {
             num_simulations: self.config.num_simulations,
         };
 
-        let all_records: Vec<PlayRecord> = (0..self.config.games_per_iteration)
+        let all_records: Vec<PlayRecord> = (0..total)
             .into_par_iter()
             .flat_map(|_| {
                 let game = self_play(inference_server, &sp_config);
-                println!(
-                    "    Game finished: {} steps, winner: {:?}",
-                    game.num_steps(),
-                    game.winner
-                );
+                pb.inc(1);
                 game.records
             })
             .collect();
+
+        pb.finish_and_clear();
 
         let added = all_records.len();
         for record in all_records {
@@ -219,8 +225,17 @@ impl Trainer {
         let mut rng = rand::rng();
         let identity_prob = 1.0 / D4Symmetry::COUNT as f32;
 
+        let n = self.replay_buffer.len();
+        let total_batches =
+            self.config.epochs * (n + self.config.batch_size - 1) / self.config.batch_size;
+        let pb = ProgressBar::new(total_batches as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("  Training: {bar:40.green/dim} {pos}/{len} batches ({eta})")
+                .unwrap(),
+        );
+
         for epoch in 0..self.config.epochs {
-            let n = self.replay_buffer.len();
             let mut indices: Vec<usize> = (0..n).collect();
             indices.shuffle(&mut rng);
 
@@ -290,6 +305,7 @@ impl Trainer {
                 *model = optim.step(lr, model.clone(), grads);
 
                 // 更新后统计
+                pb.inc(1);
                 let (new_policy_logits, new_value_pred) = model.forward(state_for_new);
                 let new_log_probs = log_softmax(new_policy_logits.clone(), 1);
                 let probs = new_log_probs.clone().exp();
@@ -335,6 +351,8 @@ impl Trainer {
             total_loss += epoch_loss;
             total_steps += epoch_steps;
         }
+
+        pb.finish_and_clear();
 
         (total_loss, total_steps)
     }

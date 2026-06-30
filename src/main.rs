@@ -33,7 +33,7 @@ enum Command {
         simulations: usize,
 
         /// 学习率
-        #[arg(short = 'l', long, default_value = "0.001")]
+        #[arg(short = 'l', long, default_value = "0.002")]
         learning_rate: f64,
 
         /// 批大小

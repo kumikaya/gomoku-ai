@@ -226,11 +226,12 @@ impl Widget for BoardWidget<'_> {
         }
 
         // 在 (7,7) 天元位置加标记
-        let star_x = x_offset + 7 * 3 + 2;
-        let star_y = y_offset + 7 + 1;
-        if self.state.board.get(7, 7) == 0
-            && !(self.state.cursor_row == 7 && self.state.cursor_col == 7)
+        let half_size = BOARD_SIZE / 2;
+        if self.state.board.get(half_size, half_size) == 0
+            && !(self.state.cursor_row == half_size && self.state.cursor_col == half_size)
         {
+            let star_x = x_offset + half_size as u16 * 3 + 2;
+            let star_y = y_offset + half_size as u16 + 1;
             buf.set_string(star_x, star_y, "╋", Style::default().fg(TuiColor::DarkGray));
         }
     }
