@@ -45,6 +45,8 @@ const DRAW_VALUE: f32 = 0.0;
 pub struct GumbelConfig {
     pub num_simulations: usize,
     pub sample_size: usize,
+    /// 每次 GPU forward 攒批的叶子数（默认 8，对齐 minizero actor_mcts_think_batch_size）
+    pub think_batch_size: usize,
     pub sigma_visit_c: f32,
     pub sigma_scale_c: f32,
     pub pure_gumbel_noise: bool,
@@ -65,6 +67,7 @@ impl Default for GumbelConfig {
             select_temperature: 1.0,
             dirichlet_alpha: 0.1,
             dirichlet_epsilon: 0.25,
+            think_batch_size: 8,
         }
     }
 }
@@ -105,6 +108,8 @@ pub struct Node {
     pub expanded: bool,
     /// 该节点对应哪个玩家的回合
     pub player: Color,
+    /// Virtual loss：攒批 evaluate 期间让 PUCT walk 发散
+    pub virtual_loss: u32,
 }
 
 impl Node {
@@ -118,6 +123,7 @@ impl Node {
             children: Table::new(NUM_POSITIONS),
             expanded: false,
             player,
+            virtual_loss: 0,
         }
     }
 
@@ -145,6 +151,12 @@ impl Node {
     pub fn add_visit(&mut self, value: f32) {
         self.visit_count += 1;
         self.total_value += value;
+    }
+
+    /// visit_count 含 virtual loss（用于 PUCT walk 时让后续 walk 发散）
+    #[inline]
+    pub fn effective_visits(&self) -> u32 {
+        self.visit_count + self.virtual_loss
     }
 }
 
@@ -260,6 +272,8 @@ impl MCTS {
 
     /// PUCT walk，返回从 `start_node_idx`（含）到叶子节点（含）的路径。
     /// 对齐 minizero `selectFromNode`：起始节点始终在 path[0]。
+    /// PUCT 公式中 `n` 用 effective_visits（visit_count + virtual_loss），
+    /// 使攒批期间的连续 walk 自然分到不同叶子。
     fn puct_walk(
         &self,
         start_node_idx: usize,
@@ -279,8 +293,7 @@ impl MCTS {
             }
 
             let node = self.node(node_idx);
-            // total_simulation = node->getCountWithVirtualLoss() - 1（对齐 minizero）
-            let total_simulation = node.visit_count.saturating_sub(1) as f32;
+            let total_simulation = node.effective_visits().saturating_sub(1) as f32;
             let bias = Self::puct_bias(total_simulation);
             let sqrt_total = total_simulation.sqrt();
             let init_q = self.init_q_value(node_idx);
@@ -291,9 +304,9 @@ impl MCTS {
                 let idx = Board::pos_to_idx(r, c);
                 if let Some(ci) = children[idx] {
                     let child = self.node(ci);
-                    let n = child.visit_count as f32;
-                    let q = if n > 0.0 {
-                        child.total_value / n
+                    let n = child.effective_visits() as f32;
+                    let q = if child.visit_count > 0 {
+                        child.total_value / child.visit_count as f32
                     } else {
                         init_q
                     };
@@ -403,81 +416,161 @@ impl MCTS {
             candidates.truncate(sample_n);
         }
 
-        // ── Phase 3: 模拟循环 ──
+        // ── Phase 3: 模拟循环（攒批 evaluate）──
+        // 对标 minizero ZeroActor::step()：
+        //   连续做 batch_size 次 PUCT walk → 攒特征 → 一次 GPU forward → 消费结果。
+        //   virtual loss 让连续 walk 自然发散到不同叶子。
+        let batch_size = (sample_n.min(config.think_batch_size)).max(1);
+
         let mut cur_sample = sample_n;
         let mut sim_budget = Self::gumbel_budget(num_sim, cur_sample);
 
         let mut sim_board = board.clone();
         let mut legal_buf = Vec::with_capacity(NUM_POSITIONS);
+        let mut sim_i = 0;
 
-        for sim_i in 0..num_sim {
-            // ── selection ──
-            let path: Vec<usize>;
+        loop {
+            if sim_i >= num_sim {
+                break;
+            }
 
-            if sim_i == 0 {
-                // 第一次模拟：从 root 走标准 PUCT（path[0] == 0）
-                sim_board.clone_from(board);
-                path = self.puct_walk(0, &mut sim_board, &mut legal_buf);
+            // ── 一轮批量：连续 walk 攒 batch_size 个叶子 ──
+            let round = (num_sim - sim_i).min(batch_size);
+
+            // 暂存本轮每个 walk 的上下文
+            struct EvalCtx {
+                path: Vec<usize>,
+                encoding: Vec<i32>,
+                legal: Vec<(usize, usize)>,
+                game_over: bool,
+                winner: Option<Color>,
+            }
+            let mut contexts: Vec<EvalCtx> = Vec::with_capacity(round);
+            let mut encodings: Vec<Vec<i32>> = Vec::with_capacity(round);
+
+            for _ in 0..round {
+                // ── selection ──
+                let path: Vec<usize>;
+
+                if sim_i == 0 {
+                    sim_board.clone_from(board);
+                    path = self.puct_walk(0, &mut sim_board, &mut legal_buf);
+                } else {
+                    candidates.sort_by(|&a, &b| {
+                        self.node(a)
+                            .visit_count
+                            .cmp(&self.node(b).visit_count)
+                            .then_with(|| {
+                                self.node(b)
+                                    .policy_logit
+                                    .partial_cmp(&self.node(a).policy_logit)
+                                    .unwrap()
+                            })
+                    });
+                    let start_ci = candidates[0];
+
+                    sim_board.clone_from(board);
+                    let move_idx = self.root().children.position_of(&start_ci).unwrap_or(0);
+                    sim_board.play_idx(move_idx);
+
+                    let p_from = self.puct_walk(start_ci, &mut sim_board, &mut legal_buf);
+                    let mut full = vec![0];
+                    full.extend(p_from);
+                    path = full;
+                }
+
+                // add virtual loss 到这条路径上
+                for &ni in &path {
+                    self.node_mut(ni).virtual_loss += 1;
+                }
+
+                let leaf_idx = *path.last().unwrap();
+
+                if sim_board.game_over {
+                    contexts.push(EvalCtx {
+                        path,
+                        encoding: Vec::new(),
+                        legal: Vec::new(),
+                        game_over: true,
+                        winner: sim_board.winner,
+                    });
+                } else if !self.node(leaf_idx).expanded {
+                    let mut encoding = vec![0i32; ENCODE_LEN];
+                    sim_board.encode_into(&mut encoding);
+                    sim_board.fill_legal_moves(&mut legal_buf);
+                    let legal_leaf = std::mem::take(&mut legal_buf);
+                    encodings.push(encoding.clone());
+                    contexts.push(EvalCtx {
+                        path,
+                        encoding,
+                        legal: legal_leaf,
+                        game_over: false,
+                        winner: None,
+                    });
+                } else {
+                    // 已展开的节点（理论上不应该到这里，但保留处理）
+                    contexts.push(EvalCtx {
+                        path,
+                        encoding: Vec::new(),
+                        legal: Vec::new(),
+                        game_over: false,
+                        winner: None,
+                    });
+                }
+
+                sim_i += 1;
+            }
+
+            // ── 批量 GPU forward ──
+            let eval_result = if !encodings.is_empty() {
+                Some(evaluator.evaluate_batch(&encodings))
             } else {
-                // 从 count 最小候选出发（ties broken by higher logit）
-                candidates.sort_by(|&a, &b| {
-                    self.node(a)
-                        .visit_count
-                        .cmp(&self.node(b).visit_count)
-                        .then_with(|| {
-                            self.node(b)
-                                .policy_logit
-                                .partial_cmp(&self.node(a).policy_logit)
-                                .unwrap()
+                None
+            };
+
+            // ── 消费结果：expand + backprop，清除 virtual loss ──
+            let mut batch_result_idx = 0;
+            for ctx in contexts.into_iter() {
+                // 清除 virtual loss
+                for &ni in &ctx.path {
+                    self.node_mut(ni).virtual_loss = self.node(ni).virtual_loss.saturating_sub(1);
+                }
+
+                if ctx.game_over {
+                    let v = match ctx.winner {
+                        Some(_) => WIN_VALUE,
+                        None => DRAW_VALUE,
+                    };
+                    self.backprop_path(&ctx.path, v);
+                } else if !ctx.encoding.is_empty() {
+                    let (policies_batch, values_batch) = eval_result.as_ref().unwrap();
+                    let probs = Self::softmax_legal(&policies_batch[batch_result_idx], &ctx.legal);
+
+                    let leaf_idx = *ctx.path.last().unwrap();
+                    let gumbel_noises_leaf = vec![0.0f32; ctx.legal.len()];
+                    let child_data_leaf: Vec<(f32, f32)> = ctx
+                        .legal
+                        .iter()
+                        .map(|&(r, c)| {
+                            let idx = Board::pos_to_idx(r, c);
+                            let p = probs[idx];
+                            (p, p.max(MIN_PROB).ln())
                         })
-                });
-                let start_ci = candidates[0];
-
-                // 推进棋盘到候选子节点对应的局面
-                sim_board.clone_from(board);
-                let move_idx = self.root().children.position_of(&start_ci).unwrap_or(0);
-                sim_board.play_idx(move_idx);
-
-                // puct_walk 返回以 start_ci 开头的 path，前面 prepend root
-                let p_from = self.puct_walk(start_ci, &mut sim_board, &mut legal_buf);
-                let mut full = vec![0];
-                full.extend(p_from);
-                path = full;
+                        .collect();
+                    self.expand_children(
+                        leaf_idx,
+                        &ctx.legal,
+                        &gumbel_noises_leaf,
+                        &child_data_leaf,
+                    );
+                    self.node_mut(leaf_idx).expanded = true;
+                    self.backprop_path(&ctx.path, -values_batch[batch_result_idx]);
+                    batch_result_idx += 1;
+                }
+                // else: 已展开节点，无操作
             }
 
-            let leaf_idx = *path.last().unwrap();
-
-            // ── evaluate & expand & backup ──
-            if sim_board.game_over {
-                let v = match sim_board.winner {
-                    Some(_) => WIN_VALUE,
-                    None => DRAW_VALUE,
-                };
-                self.backprop_path(&path, v);
-            } else if !self.node(leaf_idx).expanded {
-                let mut encoding = vec![0i32; ENCODE_LEN];
-                sim_board.encode_into(&mut encoding);
-                sim_board.fill_legal_moves(&mut legal_buf);
-                let legal_leaf = std::mem::take(&mut legal_buf);
-
-                let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]);
-                let probs = Self::softmax_legal(&policies_batch[0], &legal_leaf);
-
-                let gumbel_noises_leaf = vec![0.0f32; legal_leaf.len()];
-                let child_data_leaf: Vec<(f32, f32)> = legal_leaf
-                    .iter()
-                    .map(|&(r, c)| {
-                        let idx = Board::pos_to_idx(r, c);
-                        let p = probs[idx];
-                        (p, p.max(MIN_PROB).ln())
-                    })
-                    .collect();
-                self.expand_children(leaf_idx, &legal_leaf, &gumbel_noises_leaf, &child_data_leaf);
-                self.node_mut(leaf_idx).expanded = true;
-                self.backprop_path(&path, -values_batch[0]);
-            }
-
-            // ── sequentialHalving ──
+            // ── sequentialHalving（每轮结束后检查一次）──
             let all_reached = candidates
                 .iter()
                 .all(|&ci| self.node(ci).visit_count_f32() >= sim_budget as f32);

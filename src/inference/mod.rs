@@ -9,6 +9,7 @@ use std::time::Duration;
 
 /// 批量评估上限（GPU 线程内部攒批的最大请求数）
 const SERVER_BATCH_CAP: usize = 256;
+const BATCH_TIMEOUT: Duration = Duration::from_micros(200);
 
 // ============================================================
 //  Evaluator trait：MCTS 只依赖这个接口，不感知 GPU/CPU
@@ -215,7 +216,7 @@ impl InferenceServer {
                 if batch.len() >= SERVER_BATCH_CAP {
                     break;
                 }
-                match rx.recv_timeout(Duration::from_micros(200)) {
+                match rx.recv_timeout(BATCH_TIMEOUT) {
                     Ok(GpuCommand::Evaluate(req)) => batch.push(req),
                     Ok(GpuCommand::UpdateModel {
                         model: new_model,

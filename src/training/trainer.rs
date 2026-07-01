@@ -389,7 +389,7 @@ impl Trainer {
         pb.finish_and_clear();
 
         println!(
-            "{} batches: avg_loss={:.4}, explained_var={:.3}, avg_entropy={:.4}",
+            "  {} batches: avg_loss={:.4}, explained_var={:.3}, avg_entropy={:.4}",
             total_steps, avg_loss, explained_var, avg_entropy,
         );
 
