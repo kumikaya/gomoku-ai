@@ -21,7 +21,7 @@ enum Command {
     /// 训练模型
     Train {
         /// 训练轮数（默认 100）
-        #[arg(short = 'i', long, default_value = "100")]
+        #[arg(short = 'i', long, default_value = "400")]
         iterations: usize,
 
         /// 每轮自对弈局数
