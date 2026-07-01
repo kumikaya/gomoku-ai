@@ -144,6 +144,24 @@ impl InferenceServer {
             .to_vec::<f32>()
             .unwrap();
 
+        // NaN 防护：将 NaN 替换为 safe fallback
+        let has_nan_policy = policy_flat.iter().any(|v| v.is_nan());
+        let has_nan_value = values_flat.iter().any(|v| v.is_nan());
+        if has_nan_policy || has_nan_value {
+            eprintln!(
+                "WARNING: NN output contains NaN (policy={}, value={}), using safe fallback",
+                has_nan_policy, has_nan_value
+            );
+        }
+        let policy_flat: Vec<f32> = policy_flat
+            .into_iter()
+            .map(|v| if v.is_nan() { 0.0 } else { v })
+            .collect();
+        let values_flat: Vec<f32> = values_flat
+            .into_iter()
+            .map(|v| if v.is_nan() { 0.0 } else { v })
+            .collect();
+
         // 按请求拆分结果
         let mut pol_offset = 0;
         let mut val_offset = 0;
