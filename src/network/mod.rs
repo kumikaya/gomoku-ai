@@ -1,12 +1,15 @@
-//! AlphaZero 风格的残差卷积网络
+//! Transformer Decoder 五子棋网络
 //!
-//! 输入：[batch, 1, 15, 15]  单通道棋盘编码（-1=对方, 0=空, 1=己方）
+//! 输入：[batch, BOARD_SIZE²] i32  (0=空, 1=黑, 2=白)
 //! 输出：
-//!   - 策略分布：[batch, 225] 各合法落子点概率
-//!   - 局势价值：[batch, 1]  范围 [-1, 1]（Tanh）
+//!   - 策略 logits：[batch, BOARD_SIZE²] 各落子点未归一化分数
+//!   - 局势价值：  [batch, 1]  范围 [-1, 1]（Tanh）
 //!
-//! 骨干网络包含多个残差块，每个残差块由两个 Conv2d+BatchNorm+ReLU 组成，
-//! 最后通过跳跃连接相加。
-//! 前向传播使用 f16 半精度计算以减少显存和加速推理。
+//! 架构：
+//!   ContentEmbedding(3 → d_model)
+//!   + Pos2DEmbed (行/列解耦可学习位置编码)
+//!   + N × TransformerBlock (pre-LN self-attention + FFN, ReLU)
+//!   + Policy head (per-position Linear) + Value head (mean pool → MLP → Tanh)
 
-pub mod residual;
+pub mod pos_encoding;
+pub mod transformer;

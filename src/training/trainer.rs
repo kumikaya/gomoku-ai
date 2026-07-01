@@ -2,9 +2,9 @@
 //!
 //! `TrainConfig` 配置训练超参数，`Trainer` 执行完整的 AlphaZero 训练循环。
 
-use crate::game::board::{BOARD_SIZE, D4Symmetry, ENCODE_CHANNELS, NUM_POSITIONS};
+use crate::game::board::{D4Symmetry, ENCODE_LEN, NUM_POSITIONS};
 use crate::inference::InferenceServer;
-use crate::network::residual::{GomokuNetwork, INPUT_CHANNELS};
+use crate::network::transformer::GomokuNetwork;
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 
 use burn::module::Module;
@@ -14,7 +14,7 @@ use burn::{
     module::AutodiffModule,
     optim::{AdamConfig, GradientsParams},
     store::ModuleRecord,
-    tensor::{Device, FloatDType, Tensor, activation::log_softmax},
+    tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
@@ -34,7 +34,6 @@ pub struct TrainConfig {
     pub value_loss_weight: f32,
     pub save_every: usize,
     pub model_dir: PathBuf,
-    pub kl_targ: f32,
     pub buffer_capacity: usize,
     pub max_grad_norm: f32,
 }
@@ -48,12 +47,11 @@ impl Default for TrainConfig {
             epochs: 1,
             num_iterations: 100,
             learning_rate: 1e-3,
-            value_loss_weight: 1.0,
+            value_loss_weight: 0.5,
             save_every: 5,
             model_dir: PathBuf::from("checkpoints"),
-            kl_targ: 0.02,
             buffer_capacity: 24000,
-            max_grad_norm: 1.0,
+            max_grad_norm: 2.0,
         }
     }
 }
@@ -198,26 +196,11 @@ impl Trainer {
         pb.finish_and_clear();
 
         let added = all_records.len();
-        let mut nan_count = 0;
         for record in all_records {
-            // 过滤 NaN 样本，防止污染回放缓冲区和下游训练
-            if record.policy.iter().any(|x| !x.is_finite())
-                || !record.value.is_finite()
-                || record.state.iter().any(|x| !x.is_finite())
-            {
-                nan_count += 1;
-                continue;
-            }
             if self.replay_buffer.len() >= self.config.buffer_capacity {
                 self.replay_buffer.pop_front();
             }
             self.replay_buffer.push_back(record);
-        }
-        if nan_count > 0 {
-            eprintln!(
-                "  WARNING: {} NaN samples filtered out (MCTS produced invalid policy).",
-                nan_count
-            );
         }
         println!(
             "  Buffer: {} samples (+{})",
@@ -283,8 +266,13 @@ impl Trainer {
 
                 let (flat_states, flat_policies, flat_values) = Self::flatten_batch(&mini_batch);
 
-                let state_tensor = Tensor::<1>::from_floats(flat_states.as_slice(), train_device)
-                    .reshape([batch_len, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE]);
+                let state_tensor = Tensor::<2, Int>::from_data(
+                    burn::tensor::TensorData::new(
+                        flat_states,
+                        [batch_len as i32, ENCODE_LEN as i32],
+                    ),
+                    train_device,
+                );
                 let policy_target =
                     Tensor::<1>::from_floats(flat_policies.as_slice(), train_device)
                         .reshape([batch_len, NUM_POSITIONS]);
@@ -292,11 +280,29 @@ impl Trainer {
                     Tensor::<1>::from_floats(flat_values.as_slice(), train_device)
                         .reshape([batch_len, 1]);
 
-                let state_for_new = state_tensor.clone();
-
                 let (policy_logits, value_pred) = model.forward(state_tensor);
 
                 let log_probs = log_softmax(policy_logits.clone(), 1);
+
+                // 统计
+                {
+                    let log_probs = log_probs.clone().detach();
+                    let probs = log_probs.clone().exp();
+                    let entropy = -(probs * log_probs).sum_dim(1).mean().into_scalar::<f32>();
+                    epoch_entropy_sum += entropy;
+                    epoch_entropy_count += 1;
+
+                    let val_pred: Vec<f32> = value_pred
+                        .clone()
+                        .reshape([batch_len])
+                        .cast(FloatDType::F32)
+                        .into_data()
+                        .to_vec()
+                        .unwrap();
+                    all_value_preds.extend(val_pred);
+                    all_value_targets.extend(flat_values.iter());
+                }
+
                 let policy_loss = -(log_probs * policy_target.clone()).sum_dim(1).mean();
 
                 let mse = MseLoss::new();
@@ -311,15 +317,6 @@ impl Trainer {
                 let loss = policy_loss + value_loss * value_weight_tensor.unsqueeze();
 
                 let scalar: f32 = loss.clone().into_scalar();
-                if !scalar.is_finite() {
-                    eprintln!(
-                        "  WARNING: NaN loss detected at epoch {} step {} — skipping update.",
-                        epoch + 1,
-                        epoch_steps
-                    );
-                    pb.inc(1);
-                    continue;
-                }
                 epoch_loss += scalar;
                 epoch_steps += 1;
 
@@ -328,26 +325,7 @@ impl Trainer {
                 let grads = GradientsParams::from_grads(grads, model);
                 *model = optim.step(lr, model.clone(), grads);
 
-                // 更新后统计
                 pb.inc(1);
-                let (new_policy_logits, new_value_pred) = model.forward(state_for_new);
-                let new_log_probs = log_softmax(new_policy_logits.clone(), 1);
-                let probs = new_log_probs.clone().exp();
-                let entropy = -(probs * new_log_probs)
-                    .sum_dim(1)
-                    .mean()
-                    .into_scalar::<f32>();
-                epoch_entropy_sum += entropy;
-                epoch_entropy_count += 1;
-
-                let new_val_pred: Vec<f32> = new_value_pred
-                    .reshape([batch_len])
-                    .cast(FloatDType::F32)
-                    .into_data()
-                    .to_vec()
-                    .unwrap();
-                all_value_preds.extend(new_val_pred);
-                all_value_targets.extend(flat_values.iter());
             }
 
             let avg_loss = if epoch_steps > 0 {
@@ -383,9 +361,9 @@ impl Trainer {
 
     // ── 数据辅助 ──
 
-    fn flatten_batch(batch: &[PlayRecord]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn flatten_batch(batch: &[PlayRecord]) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
         let batch_size = batch.len();
-        let mut states = Vec::with_capacity(batch_size * ENCODE_CHANNELS * NUM_POSITIONS);
+        let mut states = Vec::with_capacity(batch_size * ENCODE_LEN);
         let mut policies = Vec::with_capacity(batch_size * NUM_POSITIONS);
         let mut values = Vec::with_capacity(batch_size);
 

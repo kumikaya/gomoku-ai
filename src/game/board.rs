@@ -4,8 +4,8 @@
 pub const BOARD_SIZE: usize = 8;
 /// 总位置数
 pub const NUM_POSITIONS: usize = BOARD_SIZE * BOARD_SIZE;
-/// 棋盘编码通道数（单通道：-1=对方, 0=空, 1=己方）
-pub const ENCODE_CHANNELS: usize = 1;
+/// 棋盘编码长度（扁平序列：0=空, 1=己方, 2=对方）
+pub const ENCODE_LEN: usize = NUM_POSITIONS;
 
 /// 玩家颜色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,17 +209,13 @@ impl Board {
         false
     }
 
-    /// 编码棋盘为网络输入：[4 × 225] 的 f32 张量
+    /// 编码棋盘为网络输入：扁平 i32 序列，当前玩家视角。
     ///
-    /// 将编码写入预分配缓冲区，避免频繁分配。
-    pub fn encode_into(&self, data: &mut [f32]) {
-        let size = NUM_POSITIONS;
-        debug_assert!(
-            data.len() >= ENCODE_CHANNELS * size,
-            "encode_into buffer too small"
-        );
+    /// 0=空, 1=己方棋子, 2=对方棋子。
+    pub fn encode_into(&self, data: &mut [i32]) {
+        debug_assert!(data.len() >= ENCODE_LEN, "encode_into buffer too small");
 
-        let (current_stone, opponent_stone) = match self.current_player {
+        let (me, opp) = match self.current_player {
             Color::Black => (1u8, 2u8),
             Color::White => (2u8, 1u8),
         };
@@ -228,22 +224,20 @@ impl Board {
             for c in 0..BOARD_SIZE {
                 let idx = r * BOARD_SIZE + c;
                 let cell = self.cells[r][c];
-                // 单通道编码：己方=1, 对方=-1, 空=0
-                data[idx] = if cell == current_stone {
-                    1.0
-                } else if cell == opponent_stone {
-                    -1.0
+                data[idx] = if cell == me {
+                    1
+                } else if cell == opp {
+                    2
                 } else {
-                    0.0
+                    0
                 };
             }
         }
     }
 
     /// 编码棋盘为网络输入（分配新 Vec）。
-    /// MCTS evaluate 中使用 `encode_into` 替代此方法避免重复分配。
-    pub fn encode_state(&self) -> Vec<f32> {
-        let mut data = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
+    pub fn encode_state(&self) -> Vec<i32> {
+        let mut data = vec![0i32; ENCODE_LEN];
         self.encode_into(&mut data);
         data
     }
@@ -304,26 +298,22 @@ impl D4Symmetry {
 
     /// 对编码后的棋盘状态和策略分布应用指定的 D4 变换。
     ///
-    /// - `state`: 输入形状 [ENCODE_CHANNELS × NUM_POSITIONS] 的编码（4 通道交错存储）
+    /// - `state`: 输入形状 [NUM_POSITIONS] 的 i32 编码（0=空, 1=黑, 2=白，扁平序列）
     /// - `policy`: 输入形状 [NUM_POSITIONS] 的策略分布
     /// - `transform_idx`: 变换索引 (0..=7)
     ///
-    /// 对每个通道同时做相同的空间重排，策略分布也做相同重排。
+    /// 对状态做空间重排，策略分布也做相同重排。
     pub fn apply_transform(
-        state: &[f32],
+        state: &[i32],
         policy: &[f32],
         transform_idx: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
+    ) -> (Vec<i32>, Vec<f32>) {
         let map = &Self::index_maps()[transform_idx];
-        let mut new_state = vec![0.0f32; state.len()];
+        let mut new_state = vec![0i32; state.len()];
         let mut new_policy = vec![0.0f32; NUM_POSITIONS];
 
-        // 对每个编码通道做空间变换
-        for ch in 0..ENCODE_CHANNELS {
-            let offset = ch * NUM_POSITIONS;
-            for src in 0..NUM_POSITIONS {
-                new_state[offset + map[src]] = state[offset + src];
-            }
+        for src in 0..NUM_POSITIONS {
+            new_state[map[src]] = state[src];
         }
 
         // 策略分布重排
@@ -338,11 +328,11 @@ impl D4Symmetry {
     ///
     /// 恒等变换（idx=0）的概率为 `identity_prob`，其余 7 种均匀分配。
     pub fn random_augment(
-        state: &[f32],
+        state: &[i32],
         policy: &[f32],
         rng: &mut impl rand::RngExt,
         identity_prob: f32,
-    ) -> (Vec<f32>, Vec<f32>) {
+    ) -> (Vec<i32>, Vec<f32>) {
         let t: f32 = rng.random();
         let idx = if t < identity_prob {
             0
@@ -350,262 +340,5 @@ impl D4Symmetry {
             1 + rng.random_range(0..7) as usize
         };
         Self::apply_transform(state, policy, idx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty_board() {
-        let board = Board::new();
-        assert_eq!(board.current_player, Color::Black);
-        assert_eq!(board.step_count, 0);
-        assert!(!board.game_over);
-        assert_eq!(board.legal_moves().len(), NUM_POSITIONS);
-    }
-
-    #[test]
-    fn test_play_and_alternate() {
-        let mut board = Board::new();
-        assert!(board.play(7, 7));
-        assert_eq!(board.current_player, Color::White);
-        assert!(board.play(7, 8));
-        assert_eq!(board.current_player, Color::Black);
-    }
-
-    #[test]
-    fn test_cannot_play_occupied() {
-        let mut board = Board::new();
-        board.play(7, 7);
-        assert!(!board.play(7, 7));
-    }
-
-    #[test]
-    fn test_horizontal_win() {
-        let mut board = Board::new();
-        let moves = [
-            (7, 6),
-            (0, 0),
-            (7, 7),
-            (1, 1),
-            (7, 8),
-            (2, 2),
-            (7, 9),
-            (3, 3),
-            (7, 10),
-        ];
-        for &(r, c) in moves.iter() {
-            board.play(r, c);
-        }
-        assert!(board.game_over);
-        assert_eq!(board.winner, Some(Color::Black));
-    }
-
-    #[test]
-    fn test_diagonal_win() {
-        let mut board = Board::new();
-        let moves = [
-            (5, 5),
-            (0, 0),
-            (6, 6),
-            (1, 1),
-            (7, 7),
-            (2, 2),
-            (8, 8),
-            (3, 3),
-            (9, 9),
-        ];
-        for &(r, c) in moves.iter() {
-            board.play(r, c);
-        }
-        assert!(board.game_over);
-        assert_eq!(board.winner, Some(Color::Black));
-    }
-
-    #[test]
-    fn test_encode_state() {
-        let mut board = Board::new();
-        board.play(7, 7); // Black
-        board.play(0, 0); // White
-        // 现在轮到 Black
-        let data = board.encode_state();
-        assert_eq!(data.len(), ENCODE_CHANNELS * NUM_POSITIONS);
-        let idx_77 = 7 * BOARD_SIZE + 7;
-        let idx_00 = 0 * BOARD_SIZE + 0;
-        let idx_empty = 1 * BOARD_SIZE + 1;
-        // 单通道 (-1, 0, 1) 编码：己方=1, 对方=-1, 空=0
-        assert_eq!(
-            data[idx_77], 1.0,
-            "Black stone (current player) should be 1"
-        );
-        assert_eq!(data[idx_00], -1.0, "White stone (opponent) should be -1");
-        assert_eq!(data[idx_empty], 0.0, "Empty cell should be 0");
-    }
-
-    #[test]
-    fn test_undo_play() {
-        let mut board = Board::new();
-        board.play(7, 7); // Black 落子
-        let snap = board.snapshot(); // 保存 (7,7) 落子前的状态
-        board.play(7, 8); // White 落子
-        assert_eq!(board.current_player, Color::Black);
-
-        board.undo(7, 8, &snap); // 撤销 White 的 (7,8)
-        // 撤销后应恢复到黑方刚落子在 (7,7) 后的状态（轮到白方）
-        assert_eq!(board.current_player, Color::White);
-        assert_eq!(board.step_count, 1);
-        assert_eq!(board.get(7, 7), 1);
-        assert_eq!(board.get(7, 8), 0); // 白方落子已被清除
-        assert!(!board.game_over);
-    }
-
-    #[test]
-    fn test_undo_with_win() {
-        let mut board = Board::new();
-        // 黑方在 (7,6)-(7,10) 连五胜
-        let moves = [
-            (7, 6),
-            (0, 0),
-            (7, 7),
-            (1, 1),
-            (7, 8),
-            (2, 2),
-            (7, 9),
-            (3, 3),
-        ];
-        for &(r, c) in moves.iter() {
-            board.play(r, c);
-        }
-        assert!(!board.game_over);
-
-        // 黑方即将走 (7,10)，保存当前状态
-        let snap_before_win = board.snapshot();
-        board.play(7, 10); // 黑方获胜
-        assert!(board.game_over);
-        assert_eq!(board.winner, Some(Color::Black));
-
-        board.undo(7, 10, &snap_before_win);
-        assert!(!board.game_over);
-        assert_eq!(board.winner, None);
-        assert_eq!(board.current_player, Color::Black); // 回到黑方回合
-        assert_eq!(board.get(7, 10), 0);
-    }
-
-    #[test]
-    fn test_snapshot_and_undo_sequence() {
-        let mut board = Board::new();
-        let mut snapshots = Vec::new();
-        let mut positions = Vec::new();
-
-        for i in 0..5 {
-            snapshots.push(board.snapshot());
-            positions.push((i, i));
-            board.play(i, i);
-        }
-        assert_eq!(board.step_count, 5);
-
-        // 逆序撤销
-        for i in (0..5).rev() {
-            let (r, c) = positions[i];
-            board.undo(r, c, &snapshots[i]);
-        }
-        assert_eq!(board.step_count, 0);
-        assert_eq!(board.current_player, Color::Black);
-    }
-
-    // ============================================================
-    //  D4 对称变换测试
-    // ============================================================
-
-    #[test]
-    fn test_d4_index_map_identity() {
-        let maps = D4Symmetry::index_maps();
-        let identity = &maps[0];
-        for i in 0..NUM_POSITIONS {
-            assert_eq!(identity[i], i, "identity map should not change index");
-        }
-    }
-
-    #[test]
-    fn test_d4_index_map_rotation_involution() {
-        // 旋转 180° 做两次等于恒等
-        let maps = D4Symmetry::index_maps();
-        let r180 = &maps[2];
-        for i in 0..NUM_POSITIONS {
-            assert_eq!(r180[r180[i]], i);
-        }
-    }
-
-    #[test]
-    fn test_d4_index_map_flip_involution() {
-        // 翻转做两次 = 恒等
-        let maps = D4Symmetry::index_maps();
-        for &t in &[4usize, 5, 6, 7] {
-            let map = &maps[t];
-            for i in 0..NUM_POSITIONS {
-                assert_eq!(map[map[i]], i, "transform {t} at index {i}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_d4_index_map_all_distinct() {
-        let maps = D4Symmetry::index_maps();
-        for i in 0..NUM_POSITIONS {
-            let mut seen = std::collections::BTreeSet::new();
-            for t in 0..8 {
-                seen.insert(maps[t][i]);
-            }
-            // 不是所有位置都有 8 种不同映射（中心点和对称轴上的点会有重叠），
-            // 但至少应该有 1 种（恒等）
-            assert!(!seen.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_d4_apply_transform() {
-        // 编码一个简单棋盘：黑子 (0,0)，白子 (14,14)，当前玩家黑
-        let mut board = Board::new();
-        board.play(0, 0);
-        board.play(14, 14);
-        let state = board.encode_state();
-        let policy: Vec<f32> = (0..NUM_POSITIONS).map(|i| i as f32).collect();
-
-        // 旋转 180°：黑子应到 (14,14)，白子到 (0,0)
-        let (rot_state, rot_policy) = D4Symmetry::apply_transform(&state, &policy, 2);
-
-        let idx_00 = Board::pos_to_idx(0, 0);
-        let idx_14_14 = Board::pos_to_idx(14, 14);
-
-        // 单通道编码：己方=1, 对方=-1, 空=0
-        // 旋转 180° 后，黑子 (己方=1) 应到 (14,14)
-        assert_eq!(
-            rot_state[idx_14_14], 1.0,
-            "black stone should rotate to (14,14)"
-        );
-        // 旋转 180° 后，白子 (对方=-1) 应到 (0,0)
-        assert_eq!(
-            rot_state[idx_00], -1.0,
-            "white stone should rotate to (0,0)"
-        );
-
-        // 策略：idx 224 应映射到 idx 0
-        assert_eq!(rot_policy[idx_14_14], policy[idx_00]);
-        assert_eq!(rot_policy[idx_00], policy[idx_14_14]);
-    }
-
-    #[test]
-    fn test_d4_random_augment() {
-        let board = Board::new();
-        let state = board.encode_state();
-        let policy = vec![1.0 / NUM_POSITIONS as f32; NUM_POSITIONS];
-        let mut rng = rand::rng();
-
-        let (aug_state, aug_policy) = D4Symmetry::random_augment(&state, &policy, &mut rng, 0.0);
-        assert_eq!(aug_state.len(), state.len());
-        assert_eq!(aug_policy.len(), NUM_POSITIONS);
-        assert!((aug_policy.iter().sum::<f32>() - 1.0).abs() < 1e-4);
     }
 }

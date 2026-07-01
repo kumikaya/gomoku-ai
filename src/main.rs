@@ -5,7 +5,7 @@ use burn::tensor::Device;
 use clap::{Parser, Subcommand};
 use gomoku_ai::game::play::play_game;
 use gomoku_ai::inference::InferenceServer;
-use gomoku_ai::network::residual::GomokuNetwork;
+use gomoku_ai::network::transformer::GomokuNetwork;
 use gomoku_ai::training::trainer::{TrainConfig, Trainer};
 
 #[derive(Parser)]
@@ -29,11 +29,11 @@ enum Command {
         games: usize,
 
         /// 每次 MCTS 模拟次数（Gumbel Zero 只需 16~64）
-        #[arg(short = 's', long, default_value = "16")]
+        #[arg(short = 's', long, default_value = "32")]
         simulations: usize,
 
         /// 学习率
-        #[arg(short = 'l', long, default_value = "0.002")]
+        #[arg(short = 'l', long, default_value = "0.001")]
         learning_rate: f64,
 
         /// 批大小
@@ -52,7 +52,7 @@ enum Command {
     /// 人机对弈
     Play {
         /// MCTS 模拟次数（Gumbel Zero 只需 32~64）
-        #[arg(short = 's', long, default_value = "64")]
+        #[arg(short = 's', long, default_value = "128")]
         simulations: usize,
 
         /// 模型文件路径（.bpk）

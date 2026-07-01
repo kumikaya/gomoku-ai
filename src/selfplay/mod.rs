@@ -12,7 +12,7 @@ use crate::mcts::node::{GumbelConfig, MCTS};
 
 #[derive(Clone, Debug)]
 pub struct PlayRecord {
-    pub state: Vec<f32>,
+    pub state: Vec<i32>,
     pub policy: Vec<f32>,
     pub value: f32,
 }

@@ -17,7 +17,7 @@
 //!   PUCT walk 用 noisy prior。
 
 use super::table::Table;
-use crate::game::board::{Board, Color, ENCODE_CHANNELS, NUM_POSITIONS};
+use crate::game::board::{Board, Color, ENCODE_LEN, NUM_POSITIONS};
 use crate::inference::Evaluator;
 
 /// 对数计算的最小概率下限，防止 ln(0) = -inf
@@ -341,7 +341,7 @@ impl MCTS {
         let sample_n = config.sample_size;
 
         // ── Phase 1: 根节点 NN 评估 ──
-        let mut root_encoding = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
+        let mut root_encoding = vec![0i32; ENCODE_LEN];
         board.encode_into(&mut root_encoding);
         let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]);
         let root_nn_value = root_values[0];
@@ -455,7 +455,7 @@ impl MCTS {
                 };
                 self.backprop_path(&path, v);
             } else if !self.node(leaf_idx).expanded {
-                let mut encoding = vec![0.0f32; ENCODE_CHANNELS * NUM_POSITIONS];
+                let mut encoding = vec![0i32; ENCODE_LEN];
                 sim_board.encode_into(&mut encoding);
                 sim_board.fill_legal_moves(&mut legal_buf);
                 let legal_leaf = std::mem::take(&mut legal_buf);
