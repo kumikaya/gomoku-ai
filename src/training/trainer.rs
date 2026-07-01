@@ -128,7 +128,7 @@ impl Trainer {
                 self.config.num_iterations
             );
 
-            self.run_self_play(&inference_server);
+            self.run_self_play(&inference_server, iteration);
 
             let buffer_size = self.replay_buffer.len();
             println!(
@@ -170,8 +170,25 @@ impl Trainer {
 
     // ── 自对弈 ──
 
-    fn run_self_play(&mut self, inference_server: &InferenceServer) {
+    /// minizero 风格训练进度衰减：0%–50%→1.0, 50%–75%→0.5, 75%–100%→0.25
+    fn decayed_temperature(iteration: usize, num_iterations: usize) -> f32 {
+        let ratio = iteration as f32 / num_iterations.max(1) as f32;
+        if ratio < 0.5 {
+            1.0
+        } else if ratio < 0.75 {
+            0.5
+        } else {
+            0.25
+        }
+    }
+
+    fn run_self_play(&mut self, inference_server: &InferenceServer, iteration: usize) {
         let total = self.config.games_per_iteration;
+
+        let temp = Self::decayed_temperature(iteration, self.config.num_iterations);
+        if iteration == 0 {
+            println!("  Temperature: {:.2}", temp);
+        }
 
         let pb = ProgressBar::new(total as u64);
         pb.set_style(
@@ -182,6 +199,7 @@ impl Trainer {
 
         let sp_config = SelfPlayConfig {
             num_simulations: self.config.num_simulations,
+            select_temperature: temp,
         };
 
         let all_records: Vec<PlayRecord> = (0..total)

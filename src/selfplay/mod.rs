@@ -30,12 +30,16 @@ impl SelfPlayGame {
 
 pub struct SelfPlayConfig {
     pub num_simulations: usize,
+    /// 动作选择 softmax 温度，minizero 风格随训练进度衰减：
+    ///   0%–50% → 1.0  |  50%–75% → 0.5  |  75%–100% → 0.25
+    pub select_temperature: f32,
 }
 
 impl Default for SelfPlayConfig {
     fn default() -> Self {
         Self {
             num_simulations: 32,
+            select_temperature: 1.0,
         }
     }
 }
@@ -49,7 +53,8 @@ pub fn self_play<E: Evaluator>(evaluator: &E, config: &SelfPlayConfig) -> SelfPl
     let mut records = Vec::new();
     let mut mcts = MCTS::new();
 
-    let search_config = GumbelConfig::pure_gumbel(config.num_simulations);
+    let mut search_config = GumbelConfig::pure_gumbel(config.num_simulations);
+    search_config.select_temperature = config.select_temperature;
 
     loop {
         // 每步新建 MCTS

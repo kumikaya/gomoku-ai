@@ -11,5 +11,5 @@
 //!   + N × TransformerBlock (pre-LN self-attention + FFN, ReLU)
 //!   + Policy head (per-position Linear) + Value head (mean pool → MLP → Tanh)
 
-pub mod pos_encoding;
+pub mod pos_embed;
 pub mod transformer;

@@ -11,7 +11,7 @@
 //!   → Policy head (per-position Linear) + Value head (mean pool + MLP → Tanh)
 
 use crate::game::board::BOARD_SIZE;
-use crate::network::pos_encoding::{Pos2DEmbed, Pos2DEmbedConfig};
+use crate::network::pos_embed::{Pos2DEmbed, Pos2DEmbedConfig};
 
 use burn::tensor::activation::{relu, tanh};
 use burn::{
