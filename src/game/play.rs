@@ -87,6 +87,9 @@ fn run_game_loop<E: Evaluator>(
         // 人类回合
         if state.board.current_player == state.player_color {
             if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Char(' ') | KeyCode::Enter => {
