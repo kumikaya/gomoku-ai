@@ -6,20 +6,21 @@ use crate::game::board::{D4Symmetry, ENCODE_LEN, NUM_POSITIONS};
 use crate::inference::InferenceServer;
 use crate::network::transformer::GomokuNetwork;
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
+use crate::training::buffer::RolloutBuffer;
+use crate::training::lr_schedule::LrSchedule;
 
 use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
+use burn::optim::ModuleOptimizer;
 use burn::{
     grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
-    optim::{AdamConfig, GradientsParams},
+    optim::{AdamWConfig, GradientsParams},
     store::ModuleRecord,
     tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::seq::SliceRandom;
 use rayon::prelude::*;
-use std::collections::VecDeque;
 use std::path::PathBuf;
 
 // ── 配置 ──
@@ -36,16 +37,24 @@ pub struct TrainConfig {
     pub model_dir: PathBuf,
     pub buffer_capacity: usize,
     pub max_grad_norm: f32,
-    /// KataGo Playout Cap：启用后每次 MCTS 搜索的模拟次数在 `[min, max]` 内随机。
-    /// `min = num_simulations * playout_cap_min_ratio`
+    /// KataGo Playout Cap：启用后每步在 `[min, max]` 内均匀随机模拟次数。
     pub playout_cap_enabled: bool,
+    /// 下界比例（相对于 `num_simulations`）。
     pub playout_cap_min_ratio: f32,
+    /// LR warmup 比例：前 `lr_warmup_ratio` 比例迭代内线性 warmup，之后 cosine 衰减到 `lr_final_ratio`。
+    /// 0.05 = 前 5% 迭代 warmup。设为 0 表示仅 cosine 衰减（无 warmup）。
+    pub lr_warmup_ratio: f32,
+    /// 最终学习率比例（相对于 `learning_rate`），cosine 衰减的底值。
+    pub lr_final_ratio: f32,
+    /// 窗口化 buffer 加权采样：近期数据采样权重乘数。
+    /// 0.0 = 关（均匀采样），推荐 0.5~1.0。
+    pub buffer_recent_bonus: f32,
 }
 
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 200,
+            num_simulations: 32,
             games_per_iteration: 64,
             batch_size: 512,
             epochs: 1,
@@ -54,10 +63,13 @@ impl Default for TrainConfig {
             value_loss_weight: 0.5,
             save_every: 5,
             model_dir: PathBuf::from("checkpoints"),
-            buffer_capacity: 24000,
+            buffer_capacity: 80000,
             max_grad_norm: 2.0,
-            playout_cap_enabled: false,
+            playout_cap_enabled: true,
             playout_cap_min_ratio: 0.25,
+            lr_warmup_ratio: 0.05,
+            lr_final_ratio: 0.1,
+            buffer_recent_bonus: 0.5,
         }
     }
 }
@@ -67,15 +79,16 @@ impl Default for TrainConfig {
 pub struct Trainer {
     config: TrainConfig,
     device: Device,
-    replay_buffer: VecDeque<PlayRecord>,
+    buffer: RolloutBuffer,
 }
 
 impl Trainer {
     pub fn new(config: TrainConfig, device: Device) -> Self {
+        let cap = config.buffer_capacity;
         Self {
             config,
             device,
-            replay_buffer: VecDeque::new(),
+            buffer: RolloutBuffer::new(cap),
         }
     }
 
@@ -117,7 +130,7 @@ impl Trainer {
         let train_device = self.device.clone().autodiff();
         let mut model = self.load_or_create_model(&train_device);
 
-        let mut optim = AdamConfig::new().init();
+        let mut optim = AdamWConfig::new().init();
         if self.config.max_grad_norm > 0.0 {
             optim = optim
                 .with_grad_clipping(GradientClippingConfig::Norm(self.config.max_grad_norm).init());
@@ -127,6 +140,16 @@ impl Trainer {
 
         let inference_server = InferenceServer::new(model.clone().valid(), self.device.clone());
 
+        let lr_sched = LrSchedule::new(
+            self.config.num_iterations,
+            self.config.lr_warmup_ratio,
+            self.config.lr_final_ratio,
+        );
+        println!(
+            "  LR schedule: warmup_ratio={:.2}, final_ratio={:.2}, base_lr={:.6}",
+            self.config.lr_warmup_ratio, self.config.lr_final_ratio, self.config.learning_rate,
+        );
+
         for iteration in 0..self.config.num_iterations {
             println!(
                 "========== Iteration {}/{} ==========",
@@ -134,12 +157,14 @@ impl Trainer {
                 self.config.num_iterations
             );
 
+            let lr = lr_sched.lr(iteration, self.config.learning_rate);
+
             self.run_self_play(&inference_server, iteration);
 
-            let buffer_size = self.replay_buffer.len();
+            let buffer_size = self.buffer.len();
             println!(
-                "  Training: epochs={}, buffer size={}",
-                self.config.epochs, buffer_size
+                "  Training: epochs={}, buffer size={}, recent_bonus={:.1}",
+                self.config.epochs, buffer_size, self.config.buffer_recent_bonus
             );
 
             if buffer_size < self.config.batch_size {
@@ -148,7 +173,7 @@ impl Trainer {
             }
 
             let (total_loss, total_steps) =
-                self.run_training_epochs(&mut model, &mut optim, &train_device);
+                self.run_training_epochs(&mut model, &mut optim, &train_device, lr);
 
             let avg_loss = if total_steps > 0 {
                 total_loss / total_steps as f32
@@ -205,7 +230,7 @@ impl Trainer {
 
         if self.config.playout_cap_enabled {
             println!(
-                "  Playout Cap: enabled ({:.0}%–100% of {} sims)",
+                "  Playout Cap: enabled (sims ∈ [{:.0}%, 100%] of {}), target_weight ∝ sims",
                 self.config.playout_cap_min_ratio * 100.0,
                 self.config.num_simulations,
             );
@@ -229,18 +254,8 @@ impl Trainer {
 
         pb.finish_and_clear();
 
-        let added = all_records.len();
-        for record in all_records {
-            if self.replay_buffer.len() >= self.config.buffer_capacity {
-                self.replay_buffer.pop_front();
-            }
-            self.replay_buffer.push_back(record);
-        }
-        println!(
-            "  Buffer: {} samples (+{})",
-            self.replay_buffer.len(),
-            added
-        );
+        let added = self.buffer.extend(all_records);
+        println!("  Buffer: {} samples (+{})", self.buffer.len(), added);
     }
 
     // ── 训练阶段 ──
@@ -248,16 +263,16 @@ impl Trainer {
     fn run_training_epochs(
         &mut self,
         model: &mut GomokuNetwork,
-        optim: &mut burn::optim::ModuleOptimizer,
+        optim: &mut ModuleOptimizer,
         train_device: &Device,
+        lr: f64,
     ) -> (f32, usize) {
-        let lr = self.config.learning_rate;
         let mut total_loss = 0.0_f32;
         let mut total_steps: usize = 0;
         let mut rng = rand::rng();
         let identity_prob = 1.0 / D4Symmetry::COUNT as f32;
 
-        let n = self.replay_buffer.len();
+        let n = self.buffer.len();
         let total_batches =
             self.config.epochs * (n + self.config.batch_size - 1) / self.config.batch_size;
         let pb = ProgressBar::new(total_batches as u64);
@@ -268,8 +283,9 @@ impl Trainer {
         );
 
         for epoch in 0..self.config.epochs {
-            let mut indices: Vec<usize> = (0..n).collect();
-            indices.shuffle(&mut rng);
+            let sampled_indices = self
+                .buffer
+                .sample(&mut rng, self.config.buffer_recent_bonus);
 
             let mut epoch_loss = 0.0_f32;
             let mut epoch_steps: usize = 0;
@@ -278,11 +294,14 @@ impl Trainer {
             let mut all_value_preds: Vec<f32> = Vec::new();
             let mut all_value_targets: Vec<f32> = Vec::new();
 
-            for chunk in indices.chunks(self.config.batch_size) {
+            for chunk in sampled_indices.chunks(self.config.batch_size) {
+                // 透传 target_weight 用于策略损失加权
+                let mut batch_target_weights = Vec::with_capacity(chunk.len());
                 let mini_batch: Vec<PlayRecord> = chunk
                     .iter()
                     .map(|&i| {
-                        let record = &self.replay_buffer[i];
+                        let record = self.buffer.get(i);
+                        batch_target_weights.push(record.target_weight);
                         let (state, policy) = D4Symmetry::random_augment(
                             &record.state,
                             &record.policy,
@@ -293,6 +312,7 @@ impl Trainer {
                             state,
                             policy,
                             value: record.value,
+                            target_weight: record.target_weight,
                         }
                     })
                     .collect();
@@ -313,6 +333,11 @@ impl Trainer {
                 let value_target_tensor =
                     Tensor::<1>::from_floats(flat_values.as_slice(), train_device)
                         .reshape([batch_len, 1]);
+
+                // [batch, 1]
+                let weight_tensor =
+                    Tensor::<1>::from_floats(batch_target_weights.as_slice(), train_device)
+                        .unsqueeze_dim(1);
 
                 let (policy_logits, value_pred) = model.forward(state_tensor);
 
@@ -337,7 +362,12 @@ impl Trainer {
                     all_value_targets.extend(flat_values.iter());
                 }
 
-                let policy_loss = -(log_probs * policy_target.clone()).sum_dim(1).mean();
+                // ── 策略损失：按 target_weight 加权聚合（低质量样本对策略梯度贡献小）──
+                let per_sample_policy_loss = -(log_probs * policy_target.clone()).sum_dim(1); // [batch, 1]
+
+                let total_weight = weight_tensor.clone().sum();
+                let weighted_policy_loss =
+                    (per_sample_policy_loss * weight_tensor).sum() / total_weight;
 
                 let mse = MseLoss::new();
                 let value_loss = mse.forward(
@@ -346,10 +376,7 @@ impl Trainer {
                     Reduction::Mean,
                 );
 
-                let value_weight_tensor =
-                    Tensor::<1>::from_floats([self.config.value_loss_weight], train_device);
-                let loss = policy_loss + value_loss * value_weight_tensor.unsqueeze();
-
+                let loss = weighted_policy_loss + value_loss * self.config.value_loss_weight;
                 let scalar: f32 = loss.clone().into_scalar();
                 epoch_loss += scalar;
                 epoch_steps += 1;

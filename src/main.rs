@@ -25,7 +25,7 @@ enum Command {
         iterations: usize,
 
         /// 每轮自对弈局数
-        #[arg(short = 'g', long, default_value = "64")]
+        #[arg(short = 'g', long, default_value = "128")]
         games: usize,
 
         /// 每次 MCTS 模拟次数（Gumbel Zero 只需 16~64）

@@ -63,7 +63,7 @@ impl Default for GumbelConfig {
             sigma_scale_c: 1.0,
             pure_gumbel_noise: true,
             select_temperature: 1.0,
-            dirichlet_alpha: 0.3,
+            dirichlet_alpha: 0.1,
             dirichlet_epsilon: 0.25,
         }
     }

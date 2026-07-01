@@ -16,6 +16,11 @@ pub struct PlayRecord {
     pub state: Vec<i32>,
     pub policy: Vec<f32>,
     pub value: f32,
+    /// 训练权重（KataGo 风格）：
+    ///   - 1.0 = 满模拟的 high-quality 样本
+    ///   - 0.0 = 最少模拟的 low-quality 样本（仅训练价值头，不训练策略头）
+    ///   中间值按模拟数比例插值
+    pub target_weight: f32,
 }
 
 pub struct SelfPlayGame {
@@ -34,10 +39,10 @@ pub struct SelfPlayConfig {
     /// 动作选择 softmax 温度，minizero 风格随训练进度衰减：
     ///   0%–50% → 1.0  |  50%–75% → 0.5  |  75%–100% → 0.25
     pub select_temperature: f32,
-    /// KataGo Playout Cap：启用在 `[min, max]` 内随机化每次搜索的模拟次数。
-    /// 让网络同时从不同质量的数据中学习，提升泛化能力并节省计算量。
+    /// KataGo Playout Cap：启用后每步在 `[min, max]` 内均匀随机模拟次数。
+    /// `min = num_simulations * playout_cap_min_ratio`。
     pub playout_cap_enabled: bool,
-    /// 随机化下界比例（相对于 `num_simulations`），例如 0.25 表示最少 25%。
+    /// 下界比例（相对于 `num_simulations`），例如 0.25 表示最少 25%。
     pub playout_cap_min_ratio: f32,
 }
 
@@ -63,33 +68,37 @@ pub fn self_play<E: Evaluator>(evaluator: &E, config: &SelfPlayConfig) -> SelfPl
     let mut rng = rand::rng();
 
     loop {
-        // ── Playout Cap: 每步随机化模拟次数 ──
-        let sims = if config.playout_cap_enabled {
-            let min =
+        // ── Playout Cap: 每步均匀随机模拟次数 + target_weight ──
+        let (sims, target_weight) = if config.playout_cap_enabled {
+            let min_sims =
                 (config.num_simulations as f32 * config.playout_cap_min_ratio).max(1.0) as usize;
-            let range = config.num_simulations.saturating_sub(min);
-            if range > 0 {
-                min + rng.random_range(0..=range)
+            let max_sims = config.num_simulations;
+            let range = max_sims.saturating_sub(min_sims);
+            let sims = if range > 0 {
+                min_sims + rng.random_range(0..=range)
             } else {
-                min
-            }
+                min_sims
+            };
+            let weight = if max_sims > min_sims {
+                (sims - min_sims) as f32 / (max_sims - min_sims) as f32
+            } else {
+                1.0
+            };
+            (sims, weight.max(0.1))
         } else {
-            config.num_simulations
+            (config.num_simulations, 1.0f32)
         };
 
         let mut search_config = GumbelConfig::pure_gumbel(sims);
         search_config.select_temperature = config.select_temperature;
 
-        // 每步新建 MCTS
         let result = mcts.search(&mut board, evaluator, &search_config);
 
-        // V 标签对齐 minizero `getMCTSValue()`：
-        // 使用 MCTS visit-count 加权 Q 作为 bootstrap target，
-        // 而非对局结果。方差更低，收敛更快。
         records.push(PlayRecord {
             state: board.encode_state(),
             policy: result.policy,
             value: result.root_value,
+            target_weight,
         });
 
         board.play_idx(result.best_move);

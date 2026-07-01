@@ -5,4 +5,6 @@
 //!
 //! 精度由 `Device::configure` 全局设定（BF16/F32），前向传播不感知精度。
 
+pub mod buffer;
+pub mod lr_schedule;
 pub mod trainer;
