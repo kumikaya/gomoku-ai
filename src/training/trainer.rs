@@ -36,6 +36,10 @@ pub struct TrainConfig {
     pub model_dir: PathBuf,
     pub buffer_capacity: usize,
     pub max_grad_norm: f32,
+    /// KataGo Playout Cap：启用后每次 MCTS 搜索的模拟次数在 `[min, max]` 内随机。
+    /// `min = num_simulations * playout_cap_min_ratio`
+    pub playout_cap_enabled: bool,
+    pub playout_cap_min_ratio: f32,
 }
 
 impl Default for TrainConfig {
@@ -52,6 +56,8 @@ impl Default for TrainConfig {
             model_dir: PathBuf::from("checkpoints"),
             buffer_capacity: 24000,
             max_grad_norm: 2.0,
+            playout_cap_enabled: false,
+            playout_cap_min_ratio: 0.25,
         }
     }
 }
@@ -197,9 +203,19 @@ impl Trainer {
                 .unwrap(),
         );
 
+        if self.config.playout_cap_enabled {
+            println!(
+                "  Playout Cap: enabled ({:.0}%–100% of {} sims)",
+                self.config.playout_cap_min_ratio * 100.0,
+                self.config.num_simulations,
+            );
+        }
+
         let sp_config = SelfPlayConfig {
             num_simulations: self.config.num_simulations,
             select_temperature: temp,
+            playout_cap_enabled: self.config.playout_cap_enabled,
+            playout_cap_min_ratio: self.config.playout_cap_min_ratio,
         };
 
         let all_records: Vec<PlayRecord> = (0..total)

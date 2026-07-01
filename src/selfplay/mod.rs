@@ -9,6 +9,7 @@
 use crate::game::board::{Board, Color};
 use crate::inference::Evaluator;
 use crate::mcts::node::{GumbelConfig, MCTS};
+use rand::RngExt;
 
 #[derive(Clone, Debug)]
 pub struct PlayRecord {
@@ -33,6 +34,11 @@ pub struct SelfPlayConfig {
     /// 动作选择 softmax 温度，minizero 风格随训练进度衰减：
     ///   0%–50% → 1.0  |  50%–75% → 0.5  |  75%–100% → 0.25
     pub select_temperature: f32,
+    /// KataGo Playout Cap：启用在 `[min, max]` 内随机化每次搜索的模拟次数。
+    /// 让网络同时从不同质量的数据中学习，提升泛化能力并节省计算量。
+    pub playout_cap_enabled: bool,
+    /// 随机化下界比例（相对于 `num_simulations`），例如 0.25 表示最少 25%。
+    pub playout_cap_min_ratio: f32,
 }
 
 impl Default for SelfPlayConfig {
@@ -40,6 +46,8 @@ impl Default for SelfPlayConfig {
         Self {
             num_simulations: 32,
             select_temperature: 1.0,
+            playout_cap_enabled: false,
+            playout_cap_min_ratio: 0.25,
         }
     }
 }
@@ -52,11 +60,26 @@ pub fn self_play<E: Evaluator>(evaluator: &E, config: &SelfPlayConfig) -> SelfPl
     let mut board = Board::new();
     let mut records = Vec::new();
     let mut mcts = MCTS::new();
-
-    let mut search_config = GumbelConfig::pure_gumbel(config.num_simulations);
-    search_config.select_temperature = config.select_temperature;
+    let mut rng = rand::rng();
 
     loop {
+        // ── Playout Cap: 每步随机化模拟次数 ──
+        let sims = if config.playout_cap_enabled {
+            let min =
+                (config.num_simulations as f32 * config.playout_cap_min_ratio).max(1.0) as usize;
+            let range = config.num_simulations.saturating_sub(min);
+            if range > 0 {
+                min + rng.random_range(0..=range)
+            } else {
+                min
+            }
+        } else {
+            config.num_simulations
+        };
+
+        let mut search_config = GumbelConfig::pure_gumbel(sims);
+        search_config.select_temperature = config.select_temperature;
+
         // 每步新建 MCTS
         let result = mcts.search(&mut board, evaluator, &search_config);
 
