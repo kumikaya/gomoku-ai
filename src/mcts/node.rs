@@ -76,7 +76,7 @@ impl Default for GumbelConfig {
             select_temperature: 1.0,
             root_policy_temperature: 1.0,
             dynamic_cpuct: true,
-            fpu_reduction: 0.0,
+            fpu_reduction: 0.2,
             dirichlet_alpha: 0.1,
             dirichlet_epsilon: 0.25,
             think_batch_size: 8,
