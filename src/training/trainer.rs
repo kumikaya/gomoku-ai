@@ -49,9 +49,6 @@ pub struct TrainConfig {
     pub lr_warmup_ratio: f32,
     /// 最终学习率比例（相对于 `learning_rate`），cosine 衰减的底值。
     pub lr_final_ratio: f32,
-    /// 窗口化 buffer 加权采样：近期数据采样权重乘数。
-    /// 0.0 = 关（均匀采样），推荐 0.5~1.0。
-    pub buffer_recent_bonus: f32,
     // ── 评估配置 ──
     /// 是否启用对抗评估（每 `eval_every` 轮与 baseline 对战）
     pub eval_enabled: bool,
@@ -84,7 +81,6 @@ impl Default for TrainConfig {
             checkpoint: None,
             lr_warmup_ratio: 0.05,
             lr_final_ratio: 0.1,
-            buffer_recent_bonus: 0.0,
             eval_enabled: true,
             eval_num_games: 100,
             eval_num_simulations: 64,
@@ -215,10 +211,9 @@ impl Trainer {
 
             let buffer_size = self.buffer.len();
             println!(
-                "  Training: mini_batches={}, buffer size={}, recent_bonus={:.1}",
+                "  Training: mini_batches={}, buffer size={}",
                 self.config.mini_batches_per_iteration,
                 buffer_size,
-                self.config.buffer_recent_bonus
             );
 
             if buffer_size < self.config.batch_size {
@@ -366,7 +361,7 @@ impl Trainer {
         for _ in 0..num_batches {
             // 每次 mini-batch 独立从 buffer 采样 batch_size 个样本
             let batch_size = self.config.batch_size.min(self.buffer.len());
-            let all_indices = self.buffer.sample(rng, self.config.buffer_recent_bonus);
+            let all_indices = self.buffer.sample(rng);
             let chunk = &all_indices[..batch_size];
 
             let mini_batch: Vec<PlayRecord> = chunk
