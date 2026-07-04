@@ -43,10 +43,7 @@ pub struct TrainConfig {
     pub max_grad_norm: f32,
     /// 从指定 checkpoint 路径恢复训练（None 则创建新模型）
     pub checkpoint: Option<PathBuf>,
-    /// KataGo Playout Cap：启用后每步在 `[min, max]` 内均匀随机模拟次数。
-    pub playout_cap_enabled: bool,
-    /// 下界比例（相对于 `num_simulations`）。
-    pub playout_cap_min_ratio: f32,
+
     /// LR warmup 比例：前 `lr_warmup_ratio` 比例迭代内线性 warmup，之后 cosine 衰减到 `lr_final_ratio`。
     /// 0.05 = 前 5% 迭代 warmup。设为 0 表示仅 cosine 衰减（无 warmup）。
     pub lr_warmup_ratio: f32,
@@ -85,8 +82,6 @@ impl Default for TrainConfig {
             buffer_capacity: 80000,
             max_grad_norm: 2.0,
             checkpoint: None,
-            playout_cap_enabled: false,
-            playout_cap_min_ratio: 0.25,
             lr_warmup_ratio: 0.05,
             lr_final_ratio: 0.1,
             buffer_recent_bonus: 0.0,
@@ -317,19 +312,9 @@ impl Trainer {
                 .unwrap(),
         );
 
-        if self.config.playout_cap_enabled {
-            println!(
-                "  Playout Cap: enabled (sims in [{:.0}%, 100%] of {}), target_weight ∝ sims",
-                self.config.playout_cap_min_ratio * 100.0,
-                self.config.num_simulations,
-            );
-        }
-
         let sp_config = SelfPlayConfig {
             num_simulations: self.config.num_simulations,
             select_temperature: temp,
-            playout_cap_enabled: self.config.playout_cap_enabled,
-            playout_cap_min_ratio: self.config.playout_cap_min_ratio,
         };
 
         let base_seed = master_rng.random::<u64>();
@@ -384,13 +369,10 @@ impl Trainer {
             let all_indices = self.buffer.sample(rng, self.config.buffer_recent_bonus);
             let chunk = &all_indices[..batch_size];
 
-            // 透传 target_weight 用于策略损失加权
-            let mut batch_target_weights = Vec::with_capacity(chunk.len());
             let mini_batch: Vec<PlayRecord> = chunk
                 .iter()
                 .map(|&i| {
                     let record = self.buffer.get(i);
-                    batch_target_weights.push(record.target_weight);
                     let (state, policy) = D4Symmetry::random_augment(
                         &record.state,
                         &record.policy,
@@ -401,7 +383,6 @@ impl Trainer {
                         state,
                         policy,
                         value: record.value,
-                        target_weight: record.target_weight,
                     }
                 })
                 .collect();
@@ -418,10 +399,6 @@ impl Trainer {
             let value_target_tensor =
                 Tensor::<1>::from_floats(flat_values.as_slice(), train_device)
                     .reshape([batch_len, 1]);
-            let weight_tensor =
-                Tensor::<1>::from_floats(batch_target_weights.as_slice(), train_device)
-                    .unsqueeze_dim(1);
-
             let (policy_logits, value_pred) = model.forward(state_tensor);
 
             let log_probs = log_softmax(policy_logits.clone(), 1);
@@ -445,12 +422,8 @@ impl Trainer {
                 all_value_targets.extend(flat_values.iter());
             }
 
-            // 策略损失：按 target_weight 加权聚合（低质量样本对策略梯度贡献小）
-            let per_sample_policy_loss = -(log_probs * policy_target.clone()).sum_dim(1); // [batch, 1]
-
-            let total_weight = weight_tensor.clone().sum();
-            let weighted_policy_loss =
-                (per_sample_policy_loss * weight_tensor).sum() / total_weight;
+            // 策略损失
+            let policy_loss = -(log_probs * policy_target.clone()).sum_dim(1).mean();
 
             let mse = MseLoss::new();
             let value_loss = mse.forward(
@@ -459,7 +432,7 @@ impl Trainer {
                 Reduction::Mean,
             );
 
-            let loss = weighted_policy_loss + value_loss * self.config.value_loss_weight;
+            let loss = policy_loss + value_loss * self.config.value_loss_weight;
             let scalar: f32 = loss.clone().into_scalar();
             total_loss += scalar;
             total_steps += 1;

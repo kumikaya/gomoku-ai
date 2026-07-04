@@ -104,7 +104,6 @@ mod tests {
             state: vec![0i32; crate::game::board::ENCODE_LEN],
             policy: vec![0.0f32; crate::game::board::NUM_POSITIONS],
             value,
-            target_weight: 1.0,
         }
     }
 
