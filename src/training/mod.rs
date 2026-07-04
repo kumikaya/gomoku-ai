@@ -7,4 +7,5 @@
 
 pub mod buffer;
 pub mod lr_schedule;
+pub mod metrics;
 pub mod trainer;

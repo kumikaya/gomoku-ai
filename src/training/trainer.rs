@@ -8,6 +8,7 @@ use crate::network::transformer::GomokuNetwork;
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 use crate::training::buffer::RolloutBuffer;
 use crate::training::lr_schedule::LrSchedule;
+use crate::training::metrics::{BatchStats, EpochStats, TrainingLogger};
 
 use crate::eval::{BaselineServer, EloTracker, EvalConfig, MatchRunner};
 
@@ -97,15 +98,18 @@ pub struct Trainer {
     config: TrainConfig,
     device: Device,
     buffer: RolloutBuffer,
+    metrics_logger: TrainingLogger,
 }
 
 impl Trainer {
     pub fn new(config: TrainConfig, device: Device) -> Self {
         let cap = config.buffer_capacity;
+        let metrics_logger = TrainingLogger::new(&config.model_dir);
         Self {
             config,
             device,
             buffer: RolloutBuffer::new(cap),
+            metrics_logger,
         }
     }
 
@@ -199,10 +203,11 @@ impl Trainer {
         );
 
         for iteration in 0..self.config.num_iterations {
+            let epoch = iteration + 1;
+
             println!(
                 "========== Iteration {}/{} ==========",
-                iteration + 1,
-                self.config.num_iterations
+                epoch, self.config.num_iterations
             );
 
             let lr = lr_sched.lr(iteration, self.config.learning_rate);
@@ -220,11 +225,16 @@ impl Trainer {
                 continue;
             }
 
-            self.run_training_batches(&mut model, &mut optim, &train_device, lr, &mut master_rng);
+            self.run_training_batches(
+                &mut model,
+                &mut optim,
+                &train_device,
+                lr,
+                &mut master_rng,
+                epoch,
+            );
 
             inference_server.update_model(model.clone().valid());
-
-            let epoch = iteration + 1;
 
             // ── 对抗评估 ──
             if self.config.eval_enabled && epoch % self.config.eval_every == 0 {
@@ -340,9 +350,9 @@ impl Trainer {
         train_device: &Device,
         lr: f64,
         rng: &mut R,
-    ) -> (f32, usize) {
-        let mut total_loss = 0.0_f32;
-        let mut total_steps: usize = 0;
+        epoch: usize,
+    ) -> EpochStats {
+        let mut stats = EpochStats::default();
         let identity_prob = 1.0 / D4Symmetry::COUNT as f32;
 
         let num_batches = self.config.mini_batches_per_iteration;
@@ -352,11 +362,6 @@ impl Trainer {
                 .template("  Training: {bar:40.green/dim} {pos}/{len} batches ({eta})")
                 .unwrap(),
         );
-
-        let mut total_entropy_sum = 0.0_f32;
-        let mut total_entropy_count: usize = 0;
-        let mut all_value_preds: Vec<f32> = Vec::new();
-        let mut all_value_targets: Vec<f32> = Vec::new();
 
         for _ in 0..num_batches {
             // 每次 mini-batch 独立从 buffer 采样 batch_size 个样本
@@ -399,27 +404,26 @@ impl Trainer {
 
             let log_probs = log_softmax(policy_logits.clone(), 1);
 
-            // 统计
-            {
+            // ── 统计（detached） ──
+            let entropy = {
                 let log_probs = log_probs.clone().detach();
                 let probs = log_probs.clone().exp();
-                let entropy = -(probs * log_probs).sum_dim(1).mean().into_scalar::<f32>();
-                total_entropy_sum += entropy;
-                total_entropy_count += 1;
+                -(probs * log_probs).sum_dim(1).mean().into_scalar::<f32>()
+            };
 
-                let val_pred: Vec<f32> = value_pred
-                    .clone()
-                    .reshape([batch_len])
-                    .cast(FloatDType::F32)
-                    .into_data()
-                    .to_vec()
-                    .unwrap();
-                all_value_preds.extend(val_pred);
-                all_value_targets.extend(flat_values.iter());
-            }
+            let val_pred: Vec<f32> = value_pred
+                .clone()
+                .reshape([batch_len])
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec()
+                .unwrap();
+            stats.all_value_preds.extend(val_pred);
+            stats.all_value_targets.extend(flat_values.iter());
 
-            // 策略损失
+            // ── 损失 ──
             let policy_loss = -(log_probs * policy_target.clone()).sum_dim(1).mean();
+            let policy_loss_scalar: f32 = policy_loss.clone().into_scalar();
 
             let mse = MseLoss::new();
             let value_loss = mse.forward(
@@ -427,11 +431,27 @@ impl Trainer {
                 value_target_tensor.clone(),
                 Reduction::Mean,
             );
+            let value_loss_scalar: f32 = value_loss.clone().into_scalar();
 
-            let loss = policy_loss + value_loss * self.config.value_loss_weight;
-            let scalar: f32 = loss.clone().into_scalar();
-            total_loss += scalar;
-            total_steps += 1;
+            let loss = value_loss * self.config.value_loss_weight + policy_loss;
+            let total_loss_scalar: f32 = loss.clone().into_scalar();
+
+            // ── 记录每个 batch 的指标到日志文件 ──
+            self.metrics_logger.log_batch(
+                epoch,
+                total_loss_scalar,
+                policy_loss_scalar,
+                value_loss_scalar,
+                entropy,
+            );
+
+            stats.push(BatchStats {
+                total_loss: total_loss_scalar,
+                policy_loss: policy_loss_scalar,
+                value_loss: value_loss_scalar,
+                entropy,
+                batch_size: batch_len,
+            });
 
             // 反向传播 + 参数更新
             let grads = loss.backward();
@@ -441,25 +461,25 @@ impl Trainer {
             pb.inc(1);
         }
 
-        let avg_loss = if total_steps > 0 {
-            total_loss / total_steps as f32
-        } else {
-            0.0
-        };
-        let avg_entropy = if total_entropy_count > 0 {
-            total_entropy_sum / total_entropy_count as f32
-        } else {
-            0.0
-        };
-        let explained_var = Self::explained_variance(&all_value_preds, &all_value_targets);
         pb.finish_and_clear();
 
+        let explained_var =
+            Self::explained_variance(&stats.all_value_preds, &stats.all_value_targets);
+
+        // 记录 epoch 级别汇总指标
+        self.metrics_logger.log_epoch_summary(epoch, explained_var);
+
         println!(
-            "  {} batches: avg_loss={:.4}, explained_var={:.3}, avg_entropy={:.4}",
-            total_steps, avg_loss, explained_var, avg_entropy,
+            "  {} batches: avg_loss={:.4}, policy_loss={:.4}, value_loss={:.4}, explained_var={:.3}, avg_entropy={:.4}",
+            stats.num_batches,
+            stats.avg_total_loss(),
+            stats.avg_policy_loss(),
+            stats.avg_value_loss(),
+            explained_var,
+            stats.avg_entropy(),
         );
 
-        (total_loss, total_steps)
+        stats
     }
 
     // ── 数据辅助 ──
