@@ -172,7 +172,6 @@ impl Trainer {
         let eval_config = EvalConfig {
             num_games: self.config.eval_num_games,
             num_simulations: self.config.eval_num_simulations,
-            promotion_threshold: self.config.eval_promotion_threshold,
             eval_every: self.config.eval_every,
         };
         let match_runner = if self.config.eval_enabled {

@@ -121,9 +121,6 @@ pub struct EvalConfig {
     pub num_games: usize,
     /// 每步 MCTS 模拟次数（评估时建议比训练时高，如 64~128）
     pub num_simulations: usize,
-    /// 晋升阈值：当前模型胜率超过此值则替换 baseline
-    /// 例如 0.55 表示胜率 > 55% 时晋升
-    pub promotion_threshold: f64,
     /// 每隔多少轮评估一次（也用于决定是否晋升）
     pub eval_every: usize,
 }
@@ -133,7 +130,6 @@ impl Default for EvalConfig {
         Self {
             num_games: 100,
             num_simulations: 64,
-            promotion_threshold: 0.55,
             eval_every: 5,
         }
     }
