@@ -58,6 +58,9 @@ pub struct GumbelConfig {
     pub root_policy_temperature: f32,
     /// 是否启用 Dynamic Variance-Scaled cPUCT
     pub dynamic_cpuct: bool,
+    /// FPU Reduction (KataGo): 未访问子节点的初始 Q 值向负值偏移。
+    /// 0.0 = 无修正，0.2 = KataGo 推荐值。
+    pub fpu_reduction: f32,
     pub dirichlet_alpha: f32,
     pub dirichlet_epsilon: f32,
 }
@@ -73,6 +76,7 @@ impl Default for GumbelConfig {
             select_temperature: 1.0,
             root_policy_temperature: 1.0,
             dynamic_cpuct: true,
+            fpu_reduction: 0.0,
             dirichlet_alpha: 0.1,
             dirichlet_epsilon: 0.25,
             think_batch_size: 8,
@@ -316,6 +320,7 @@ impl MCTS {
         board: &mut Board,
         legal: &mut Vec<(usize, usize)>,
         dynamic_cpuct: bool,
+        fpu_reduction: f32,
     ) -> Vec<usize> {
         // 方差缩放钳位：防止极端方差导致探索失控
         const VAR_CLAMP_MIN: f32 = 0.1;
@@ -338,6 +343,8 @@ impl MCTS {
             let bias = Self::puct_bias(total_simulation);
             let sqrt_total = total_simulation.sqrt();
             let init_q = self.init_q_value(node_idx);
+            // FPU Reduction (KataGo): 未访问子节点悲观估计，避免在明显差走法上浪费模拟
+            let fpu_q = init_q - fpu_reduction;
 
             let children = &node.children;
             let mut best: Option<(usize, usize, f32, f32)> = None;
@@ -349,7 +356,7 @@ impl MCTS {
                     let q = if child.visit_count > 0 {
                         child.total_value / child.visit_count as f32
                     } else {
-                        init_q
+                        fpu_q
                     };
                     let var_scale = if dynamic_cpuct {
                         child.variance().sqrt().clamp(VAR_CLAMP_MIN, VAR_CLAMP_MAX)
@@ -508,7 +515,13 @@ impl MCTS {
 
                 if sim_i == 0 {
                     sim_board.clone_from(board);
-                    path = self.puct_walk(0, &mut sim_board, &mut legal_buf, config.dynamic_cpuct);
+                    path = self.puct_walk(
+                        0,
+                        &mut sim_board,
+                        &mut legal_buf,
+                        config.dynamic_cpuct,
+                        config.fpu_reduction,
+                    );
                 } else {
                     candidates.sort_by(|&a, &b| {
                         self.node(a)
@@ -532,6 +545,7 @@ impl MCTS {
                         &mut sim_board,
                         &mut legal_buf,
                         config.dynamic_cpuct,
+                        config.fpu_reduction,
                     );
                     let mut full = vec![0];
                     full.extend(p_from);

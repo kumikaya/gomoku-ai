@@ -12,8 +12,8 @@ use rand::distr::{Distribution, weighted::WeightedIndex};
 pub struct RolloutBuffer {
     buf: Vec<PlayRecord>,
     capacity: usize,
-    /// 归一化后的 surprise 权重（与 buf 一一对应）
-    surprise_weights: Vec<f32>,
+    /// 归一化后的样本权重（与 buf 一一对应）
+    sample_weights: Vec<f32>,
 }
 
 impl RolloutBuffer {
@@ -23,7 +23,7 @@ impl RolloutBuffer {
         Self {
             buf: Vec::with_capacity(capacity),
             capacity,
-            surprise_weights: Vec::with_capacity(capacity),
+            sample_weights: Vec::with_capacity(capacity),
         }
     }
 
@@ -47,13 +47,13 @@ impl RolloutBuffer {
     pub fn extend(&mut self, records: impl IntoIterator<Item = PlayRecord>) -> usize {
         let mut count = 0;
         for record in records {
-            let sw = record.surprise_weight;
+            let sw = record.sample_weight;
             if self.buf.len() >= self.capacity {
                 self.buf.remove(0);
-                self.surprise_weights.remove(0);
+                self.sample_weights.remove(0);
             }
             self.buf.push(record);
-            self.surprise_weights.push(sw);
+            self.sample_weights.push(sw);
             count += 1;
         }
         count
@@ -74,9 +74,9 @@ impl RolloutBuffer {
         // 计算有效权重：uniform_base + surprise_scaled
         let uniform_base = 0.5 / n as f64;
 
-        let max_kl = self.surprise_weights.iter().fold(0.0f32, |a, &b| a.max(b));
+        let max_kl = self.sample_weights.iter().fold(0.0f32, |a, &b| a.max(b));
         let sum_kl: f64 = if max_kl > 1e-10 {
-            self.surprise_weights
+            self.sample_weights
                 .iter()
                 .map(|&w| w as f64)
                 .sum::<f64>()
@@ -86,7 +86,7 @@ impl RolloutBuffer {
         };
 
         let surprise_scaled: Vec<f64> = if max_kl > 1e-10 {
-            self.surprise_weights
+            self.sample_weights
                 .iter()
                 .map(|&w| 0.5 * w as f64 / sum_kl)
                 .collect()
@@ -134,7 +134,7 @@ mod tests {
             state: vec![0i32; crate::game::board::ENCODE_LEN],
             policy: vec![0.0f32; crate::game::board::NUM_POSITIONS],
             value,
-            surprise_weight: surprise,
+            sample_weight: surprise,
         }
     }
 

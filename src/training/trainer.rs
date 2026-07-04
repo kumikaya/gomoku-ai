@@ -309,6 +309,7 @@ impl Trainer {
         let sp_config = SelfPlayConfig {
             num_simulations: self.config.num_simulations,
             select_temperature: temp,
+            ..Default::default()
         };
 
         let base_seed = master_rng.random::<u64>();
@@ -377,7 +378,7 @@ impl Trainer {
                         state,
                         policy,
                         value: record.value,
-                        surprise_weight: 0.0,
+                        ..Default::default()
                     }
                 })
                 .collect();
