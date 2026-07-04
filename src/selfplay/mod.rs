@@ -2,9 +2,11 @@
 //!
 //! 使用 MCTS (Gumbel Zero) 指导双方走棋，生成 (状态, 策略, 价值) 训练样本。
 //!
-//! Gumbel Zero 的 Completed Q 策略已自带 softmax 分布，
-//! 不需要 PUCT 风格的 temperature 退火。Gumbel 噪声提供了
-//! 足够的探索多样性。
+//! Playout Cap Randomization (KataGo): 每步随机决定做"完整搜索"还是"快速搜索"。
+//! - 完整搜索: num_simulations 全量模拟 → 产生训练样本 + 选择走法
+//! - 快速搜索: fast_sim_factor * num_simulations → 仅用于选择走法推进棋局，不产生样本
+//!
+//! 对齐 KataGo: cheapSearchTargetWeight=0 → 快速搜索的样本不写入训练数据。
 
 use crate::game::board::{Board, Color, NUM_POSITIONS};
 use crate::inference::Evaluator;
@@ -16,8 +18,8 @@ pub struct PlayRecord {
     pub state: Vec<i32>,
     pub policy: Vec<f32>,
     pub value: f32,
-    /// 训练样本权重（KataGo Playout Cap + Policy Surprise）。
-    /// 完整搜索 + 惊奇局面 → 高权重；快速搜索 → 低权重。
+    /// 训练样本权重 (Policy Surprise = KL(nn_prior || mcts_posterior)).
+    /// 仅完整搜索产生样本，权重即 KL 值。写入时按权重复制多份 (KataGo frequency weighting).
     pub sample_weight: f32,
 }
 
@@ -34,12 +36,10 @@ impl SelfPlayGame {
 
 pub struct SelfPlayConfig {
     pub num_simulations: usize,
-    /// 动作选择 softmax 温度
     pub select_temperature: f32,
-    /// Playout Cap Randomization (KataGo): 完整搜索的概率 (0.0-1.0)
-    /// 其余步用 `num_simulations * fast_sim_factor` 做快速搜索。
+    /// 完整搜索概率 (0.0-1.0)，其余步做快速搜索仅用于推进棋局不产生样本。
     pub full_search_prob: f32,
-    /// 快速搜索的模拟数比例（相对于 num_simulations），默认 0.25
+    /// 快速搜索的模拟数比例 (相对于 num_simulations).
     pub fast_sim_factor: f32,
 }
 
@@ -54,12 +54,9 @@ impl Default for SelfPlayConfig {
     }
 }
 
-/// 运行一局自对弈，生成 (状态, 策略, 价值) 训练样本。
+/// 运行一局自对弈。
 ///
-/// Playout Cap Randomization (KataGo): 每步随机决定做"完整搜索"还是"快速搜索"。
-/// - 完整搜索：num_simulations 全量模拟 → 高质量 policy target
-/// - 快速搜索：fast_sim_factor * num_simulations → 低成本覆盖更多局面
-/// 快速搜索的样本标记更低的 surprise_weight，避免低质量目标主导训练。
+/// 完整搜索 → 产生训练样本；快速搜索 → 仅推进棋局。
 pub fn self_play<E: Evaluator>(
     evaluator: &E,
     config: &SelfPlayConfig,
@@ -82,14 +79,16 @@ pub fn self_play<E: Evaluator>(
 
         let result = mcts.search(&mut board, evaluator, &search_config, rng);
 
-        let weight = compute_sample_weight(&result.root_nn_prior, &result.policy, is_full_search);
-
-        records.push(PlayRecord {
-            state: board.encode_state(),
-            policy: result.policy,
-            value: result.root_value,
-            sample_weight: weight,
-        });
+        // 仅完整搜索产生训练样本 (对齐 KataGo cheapSearchTargetWeight=0)
+        if is_full_search {
+            let kl = compute_kl(&result.root_nn_prior, &result.policy);
+            records.push(PlayRecord {
+                state: board.encode_state(),
+                policy: result.policy,
+                value: result.root_value,
+                sample_weight: kl,
+            });
+        }
 
         board.play_idx(result.best_move);
 
@@ -104,15 +103,8 @@ pub fn self_play<E: Evaluator>(
     }
 }
 
-/// 计算训练样本权重 (KataGo Playout Cap + Policy Surprise Weighting)。
-///
-/// - `nn_prior`: 根节点 NN 干净先验（不含 noise/temperature）
-/// - `mcts_policy`: MCTS 搜索后验（Completed Q policy）
-/// - `is_full_search`: 是否为完整搜索（全量模拟）
-///
-/// 返回 KL(P || Q) × 搜索质量折扣。
-fn compute_sample_weight(nn_prior: &[f32], mcts_policy: &[f32], is_full_search: bool) -> f32 {
-    // Policy Surprise: KL(P || Q)
+/// Policy Surprise: NN 先验 P 与 MCTS 后验 Q 的 KL 散度。
+fn compute_kl(nn_prior: &[f32], mcts_policy: &[f32]) -> f32 {
     let epsilon = 1e-12f32;
     let mut kl = 0.0f32;
     for i in 0..NUM_POSITIONS {
@@ -122,7 +114,5 @@ fn compute_sample_weight(nn_prior: &[f32], mcts_policy: &[f32], is_full_search: 
             kl += p * (p / q).ln();
         }
     }
-    // Playout Cap 折扣：快速搜索样本降权，避免低质量目标主导训练
-    let weight_scale: f32 = if is_full_search { 1.0 } else { 0.2 };
-    kl * weight_scale
+    kl
 }
