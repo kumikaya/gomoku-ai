@@ -3,7 +3,7 @@
 //! 通过对抗对弈评估模型实力：
 //! - `MatchRunner`: 让两个模型对弈 N 局，统计胜率
 //! - `EloTracker`: Elo 评分追踪（1500 基准）
-//! - 在训练循环中周期性评估，胜率超过阈值则晋升模型
+//! - `BaselineServer`: 长期缓存 baseline 的 InferenceServer，避免重复创建 GPU 线程
 
 use crate::game::board::{Board, Color, NUM_POSITIONS};
 use crate::inference::InferenceServer;
@@ -16,16 +16,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 // ============================================================
 //  Elo 评分系统
 // ============================================================
 
-/// Elo 评分追踪器。
-///
-/// 初始 Elo 1500，每轮评估后根据实际 vs 预期胜率更新。
-/// 基线模型视为 Elo 固定（不更新），仅计算当前模型相对 baseline 的评分变化。
 pub struct EloTracker {
     pub current_elo: f64,
     pub history: Vec<(usize, f64)>,
@@ -41,12 +36,6 @@ impl EloTracker {
         }
     }
 
-    /// 根据对 baseline 的胜率更新 Elo。
-    ///
-    /// `iteration`: 当前训练轮次
-    /// `win_rate`: 当前模型 vs baseline 的胜率 (0.0~1.0，平局计 0.5)
-    ///
-    /// 返回新的 Elo 分数。
     pub fn update(&mut self, iteration: usize, win_rate: f64) -> f64 {
         let baseline_elo = 1500.0;
         let clamped = win_rate.clamp(0.01, 0.99);
@@ -70,7 +59,6 @@ impl EloTracker {
 //  对弈结果
 // ============================================================
 
-/// 一局游戏的结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameOutcome {
     BlackWins,
@@ -78,24 +66,17 @@ enum GameOutcome {
     Draw,
 }
 
-/// 多局对抗对弈的汇总结果
 #[derive(Debug, Clone, Default)]
 pub struct MatchResult {
     pub total_games: usize,
-    /// 当前模型（挑战者）的胜场
     pub wins_current: usize,
-    /// 基线模型（擂主）的胜场
     pub wins_baseline: usize,
-    /// 平局数
     pub draws: usize,
-    /// 全局黑方胜场（用于检测先手优势）
     pub black_wins: usize,
-    /// 全局白方胜场
     pub white_wins: usize,
 }
 
 impl MatchResult {
-    /// 当前模型的胜率（平局计 0.5 胜）
     pub fn win_rate_current(&self) -> f64 {
         if self.total_games == 0 {
             return 0.5;
@@ -117,11 +98,8 @@ impl MatchResult {
 // ============================================================
 
 pub struct EvalConfig {
-    /// 评估对弈局数
     pub num_games: usize,
-    /// 每步 MCTS 模拟次数（评估时建议比训练时高，如 64~128）
     pub num_simulations: usize,
-    /// 每隔多少轮评估一次（也用于决定是否晋升）
     pub eval_every: usize,
 }
 
@@ -136,13 +114,56 @@ impl Default for EvalConfig {
 }
 
 // ============================================================
+//  BaselineServer: 长期缓存 baseline 的 GPU 推理线程
+// ============================================================
+
+/// 整个训练周期只创建一个 GPU 线程，晋升时通过 `update_model` 热更新权重，
+/// 避免反复创建/销毁 GPU 线程导致显存碎片。
+pub struct BaselineServer {
+    server: InferenceServer,
+    model_dir: PathBuf,
+}
+
+impl BaselineServer {
+    pub fn new(initial_model: &GomokuNetwork, model_dir: PathBuf, device: &Device) -> Self {
+        let baseline_path = model_dir.join("gomoku_baseline");
+
+        let model = if let Ok(record) = burn::store::ModuleRecord::load(&baseline_path) {
+            println!("  Loaded baseline model from {:?}", baseline_path);
+            GomokuNetwork::new(device).load_record(record)
+        } else {
+            println!("  No baseline found, using current model as baseline.");
+            initial_model.clone().valid()
+        };
+
+        Self {
+            server: InferenceServer::new(model, device.clone()),
+            model_dir,
+        }
+    }
+
+    pub fn promote(&self, model: &GomokuNetwork) {
+        let path = self.model_dir.join("gomoku_baseline");
+        if let Err(e) = model.clone().valid().save_file(&path) {
+            eprintln!("  Warning: failed to save baseline: {}", e);
+            return;
+        }
+        println!("  Baseline promoted! Saved to {:?}", path);
+        self.server.update_model(model.clone().valid());
+    }
+
+    pub fn server(&self) -> &InferenceServer {
+        &self.server
+    }
+}
+
+// ============================================================
 //  MatchRunner: 两模型对抗对弈
 // ============================================================
 
-/// 对抗对弈引擎。
-///
-/// 让当前模型与基线模型对弈 N 局，各自交替先后手，
-/// 使用 Gumbel Zero MCTS，低温度接近确定性下棋。
+/// 不持有自己的 InferenceServer，接受外部引用：
+/// - `current`: 训练循环中的 `inference_server`
+/// - `baseline`: `BaselineServer` 中缓存的 server
 pub struct MatchRunner {
     config: EvalConfig,
 }
@@ -152,26 +173,14 @@ impl MatchRunner {
         Self { config }
     }
 
-    /// 运行对抗对弈。
-    ///
-    /// `current`: 当前训练中的模型（挑战者）
-    /// `baseline`: 基线模型（擂主，如上次晋升的最佳模型）
-    /// `device`: 推理设备
-    ///
-    /// 返回 `MatchResult`，其中 `wins_current` 是当前模型的胜场。
     pub fn run_match(
         &self,
-        current: GomokuNetwork,
-        baseline: GomokuNetwork,
-        device: Device,
+        current_server: &InferenceServer,
+        baseline_server: &InferenceServer,
         rng_seed: u64,
     ) -> MatchResult {
         let num_games = self.config.num_games;
         let half = num_games / 2;
-
-        // 为两个模型各创建一个 InferenceServer
-        let server_current = Arc::new(InferenceServer::new(current, device.clone()));
-        let server_baseline = Arc::new(InferenceServer::new(baseline, device.clone()));
 
         let pb = ProgressBar::new(num_games as u64);
         pb.set_style(
@@ -180,14 +189,13 @@ impl MatchRunner {
                 .unwrap(),
         );
 
-        // 前半：当前模型执黑（先手），基线执白
         let outcomes_current_black: Vec<GameOutcome> = (0..half)
             .into_par_iter()
             .map(|game_i| {
                 let seed = rng_seed.wrapping_add(game_i as u64);
                 let result = play_eval_game(
-                    server_current.as_ref(),
-                    server_baseline.as_ref(),
+                    current_server,
+                    baseline_server,
                     self.config.num_simulations,
                     seed,
                 );
@@ -196,14 +204,13 @@ impl MatchRunner {
             })
             .collect();
 
-        // 后半：基线执黑，当前模型执白
         let outcomes_current_white: Vec<GameOutcome> = (0..num_games - half)
             .into_par_iter()
             .map(|game_i| {
                 let seed = rng_seed.wrapping_add((half + game_i) as u64);
                 let result = play_eval_game(
-                    server_baseline.as_ref(),
-                    server_current.as_ref(),
+                    baseline_server,
+                    current_server,
                     self.config.num_simulations,
                     seed,
                 );
@@ -217,7 +224,6 @@ impl MatchRunner {
         let mut result = MatchResult::default();
         result.total_games = num_games;
 
-        // 当前模型执黑 → BlackWins = 当前胜
         for outcome in &outcomes_current_black {
             match outcome {
                 GameOutcome::BlackWins => {
@@ -234,7 +240,6 @@ impl MatchRunner {
             }
         }
 
-        // 当前模型执白 → WhiteWins = 当前胜
         for outcome in &outcomes_current_white {
             match outcome {
                 GameOutcome::BlackWins => {
@@ -259,9 +264,6 @@ impl MatchRunner {
 //  评估对弈逻辑
 // ============================================================
 
-/// 运行一局评估对弈。
-///
-/// 评估时使用确定性搜索：温度设很低（接近 argmax），无 Dirichlet 噪声。
 fn play_eval_game(
     black_server: &InferenceServer,
     white_server: &InferenceServer,
@@ -275,7 +277,6 @@ fn play_eval_game(
     let mut config = GumbelConfig::pure_gumbel(num_simulations);
     config.select_temperature = 0.1;
 
-    // 为每局生成独立的确定性 RNG
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
     let max_moves = NUM_POSITIONS * 2;
@@ -305,46 +306,5 @@ fn play_eval_game(
         Some(Color::Black) => GameOutcome::BlackWins,
         Some(Color::White) => GameOutcome::WhiteWins,
         None => GameOutcome::Draw,
-    }
-}
-
-// ============================================================
-//  基线模型管理
-// ============================================================
-
-/// 管理 baseline 模型文件的路径。
-pub struct BaselineManager {
-    model_dir: PathBuf,
-}
-
-impl BaselineManager {
-    pub fn new(model_dir: PathBuf) -> Self {
-        Self { model_dir }
-    }
-
-    fn baseline_path(&self) -> PathBuf {
-        self.model_dir.join("gomoku_baseline")
-    }
-
-    /// 加载基线模型（若不存在则返回 None）
-    pub fn load_baseline(&self, device: &Device) -> Option<GomokuNetwork> {
-        let path = self.baseline_path();
-        match burn::store::ModuleRecord::load(&path) {
-            Ok(record) => {
-                println!("  Loaded baseline model from {:?}", path);
-                Some(GomokuNetwork::new(device).load_record(record))
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// 将当前模型保存为新的基线
-    pub fn promote(&self, model: &GomokuNetwork) {
-        let path = self.baseline_path();
-        if let Err(e) = model.clone().valid().save_file(&path) {
-            eprintln!("  Warning: failed to save baseline: {}", e);
-        } else {
-            println!("  Baseline promoted! Saved to {:?}", path);
-        }
     }
 }

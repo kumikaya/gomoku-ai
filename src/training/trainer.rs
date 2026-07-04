@@ -9,7 +9,7 @@ use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 use crate::training::buffer::RolloutBuffer;
 use crate::training::lr_schedule::LrSchedule;
 
-use crate::eval::{BaselineManager, EloTracker, EvalConfig, MatchRunner};
+use crate::eval::{BaselineServer, EloTracker, EvalConfig, MatchRunner};
 
 use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
@@ -76,7 +76,7 @@ impl Default for TrainConfig {
             mini_batches_per_iteration: 100,
             num_iterations: 100,
             learning_rate: 1e-3,
-            value_loss_weight: 0.5,
+            value_loss_weight: 1.0,
             save_every: 5,
             model_dir: PathBuf::from("checkpoints"),
             buffer_capacity: 80000,
@@ -175,13 +175,19 @@ impl Trainer {
             println!("  Eval disabled.");
             None
         };
-        let baseline_mgr = BaselineManager::new(self.config.model_dir.clone());
-        let mut elo = EloTracker::new();
 
-        // 初始模型作为 baseline（如果尚未存在）
-        if self.config.eval_enabled && baseline_mgr.load_baseline(&self.device).is_none() {
-            baseline_mgr.promote(&model);
-        }
+        // BaselineServer 长期持有 baseline 的 GPU 线程，只在晋升时热更新
+        let baseline_server = if self.config.eval_enabled {
+            Some(BaselineServer::new(
+                &model,
+                self.config.model_dir.clone(),
+                &self.device,
+            ))
+        } else {
+            None
+        };
+
+        let mut elo = EloTracker::new();
 
         let mut master_rng = StdRng::seed_from_u64(self.config.random_seed);
         println!("  Random seed: {}", self.config.random_seed);
@@ -228,39 +234,33 @@ impl Trainer {
 
             // ── 对抗评估 ──
             if self.config.eval_enabled && epoch % self.config.eval_every == 0 {
-                if let Some(ref runner) = match_runner {
-                    if let Some(baseline) = baseline_mgr.load_baseline(&self.device) {
-                        println!();
-                        println!("  === Tournament Evaluation (iter {}) ===", epoch);
-                        let result = runner.run_match(
-                            model.clone().valid(),
-                            baseline,
-                            self.device.clone(),
-                            master_rng.random::<u64>(),
+                if let (Some(runner), Some(bs)) = (&match_runner, &baseline_server) {
+                    println!();
+                    println!("  === Tournament Evaluation (iter {}) ===", epoch);
+                    let result = runner.run_match(
+                        &inference_server,
+                        bs.server(),
+                        master_rng.random::<u64>(),
+                    );
+                    result.print();
+
+                    let wr = result.win_rate_current();
+                    let new_elo = elo.update(epoch, wr);
+                    println!("  Elo: {:.1} (baseline=1500)", new_elo);
+
+                    if wr > self.config.eval_promotion_threshold {
+                        println!(
+                            "  >>> Model promoted! Win rate {:.1}% > threshold {:.0}%",
+                            wr * 100.0,
+                            self.config.eval_promotion_threshold * 100.0,
                         );
-                        result.print();
-
-                        let wr = result.win_rate_current();
-                        let new_elo = elo.update(epoch, wr);
-                        println!("  Elo: {:.1} (baseline=1500)", new_elo);
-
-                        if wr > self.config.eval_promotion_threshold {
-                            println!(
-                                "  >>> Model promoted! Win rate {:.1}% > threshold {:.0}%",
-                                wr * 100.0,
-                                self.config.eval_promotion_threshold * 100.0,
-                            );
-                            baseline_mgr.promote(&model);
-                        } else {
-                            println!(
-                                "  Win rate {:.1}% <= threshold {:.0}%, baseline unchanged",
-                                wr * 100.0,
-                                self.config.eval_promotion_threshold * 100.0,
-                            );
-                        }
+                        bs.promote(&model);
                     } else {
-                        println!("  Baseline missing, promoting current model.");
-                        baseline_mgr.promote(&model);
+                        println!(
+                            "  Win rate {:.1}% <= threshold {:.0}%, baseline unchanged",
+                            wr * 100.0,
+                            self.config.eval_promotion_threshold * 100.0,
+                        );
                     }
                 }
             }

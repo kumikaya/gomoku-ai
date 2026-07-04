@@ -196,7 +196,9 @@ fn main() {
                 ..Default::default()
             };
             let runner = MatchRunner::new(config);
-            let result = runner.run_match(challenger_model, baseline_model, device, 0);
+            let server_c = InferenceServer::new(challenger_model, device.clone());
+            let server_b = InferenceServer::new(baseline_model, device);
+            let result = runner.run_match(&server_c, &server_b, 0);
 
             println!();
             result.print();
