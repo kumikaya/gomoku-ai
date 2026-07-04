@@ -823,6 +823,8 @@ impl MCTS {
         use rand::distr::Distribution;
         let gumbel = rand_distr::Gumbel::new(0.0, 1.0).unwrap();
         let mut rng = rand::rng();
-        (0..n).map(|_| gumbel.sample(&mut rng)).collect()
+        (0..n)
+            .map(|_| (gumbel.sample(&mut rng) as f32).clamp(-40.0_f32, 40.0_f32))
+            .collect()
     }
 }

@@ -9,14 +9,16 @@ use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 use crate::training::buffer::RolloutBuffer;
 use crate::training::lr_schedule::LrSchedule;
 
+use crate::eval::{BaselineManager, EloTracker, EvalConfig, MatchRunner};
+
 use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::optim::ModuleOptimizer;
+use burn::store::ModuleRecord;
 use burn::{
     grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
     optim::{AdamWConfig, GradientsParams},
-    store::ModuleRecord,
     tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
 };
 use indicatif::{ProgressBar, ProgressStyle};
@@ -37,6 +39,8 @@ pub struct TrainConfig {
     pub model_dir: PathBuf,
     pub buffer_capacity: usize,
     pub max_grad_norm: f32,
+    /// 从指定 checkpoint 路径恢复训练（None 则创建新模型）
+    pub checkpoint: Option<PathBuf>,
     /// KataGo Playout Cap：启用后每步在 `[min, max]` 内均匀随机模拟次数。
     pub playout_cap_enabled: bool,
     /// 下界比例（相对于 `num_simulations`）。
@@ -49,6 +53,17 @@ pub struct TrainConfig {
     /// 窗口化 buffer 加权采样：近期数据采样权重乘数。
     /// 0.0 = 关（均匀采样），推荐 0.5~1.0。
     pub buffer_recent_bonus: f32,
+    // ── 评估配置 ──
+    /// 是否启用对抗评估（每 `eval_every` 轮与 baseline 对战）
+    pub eval_enabled: bool,
+    /// 评估对弈局数
+    pub eval_num_games: usize,
+    /// 评估时 MCTS 模拟次数（建议比训练时高）
+    pub eval_num_simulations: usize,
+    /// 晋升阈值：当前模型胜率超过此值替换 baseline
+    pub eval_promotion_threshold: f64,
+    /// 每隔多少轮评估一次
+    pub eval_every: usize,
 }
 
 impl Default for TrainConfig {
@@ -65,11 +80,17 @@ impl Default for TrainConfig {
             model_dir: PathBuf::from("checkpoints"),
             buffer_capacity: 80000,
             max_grad_norm: 2.0,
-            playout_cap_enabled: true,
+            checkpoint: None,
+            playout_cap_enabled: false,
             playout_cap_min_ratio: 0.25,
             lr_warmup_ratio: 0.05,
             lr_final_ratio: 0.1,
             buffer_recent_bonus: 0.5,
+            eval_enabled: true,
+            eval_num_games: 100,
+            eval_num_simulations: 64,
+            eval_promotion_threshold: 0.55,
+            eval_every: 5,
         }
     }
 }
@@ -98,16 +119,20 @@ impl Trainer {
         self.config.model_dir.join(format!("gomoku_{}", label))
     }
 
-    fn load_or_create_model(&self, autodiff_device: &Device) -> GomokuNetwork {
-        let latest_path = self.model_path("latest");
-        if let Ok(record) = ModuleRecord::load(&latest_path) {
-            println!("Loaded existing model from disk.");
-            return GomokuNetwork::new(autodiff_device).load_record(record);
-        }
-        let init_path = self.model_path("initial");
-        if let Ok(record) = ModuleRecord::load(&init_path) {
-            println!("Loaded initial model from disk.");
-            return GomokuNetwork::new(autodiff_device).load_record(record);
+    fn load_model(&self, autodiff_device: &Device) -> GomokuNetwork {
+        if let Some(ref ckpt_path) = self.config.checkpoint {
+            match ModuleRecord::load(ckpt_path) {
+                Ok(record) => {
+                    println!("Loaded checkpoint from {:?}", ckpt_path);
+                    return GomokuNetwork::new(autodiff_device).load_record(record);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to load checkpoint {:?}: {}. Creating new model.",
+                        ckpt_path, e
+                    );
+                }
+            }
         }
         println!("Creating new model.");
         GomokuNetwork::new(autodiff_device)
@@ -128,7 +153,7 @@ impl Trainer {
         std::fs::create_dir_all(&self.config.model_dir).ok();
 
         let train_device = self.device.clone().autodiff();
-        let mut model = self.load_or_create_model(&train_device);
+        let mut model = self.load_model(&train_device);
 
         let mut optim = AdamWConfig::new().init();
         if self.config.max_grad_norm > 0.0 {
@@ -136,9 +161,28 @@ impl Trainer {
                 .with_grad_clipping(GradientClippingConfig::Norm(self.config.max_grad_norm).init());
         }
 
-        self.save_model(&model, "initial");
-
         let inference_server = InferenceServer::new(model.clone().valid(), self.device.clone());
+
+        // 评估基础设施
+        let eval_config = EvalConfig {
+            num_games: self.config.eval_num_games,
+            num_simulations: self.config.eval_num_simulations,
+            promotion_threshold: self.config.eval_promotion_threshold,
+            eval_every: self.config.eval_every,
+        };
+        let match_runner = if self.config.eval_enabled {
+            Some(MatchRunner::new(eval_config))
+        } else {
+            println!("  Eval disabled.");
+            None
+        };
+        let baseline_mgr = BaselineManager::new(self.config.model_dir.clone());
+        let mut elo = EloTracker::new();
+
+        // 初始模型作为 baseline（如果尚未存在）
+        if self.config.eval_enabled && baseline_mgr.load_baseline(&self.device).is_none() {
+            baseline_mgr.promote(&model);
+        }
 
         let lr_sched = LrSchedule::new(
             self.config.num_iterations,
@@ -179,17 +223,52 @@ impl Trainer {
             inference_server.update_model(model.clone().valid());
 
             let epoch = iteration + 1;
+
+            // ── 对抗评估 ──
+            if self.config.eval_enabled && epoch % self.config.eval_every == 0 {
+                if let Some(ref runner) = match_runner {
+                    if let Some(baseline) = baseline_mgr.load_baseline(&self.device) {
+                        println!();
+                        println!("  === Tournament Evaluation (iter {}) ===", epoch);
+                        let result =
+                            runner.run_match(model.clone().valid(), baseline, self.device.clone());
+                        result.print();
+
+                        let wr = result.win_rate_current();
+                        let new_elo = elo.update(epoch, wr);
+                        println!("  Elo: {:.1} (baseline=1500)", new_elo);
+
+                        if wr > self.config.eval_promotion_threshold {
+                            println!(
+                                "  >>> Model promoted! Win rate {:.1}% > threshold {:.0}%",
+                                wr * 100.0,
+                                self.config.eval_promotion_threshold * 100.0,
+                            );
+                            baseline_mgr.promote(&model);
+                        } else {
+                            println!(
+                                "  Win rate {:.1}% <= threshold {:.0}%, baseline unchanged",
+                                wr * 100.0,
+                                self.config.eval_promotion_threshold * 100.0,
+                            );
+                        }
+                    } else {
+                        println!("  Baseline missing, promoting current model.");
+                        baseline_mgr.promote(&model);
+                    }
+                }
+            }
+
+            // 每个 epoch 结束后保存
             if epoch % self.config.save_every == 0 || epoch == self.config.num_iterations {
                 self.save_model(&model, &format!("epoch_{}", epoch));
-                model
-                    .clone()
-                    .valid()
-                    .save_file(self.model_path("latest"))
-                    .unwrap_or_else(|e| eprintln!("Warning: failed to save latest: {}", e));
             }
         }
 
-        self.save_model(&model, "final");
+        if self.config.eval_enabled {
+            elo.print_history();
+        }
+
         println!("Training complete!");
     }
 
@@ -224,7 +303,7 @@ impl Trainer {
 
         if self.config.playout_cap_enabled {
             println!(
-                "  Playout Cap: enabled (sims ∈ [{:.0}%, 100%] of {}), target_weight ∝ sims",
+                "  Playout Cap: enabled (sims in [{:.0}%, 100%] of {}), target_weight ∝ sims",
                 self.config.playout_cap_min_ratio * 100.0,
                 self.config.num_simulations,
             );
@@ -348,7 +427,7 @@ impl Trainer {
                 all_value_targets.extend(flat_values.iter());
             }
 
-            // ── 策略损失：按 target_weight 加权聚合（低质量样本对策略梯度贡献小）──
+            // 策略损失：按 target_weight 加权聚合（低质量样本对策略梯度贡献小）
             let per_sample_policy_loss = -(log_probs * policy_target.clone()).sum_dim(1); // [batch, 1]
 
             let total_weight = weight_tensor.clone().sum();
