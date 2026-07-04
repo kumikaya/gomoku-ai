@@ -212,8 +212,7 @@ impl Trainer {
             let buffer_size = self.buffer.len();
             println!(
                 "  Training: mini_batches={}, buffer size={}",
-                self.config.mini_batches_per_iteration,
-                buffer_size,
+                self.config.mini_batches_per_iteration, buffer_size,
             );
 
             if buffer_size < self.config.batch_size {
@@ -378,6 +377,7 @@ impl Trainer {
                         state,
                         policy,
                         value: record.value,
+                        surprise_weight: 0.0,
                     }
                 })
                 .collect();

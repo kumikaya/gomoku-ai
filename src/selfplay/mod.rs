@@ -6,7 +6,7 @@
 //! 不需要 PUCT 风格的 temperature 退火。Gumbel 噪声提供了
 //! 足够的探索多样性。
 
-use crate::game::board::{Board, Color};
+use crate::game::board::{Board, Color, NUM_POSITIONS};
 use crate::inference::Evaluator;
 use crate::mcts::node::{GumbelConfig, MCTS};
 use rand::RngExt;
@@ -16,6 +16,9 @@ pub struct PlayRecord {
     pub state: Vec<i32>,
     pub policy: Vec<f32>,
     pub value: f32,
+    /// Policy Surprise Weighting: KL(nn_prior || mcts_posterior) 归一化后的权重。
+    /// 0 表示无 surprise 信息（均匀权重），>0 表示惊奇程度。
+    pub surprise_weight: f32,
 }
 
 pub struct SelfPlayGame {
@@ -66,10 +69,12 @@ pub fn self_play<E: Evaluator>(
 
         let result = mcts.search(&mut board, evaluator, &search_config, rng);
 
+        let surprise = compute_surprise(&result.root_nn_prior, &result.policy);
         records.push(PlayRecord {
             state: board.encode_state(),
             policy: result.policy,
             value: result.root_value,
+            surprise_weight: surprise,
         });
 
         board.play_idx(result.best_move);
@@ -83,4 +88,24 @@ pub fn self_play<E: Evaluator>(
         winner: board.winner,
         records,
     }
+}
+
+/// Policy Surprise Weighting (KataGo):
+/// 计算 NN 干净先验 P 与 MCTS 搜索后验 Q 之间的 KL 散度。
+///
+/// KL(P || Q) = Σ P(i) * ln(P(i) / Q(i))
+///
+/// 值越大表示 NN 越"惊到"于搜索结果。
+/// 返回原始 KL 值（调用方在缓冲区中做归一化）。
+fn compute_surprise(nn_prior: &[f32], mcts_policy: &[f32]) -> f32 {
+    let epsilon = 1e-12f32;
+    let mut kl = 0.0f32;
+    for i in 0..NUM_POSITIONS {
+        let p = nn_prior[i].max(epsilon);
+        let q = mcts_policy[i].max(epsilon);
+        if p > epsilon {
+            kl += p * (p / q).ln();
+        }
+    }
+    kl
 }

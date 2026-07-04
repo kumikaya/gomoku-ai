@@ -53,6 +53,11 @@ pub struct GumbelConfig {
     pub pure_gumbel_noise: bool,
     /// 动作选择 softmax 温度（minizero 默认 1.0）
     pub select_temperature: f32,
+    /// 根节点策略先验 softmax 温度（>1 抑制过早收敛，对齐 KataGo）
+    /// 仅在根节点参与 `ln(prior)` 之前对 NN 先验做 `probs^(1/T) / Z` 缩放。
+    pub root_policy_temperature: f32,
+    /// 是否启用 Dynamic Variance-Scaled cPUCT
+    pub dynamic_cpuct: bool,
     pub dirichlet_alpha: f32,
     pub dirichlet_epsilon: f32,
 }
@@ -66,6 +71,8 @@ impl Default for GumbelConfig {
             sigma_scale_c: 1.0,
             pure_gumbel_noise: true,
             select_temperature: 1.0,
+            root_policy_temperature: 1.0,
+            dynamic_cpuct: true,
             dirichlet_alpha: 0.1,
             dirichlet_epsilon: 0.25,
             think_batch_size: 8,
@@ -98,6 +105,8 @@ impl GumbelConfig {
 pub struct Node {
     pub visit_count: u32,
     pub total_value: f32,
+    /// Σ(value²)：用于计算节点效用方差（Dynamic Variance-Scaled cPUCT）
+    pub value_sq_sum: f32,
     /// 先验概率（PUCT walk 使用；纯 Gumbel 模式 = NN prior，混合模式 = noisy prior）
     pub prior: f32,
     /// 带 Gumbel 噪声的 logit：ln(NN_prior) + gumbel_noise
@@ -118,6 +127,7 @@ impl Node {
         Self {
             visit_count: 0,
             total_value: 0.0,
+            value_sq_sum: 0.0,
             prior,
             policy_logit: gumbel_logit + gumbel_noise,
             gumbel_noise,
@@ -148,10 +158,30 @@ impl Node {
         }
     }
 
+    /// 效用方差（Dynamic Variance-Scaled cPUCT）。
+    ///
+    /// 对访问数较少的节点混入先验方差，避免除零和不合理的极值。
+    /// 值域约 [0.04, 1.0]。
+    #[inline]
+    pub fn variance(&self) -> f32 {
+        // 值域 [-1,1] 下合理的先验方差
+        const PRIOR_VAR: f32 = 0.25;
+        const PRIOR_WEIGHT: f32 = 3.0;
+        if self.visit_count > 1 {
+            let n = self.visit_count as f32;
+            let mean = self.total_value / n;
+            let sample_var = (self.value_sq_sum / n) - (mean * mean);
+            ((sample_var * n) + (PRIOR_VAR * PRIOR_WEIGHT)) / (n + PRIOR_WEIGHT)
+        } else {
+            PRIOR_VAR
+        }
+    }
+
     #[inline]
     pub fn add_visit(&mut self, value: f32) {
         self.visit_count += 1;
         self.total_value += value;
+        self.value_sq_sum += value * value;
     }
 
     /// visit_count 含 virtual loss（用于 PUCT walk 时让后续 walk 发散）
@@ -173,6 +203,8 @@ pub struct SearchResult {
     pub best_move: usize,
     pub policy: Vec<f32>,
     pub root_value: f32,
+    /// 根节点 NN 干净先验（不含 noise/temperature），用于 Policy Surprise Weighting
+    pub root_nn_prior: Vec<f32>,
 }
 
 impl MCTS {
@@ -275,12 +307,20 @@ impl MCTS {
     /// 对齐 minizero `selectFromNode`：起始节点始终在 path[0]。
     /// PUCT 公式中 `n` 用 effective_visits（visit_count + virtual_loss），
     /// 使攒批期间的连续 walk 自然分到不同叶子。
+    ///
+    /// 若 `dynamic_cpuct` 启用，则 bias 乘以 `sqrt(child_variance)`，
+    /// 使效用波动大的局面多探索（对齐 KataGo Dynamic Variance-Scaled cPUCT）。
     fn puct_walk(
         &self,
         start_node_idx: usize,
         board: &mut Board,
         legal: &mut Vec<(usize, usize)>,
+        dynamic_cpuct: bool,
     ) -> Vec<usize> {
+        // 方差缩放钳位：防止极端方差导致探索失控
+        const VAR_CLAMP_MIN: f32 = 0.1;
+        const VAR_CLAMP_MAX: f32 = 4.0;
+
         let mut path: Vec<usize> = vec![start_node_idx];
         let mut node_idx = start_node_idx;
 
@@ -311,7 +351,12 @@ impl MCTS {
                     } else {
                         init_q
                     };
-                    let score = q + bias * child.prior * sqrt_total / (1.0 + n);
+                    let var_scale = if dynamic_cpuct {
+                        child.variance().sqrt().clamp(VAR_CLAMP_MIN, VAR_CLAMP_MAX)
+                    } else {
+                        1.0
+                    };
+                    let score = q + bias * var_scale * child.prior * sqrt_total / (1.0 + n);
                     let policy = child.prior;
                     if best.map_or(true, |(_, _, s, p)| score > s || (score == s && policy > p)) {
                         best = Some((idx, ci, score, policy));
@@ -349,6 +394,7 @@ impl MCTS {
                 best_move: NUM_POSITIONS,
                 policy: vec![0.0; NUM_POSITIONS],
                 root_value: 0.0,
+                root_nn_prior: vec![0.0; NUM_POSITIONS],
             };
         }
 
@@ -361,7 +407,13 @@ impl MCTS {
         let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]);
         let root_nn_value = root_values[0];
 
-        let policy_probs = Self::softmax_legal(&root_logits[0], &legal_moves);
+        let raw_policy_probs = Self::softmax_legal(&root_logits[0], &legal_moves);
+
+        let policy_probs = Self::apply_root_temperature(
+            &raw_policy_probs,
+            &legal_moves,
+            config.root_policy_temperature,
+        );
 
         // 干净 logit：ln(NN prior)，加 epsilon 防止 prior=0 导致 -inf
         let clean_logits: Vec<f32> = legal_moves
@@ -456,7 +508,7 @@ impl MCTS {
 
                 if sim_i == 0 {
                     sim_board.clone_from(board);
-                    path = self.puct_walk(0, &mut sim_board, &mut legal_buf);
+                    path = self.puct_walk(0, &mut sim_board, &mut legal_buf, config.dynamic_cpuct);
                 } else {
                     candidates.sort_by(|&a, &b| {
                         self.node(a)
@@ -475,7 +527,12 @@ impl MCTS {
                     let move_idx = self.root().children.position_of(&start_ci).unwrap_or(0);
                     sim_board.play_idx(move_idx);
 
-                    let p_from = self.puct_walk(start_ci, &mut sim_board, &mut legal_buf);
+                    let p_from = self.puct_walk(
+                        start_ci,
+                        &mut sim_board,
+                        &mut legal_buf,
+                        config.dynamic_cpuct,
+                    );
                     let mut full = vec![0];
                     full.extend(p_from);
                     path = full;
@@ -606,6 +663,7 @@ impl MCTS {
             best_move,
             policy,
             root_value,
+            root_nn_prior: raw_policy_probs,
         }
     }
 
@@ -636,7 +694,13 @@ impl MCTS {
         if node.visit_count == 0 {
             return f32::NEG_INFINITY;
         }
-        node.policy_logit + (config.sigma_visit_c + max_n) * config.sigma_scale_c * node.q()
+        let var_scale = if config.dynamic_cpuct {
+            node.variance().sqrt().clamp(0.1, 4.0)
+        } else {
+            1.0
+        };
+        node.policy_logit
+            + (config.sigma_visit_c + max_n) * config.sigma_scale_c * var_scale * node.q()
     }
 
     /// Completed Q policy：用**去噪声** logit + Q 项，再做 softmax。
@@ -781,6 +845,33 @@ impl MCTS {
     }
 
     // ── utils ──
+
+    /// Root Policy Softmax Temperature (KataGo):
+    /// Scale root priors via `p^(1/T) / Z` before computing ln(prior).
+    /// T=1.0 returns unchanged. T>1 pushes distribution toward uniform.
+    fn apply_root_temperature(
+        probs: &[f32],
+        legal: &[(usize, usize)],
+        temperature: f32,
+    ) -> Vec<f32> {
+        if temperature == 1.0 {
+            return probs.to_vec();
+        }
+        let mut scaled = vec![0.0f32; NUM_POSITIONS];
+        let mut sum = 0.0;
+        for &(r, c) in legal {
+            let idx = Board::pos_to_idx(r, c);
+            let v = probs[idx].max(MIN_PROB).powf(1.0 / temperature);
+            scaled[idx] = v;
+            sum += v;
+        }
+        if sum > 0.0 {
+            for &(r, c) in legal {
+                scaled[Board::pos_to_idx(r, c)] /= sum;
+            }
+        }
+        scaled
+    }
 
     #[inline]
     fn softmax_legal(logits: &[f32], legal: &[(usize, usize)]) -> Vec<f32> {
