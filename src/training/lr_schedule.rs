@@ -21,8 +21,8 @@ impl LrSchedule {
     pub fn new(num_iterations: usize, warmup_ratio: f32, final_ratio: f32) -> Self {
         let factors: Vec<f64> = (0..num_iterations)
             .map(|it| {
-                let progress = it as f32 / num_iterations.max(1) as f32;
-                if warmup_ratio <= 0.0 || progress >= warmup_ratio {
+                let progress = it as f32 / (num_iterations - 1).max(1) as f32;
+                if warmup_ratio <= 0.0 || (warmup_ratio < 1.0 && progress >= warmup_ratio) {
                     // ── cosine decay 阶段 ──
                     let decay_progress = if warmup_ratio >= 1.0 {
                         1.0
