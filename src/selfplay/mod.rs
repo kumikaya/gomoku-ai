@@ -61,11 +61,14 @@ impl Default for SelfPlayConfig {
 ///
 /// `evaluator` 可以是 `InferenceServer` 或其他 `Evaluator` 实现。
 /// 多局并发时可共享同一个 evaluator，GPU 线程自动跨对局攒批。
-pub fn self_play<E: Evaluator>(evaluator: &E, config: &SelfPlayConfig) -> SelfPlayGame {
+pub fn self_play<E: Evaluator>(
+    evaluator: &E,
+    config: &SelfPlayConfig,
+    rng: &mut impl RngExt,
+) -> SelfPlayGame {
     let mut board = Board::new();
     let mut records = Vec::new();
     let mut mcts = MCTS::new();
-    let mut rng = rand::rng();
 
     loop {
         // ── Playout Cap: 每步均匀随机模拟次数 + target_weight ──
@@ -92,7 +95,7 @@ pub fn self_play<E: Evaluator>(evaluator: &E, config: &SelfPlayConfig) -> SelfPl
         let mut search_config = GumbelConfig::pure_gumbel(sims);
         search_config.select_temperature = config.select_temperature;
 
-        let result = mcts.search(&mut board, evaluator, &search_config);
+        let result = mcts.search(&mut board, evaluator, &search_config, rng);
 
         records.push(PlayRecord {
             state: board.encode_state(),

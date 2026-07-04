@@ -196,7 +196,7 @@ fn main() {
                 ..Default::default()
             };
             let runner = MatchRunner::new(config);
-            let result = runner.run_match(challenger_model, baseline_model, device);
+            let result = runner.run_match(challenger_model, baseline_model, device, 0);
 
             println!();
             result.print();

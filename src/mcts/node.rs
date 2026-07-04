@@ -19,6 +19,7 @@
 use super::table::Table;
 use crate::game::board::{Board, Color, ENCODE_LEN, NUM_POSITIONS};
 use crate::inference::Evaluator;
+use rand::RngExt;
 
 /// 对数计算的最小概率下限，防止 ln(0) = -inf
 const MIN_PROB: f32 = 1e-15;
@@ -339,6 +340,7 @@ impl MCTS {
         board: &mut Board,
         evaluator: &E,
         config: &GumbelConfig,
+        rng: &mut impl RngExt,
     ) -> SearchResult {
         self.reset(board.current_player);
         let legal_moves = board.legal_moves();
@@ -368,7 +370,7 @@ impl MCTS {
             .collect();
 
         // Gumbel 噪声（所有场景下都生成）
-        let gumbel_noises = Self::gumbel_noise(legal_moves.len());
+        let gumbel_noises = Self::gumbel_noise(legal_moves.len(), rng);
 
         // ── Phase 1b: expand root ──
         let child_data: Vec<(f32, f32)> = if config.pure_gumbel_noise {
@@ -381,7 +383,7 @@ impl MCTS {
                 })
                 .collect()
         } else {
-            let dir = Self::dirichlet_noise(legal_moves.len(), config.dirichlet_alpha);
+            let dir = Self::dirichlet_noise(legal_moves.len(), config.dirichlet_alpha, rng);
             legal_moves
                 .iter()
                 .enumerate()
@@ -598,7 +600,7 @@ impl MCTS {
         let (policy, root_value) = self.build_completed_q_policy(root_nn_value, num_sim, config);
 
         // ── Phase 5: 动作选择（softmax over visit counts） ──
-        let best_move = self.select_by_softmax_count(config.select_temperature);
+        let best_move = self.select_by_softmax_count(config.select_temperature, rng);
 
         SearchResult {
             best_move,
@@ -719,7 +721,7 @@ impl MCTS {
     }
 
     /// 动作选择：softmax over visit_counts，temperature 默认 1.0。
-    fn select_by_softmax_count(&self, temperature: f32) -> usize {
+    fn select_by_softmax_count(&self, temperature: f32, rng: &mut impl RngExt) -> usize {
         use rand::distr::{Distribution, weighted::WeightedIndex};
         let children = &self.root().children;
 
@@ -750,7 +752,7 @@ impl MCTS {
         let total: f64 = probs.iter().sum();
         if total > 0.0 {
             let dist = WeightedIndex::new(&probs).unwrap();
-            dist.sample(&mut rand::rng())
+            dist.sample(rng)
         } else {
             let (policy, _) = self.build_completed_q_policy(0.0, 1, &GumbelConfig::default());
             policy
@@ -807,11 +809,10 @@ impl MCTS {
         probs
     }
 
-    fn dirichlet_noise(n: usize, alpha: f32) -> Vec<f32> {
+    fn dirichlet_noise(n: usize, alpha: f32, rng: &mut impl RngExt) -> Vec<f32> {
         use rand::distr::Distribution;
         let gamma = rand_distr::Gamma::new(alpha, 1.0).unwrap();
-        let mut rng = rand::rng();
-        let mut v: Vec<f32> = (0..n).map(|_| gamma.sample(&mut rng)).collect();
+        let mut v: Vec<f32> = (0..n).map(|_| gamma.sample(rng)).collect();
         let s: f32 = v.iter().sum();
         for x in &mut v {
             *x /= s;
@@ -819,12 +820,11 @@ impl MCTS {
         v
     }
 
-    fn gumbel_noise(n: usize) -> Vec<f32> {
+    fn gumbel_noise(n: usize, rng: &mut impl RngExt) -> Vec<f32> {
         use rand::distr::Distribution;
         let gumbel = rand_distr::Gumbel::new(0.0, 1.0).unwrap();
-        let mut rng = rand::rng();
         (0..n)
-            .map(|_| (gumbel.sample(&mut rng) as f32).clamp(-40.0_f32, 40.0_f32))
+            .map(|_| (gumbel.sample(rng) as f32).clamp(-40.0_f32, 40.0_f32))
             .collect()
     }
 }

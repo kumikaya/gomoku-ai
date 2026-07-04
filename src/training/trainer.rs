@@ -22,6 +22,8 @@ use burn::{
     tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
 };
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 use std::path::PathBuf;
 
@@ -64,6 +66,8 @@ pub struct TrainConfig {
     pub eval_promotion_threshold: f64,
     /// 每隔多少轮评估一次
     pub eval_every: usize,
+    /// 随机种子（固定可复现实验结果）
+    pub random_seed: u64,
 }
 
 impl Default for TrainConfig {
@@ -85,12 +89,13 @@ impl Default for TrainConfig {
             playout_cap_min_ratio: 0.25,
             lr_warmup_ratio: 0.05,
             lr_final_ratio: 0.1,
-            buffer_recent_bonus: 0.5,
+            buffer_recent_bonus: 0.0,
             eval_enabled: true,
             eval_num_games: 100,
             eval_num_simulations: 64,
             eval_promotion_threshold: 0.55,
             eval_every: 5,
+            random_seed: 42,
         }
     }
 }
@@ -184,6 +189,9 @@ impl Trainer {
             baseline_mgr.promote(&model);
         }
 
+        let mut master_rng = StdRng::seed_from_u64(self.config.random_seed);
+        println!("  Random seed: {}", self.config.random_seed);
+
         let lr_sched = LrSchedule::new(
             self.config.num_iterations,
             self.config.lr_warmup_ratio,
@@ -203,7 +211,7 @@ impl Trainer {
 
             let lr = lr_sched.lr(iteration, self.config.learning_rate);
 
-            self.run_self_play(&inference_server, iteration);
+            self.run_self_play(&inference_server, iteration, &mut master_rng);
 
             let buffer_size = self.buffer.len();
             println!(
@@ -218,7 +226,7 @@ impl Trainer {
                 continue;
             }
 
-            self.run_training_batches(&mut model, &mut optim, &train_device, lr);
+            self.run_training_batches(&mut model, &mut optim, &train_device, lr, &mut master_rng);
 
             inference_server.update_model(model.clone().valid());
 
@@ -230,8 +238,12 @@ impl Trainer {
                     if let Some(baseline) = baseline_mgr.load_baseline(&self.device) {
                         println!();
                         println!("  === Tournament Evaluation (iter {}) ===", epoch);
-                        let result =
-                            runner.run_match(model.clone().valid(), baseline, self.device.clone());
+                        let result = runner.run_match(
+                            model.clone().valid(),
+                            baseline,
+                            self.device.clone(),
+                            master_rng.random::<u64>(),
+                        );
                         result.print();
 
                         let wr = result.win_rate_current();
@@ -286,7 +298,12 @@ impl Trainer {
         }
     }
 
-    fn run_self_play(&mut self, inference_server: &InferenceServer, iteration: usize) {
+    fn run_self_play<R: RngExt>(
+        &mut self,
+        inference_server: &InferenceServer,
+        iteration: usize,
+        master_rng: &mut R,
+    ) {
         let total = self.config.games_per_iteration;
 
         let temp = Self::decayed_temperature(iteration, self.config.num_iterations);
@@ -316,10 +333,14 @@ impl Trainer {
             playout_cap_min_ratio: self.config.playout_cap_min_ratio,
         };
 
+        let base_seed = master_rng.random::<u64>();
+
         let all_records: Vec<PlayRecord> = (0..total)
             .into_par_iter()
-            .flat_map(|_| {
-                let game = self_play(inference_server, &sp_config);
+            .flat_map(|game_i| {
+                let seed = base_seed.wrapping_add(game_i as u64);
+                let mut game_rng = StdRng::seed_from_u64(seed);
+                let game = self_play(inference_server, &sp_config, &mut game_rng);
                 pb.inc(1);
                 game.records
             })
@@ -333,16 +354,16 @@ impl Trainer {
 
     // ── 训练阶段 ──
 
-    fn run_training_batches(
+    fn run_training_batches<R: RngExt>(
         &mut self,
         model: &mut GomokuNetwork,
         optim: &mut ModuleOptimizer,
         train_device: &Device,
         lr: f64,
+        rng: &mut R,
     ) -> (f32, usize) {
         let mut total_loss = 0.0_f32;
         let mut total_steps: usize = 0;
-        let mut rng = rand::rng();
         let identity_prob = 1.0 / D4Symmetry::COUNT as f32;
 
         let num_batches = self.config.mini_batches_per_iteration;
@@ -361,9 +382,7 @@ impl Trainer {
         for _ in 0..num_batches {
             // 每次 mini-batch 独立从 buffer 采样 batch_size 个样本
             let batch_size = self.config.batch_size.min(self.buffer.len());
-            let all_indices = self
-                .buffer
-                .sample(&mut rng, self.config.buffer_recent_bonus);
+            let all_indices = self.buffer.sample(rng, self.config.buffer_recent_bonus);
             let chunk = &all_indices[..batch_size];
 
             // 透传 target_weight 用于策略损失加权
@@ -376,7 +395,7 @@ impl Trainer {
                     let (state, policy) = D4Symmetry::random_augment(
                         &record.state,
                         &record.policy,
-                        &mut rng,
+                        rng,
                         identity_prob,
                     );
                     PlayRecord {

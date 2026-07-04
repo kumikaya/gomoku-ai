@@ -13,6 +13,7 @@ use crate::network::transformer::GomokuNetwork;
 use burn::module::{AutodiffModule, Module};
 use burn::tensor::Device;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::SeedableRng;
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -167,6 +168,7 @@ impl MatchRunner {
         current: GomokuNetwork,
         baseline: GomokuNetwork,
         device: Device,
+        rng_seed: u64,
     ) -> MatchResult {
         let num_games = self.config.num_games;
         let half = num_games / 2;
@@ -185,11 +187,13 @@ impl MatchRunner {
         // 前半：当前模型执黑（先手），基线执白
         let outcomes_current_black: Vec<GameOutcome> = (0..half)
             .into_par_iter()
-            .map(|_| {
+            .map(|game_i| {
+                let seed = rng_seed.wrapping_add(game_i as u64);
                 let result = play_eval_game(
                     server_current.as_ref(),
                     server_baseline.as_ref(),
                     self.config.num_simulations,
+                    seed,
                 );
                 pb.inc(1);
                 result
@@ -199,11 +203,13 @@ impl MatchRunner {
         // 后半：基线执黑，当前模型执白
         let outcomes_current_white: Vec<GameOutcome> = (0..num_games - half)
             .into_par_iter()
-            .map(|_| {
+            .map(|game_i| {
+                let seed = rng_seed.wrapping_add((half + game_i) as u64);
                 let result = play_eval_game(
                     server_baseline.as_ref(),
                     server_current.as_ref(),
                     self.config.num_simulations,
+                    seed,
                 );
                 pb.inc(1);
                 result
@@ -264,6 +270,7 @@ fn play_eval_game(
     black_server: &InferenceServer,
     white_server: &InferenceServer,
     num_simulations: usize,
+    seed: u64,
 ) -> GameOutcome {
     let mut board = Board::new();
     let mut black_mcts = MCTS::new();
@@ -271,6 +278,9 @@ fn play_eval_game(
 
     let mut config = GumbelConfig::pure_gumbel(num_simulations);
     config.select_temperature = 0.1;
+
+    // 为每局生成独立的确定性 RNG
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
     let max_moves = NUM_POSITIONS * 2;
 
@@ -284,7 +294,7 @@ fn play_eval_game(
             &mut white_mcts
         };
 
-        let result = mcts.search(&mut board, eval, &config);
+        let result = mcts.search(&mut board, eval, &config, &mut rng);
 
         if result.best_move >= NUM_POSITIONS || !board.play_idx(result.best_move) {
             break;
