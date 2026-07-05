@@ -153,10 +153,14 @@ impl Node {
         self.visit_count as f32
     }
 
+    /// 父节点视角的平均 Q 值（PUCT / completedQ / 所有外部读取的正确视角）。
+    ///
+    /// 由于 `total_value` 按节点自身视角存储，而外部读取者总是父节点，
+    /// 因此返回 `-q_self()` 以自然翻转为父节点视角。
     #[inline]
     pub fn q(&self) -> f32 {
         if self.visit_count > 0 {
-            self.total_value / self.visit_count as f32
+            -self.total_value / self.visit_count as f32
         } else {
             0.0
         }
@@ -353,8 +357,9 @@ impl MCTS {
                 if let Some(ci) = children[idx] {
                     let child = self.node(ci);
                     let n = child.effective_visits() as f32;
+                    // q() 已返回父节点视角，fpu_q 也是父节点视角，直接使用
                     let q = if child.visit_count > 0 {
-                        child.total_value / child.visit_count as f32
+                        child.q()
                     } else {
                         fpu_q
                     };
@@ -610,8 +615,10 @@ impl MCTS {
                 }
 
                 if ctx.game_over {
+                    // 叶子节点是输家（winner 刚赢了，轮到输家的回合）
+                    // 从输家视角 value = -WIN_VALUE
                     let v = match ctx.winner {
-                        Some(_) => WIN_VALUE,
+                        Some(_) => -WIN_VALUE,
                         None => DRAW_VALUE,
                     };
                     self.backprop_path(&ctx.path, v);
@@ -637,7 +644,8 @@ impl MCTS {
                         &child_data_leaf,
                     );
                     self.node_mut(leaf_idx).expanded = true;
-                    self.backprop_path(&ctx.path, -values_batch[batch_result_idx]);
+                    // values_batch 已经是叶子玩家视角（encode_into 使用 leaf player 视角编码）
+                    self.backprop_path(&ctx.path, values_batch[batch_result_idx]);
                     batch_result_idx += 1;
                 }
                 // else: 已展开节点，无操作
