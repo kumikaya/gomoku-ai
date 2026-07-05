@@ -5,8 +5,9 @@ use ndarray::Array2;
 use crate::mcts::game::{ActionId, Game};
 
 /// 玩家颜色
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Color {
+    #[default]
     Black = 0,
     White = 1,
 }

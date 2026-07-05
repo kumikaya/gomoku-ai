@@ -97,6 +97,7 @@ mod tests {
             policy: vec![0.0f32; npos],
             value,
             sample_weight: weight,
+            ..Default::default()
         }
     }
 

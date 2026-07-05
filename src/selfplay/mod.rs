@@ -21,6 +21,9 @@ pub struct PlayRecord {
     /// 训练样本权重 (Policy Surprise = KL(nn_prior || mcts_posterior)).
     /// 仅完整搜索产生样本，权重即 KL 值。写入时按权重复制多份 (KataGo frequency weighting).
     pub sample_weight: f32,
+    /// 走这步棋的玩家（仅用于自对弈结束后用游戏结果修正 value，不参与训练）。
+    #[doc(hidden)]
+    pub player: Color,
 }
 
 pub struct SelfPlayGame {
@@ -85,8 +88,10 @@ pub fn self_play<E: Evaluator>(
             records.push(PlayRecord {
                 state: board.encode_state(),
                 policy: result.policy,
-                value: result.root_value,
+                // 先写入 MCTS root value 作为占位，游戏结束后用最终结果修正
+                value: 0.0,
                 sample_weight: kl,
+                player: board.current_player,
             });
         }
 
@@ -95,6 +100,16 @@ pub fn self_play<E: Evaluator>(
         if board.game_over {
             break;
         }
+    }
+
+    // ── 对齐 minizero：用游戏最终结果修正 value 标签 ──
+    // 从当前玩家视角：赢=+1.0, 输=-1.0, 平=0.0
+    for record in &mut records {
+        record.value = match board.winner {
+            Some(w) if w == record.player => 1.0,
+            Some(_) => -1.0,
+            None => 0.0,
+        };
     }
 
     SelfPlayGame {
