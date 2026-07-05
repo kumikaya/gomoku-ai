@@ -44,7 +44,7 @@ struct GameState {
     board: Board,
     cursor_row: usize,
     cursor_col: usize,
-    mcts: MCTS,
+    mcts: MCTS<Board>,
     message: String,
     player_color: Color,
     game_over: bool,

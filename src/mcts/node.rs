@@ -5,7 +5,13 @@
 //! - Sequential Halving 用带噪声 logit + normalized Q 做候选排序
 //! - Completed Q policy 用干净 logit（`logit_without_noise = logit - noise`）
 //! - 动作选择用 softmax over visit counts（temperature=1.0, value_threshold=0.1）
-//! - path = Vec<usize>（纯节点索引序列，root 在 path[0]，对齐 minizero）
+//! - path = Vec<NodeId>（纯节点索引序列，root 在 path[0]，对齐 minizero）
+//!
+//! ## 游戏解耦
+//!
+//! MCTS 通过 `Game` trait 与具体棋盘解耦。所有游戏操作（合法动作、落子、
+//! 编码、终局检测）均通过 trait 调用。动作统一为 `ActionId`（平铺索引），
+//! 消除了行列坐标和各种 `pos_to_idx` 转换。
 //!
 //! ## 噪声模式
 //!
@@ -16,8 +22,8 @@
 //!   prior = (1-ε)*NN + ε*Dirichlet，`policy_logit = ln(NN_prior) + gumbel_noise`。
 //!   PUCT walk 用 noisy prior。
 
+use super::game::{ActionId, Game};
 use super::table::Table;
-use crate::game::board::{Board, Color, ENCODE_LEN, NUM_POSITIONS};
 use crate::inference::Evaluator;
 use rand::RngExt;
 
@@ -33,10 +39,8 @@ const PUCT_INIT: f32 = 1.25;
 /// PUCT 基项（对齐 minizero `actor_mcts_puct_base`）
 const PUCT_BASE: f32 = 19652.0;
 
-/// 获胜模拟的价值
-const WIN_VALUE: f32 = 1.0;
-/// 平局模拟的价值
-const DRAW_VALUE: f32 = 0.0;
+/// MCTS 树节点索引。
+pub type NodeId = usize;
 
 // ============================================================
 //  GumbelConfig
@@ -51,15 +55,13 @@ pub struct GumbelConfig {
     pub sigma_visit_c: f32,
     pub sigma_scale_c: f32,
     pub pure_gumbel_noise: bool,
-    /// 动作选择 softmax 温度（minizero 默认 1.0）
+    /// 最终动作选择的 softmax 温度（默认 1.0）
     pub select_temperature: f32,
-    /// 根节点策略先验 softmax 温度（>1 抑制过早收敛，对齐 KataGo）
-    /// 仅在根节点参与 `ln(prior)` 之前对 NN 先验做 `probs^(1/T) / Z` 缩放。
+    /// 根节点先验策略的 softmax 温度 (KataGo rootPolicyTemperature)
     pub root_policy_temperature: f32,
-    /// 是否启用 Dynamic Variance-Scaled cPUCT
+    /// 是否启用 Dynamic Variance-Scaled cPUCT (KataGo)
     pub dynamic_cpuct: bool,
-    /// FPU Reduction (KataGo): 未访问子节点的初始 Q 值向负值偏移。
-    /// 0.0 = 无修正，0.2 = KataGo 推荐值。
+    /// FPU Reduction 强度 (KataGo)
     pub fpu_reduction: f32,
     pub dirichlet_alpha: f32,
     pub dirichlet_epsilon: f32,
@@ -70,16 +72,16 @@ impl Default for GumbelConfig {
         Self {
             num_simulations: 32,
             sample_size: 16,
+            think_batch_size: 8,
             sigma_visit_c: 50.0,
-            sigma_scale_c: 1.0,
+            sigma_scale_c: 3.0,
             pure_gumbel_noise: true,
             select_temperature: 1.0,
             root_policy_temperature: 1.0,
-            dynamic_cpuct: true,
-            fpu_reduction: 0.2,
-            dirichlet_alpha: 0.1,
-            dirichlet_epsilon: 0.25,
-            think_batch_size: 8,
+            dynamic_cpuct: false,
+            fpu_reduction: 0.15,
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.03,
         }
     }
 }
@@ -92,6 +94,7 @@ impl GumbelConfig {
             ..Default::default()
         }
     }
+
     pub fn mixed(num_simulations: usize) -> Self {
         Self {
             num_simulations,
@@ -106,7 +109,7 @@ impl GumbelConfig {
 // ============================================================
 
 #[derive(Clone)]
-pub struct Node {
+pub struct Node<G: Game> {
     pub visit_count: u32,
     pub total_value: f32,
     /// Σ(value²)：用于计算节点效用方差（Dynamic Variance-Scaled cPUCT）
@@ -118,16 +121,22 @@ pub struct Node {
     pub policy_logit: f32,
     /// Gumbel 噪声值（用于 recovered clean logit = policy_logit - gumbel_noise）
     pub gumbel_noise: f32,
-    pub children: Table<usize>,
+    pub children: Table<NodeId>,
     pub expanded: bool,
     /// 该节点对应哪个玩家的回合
-    pub player: Color,
+    pub player: G::Player,
     /// Virtual loss：攒批 evaluate 期间让 PUCT walk 发散
     pub virtual_loss: u32,
 }
 
-impl Node {
-    pub fn new(prior: f32, gumbel_logit: f32, gumbel_noise: f32, player: Color) -> Self {
+impl<G: Game> Node<G> {
+    pub fn new(
+        prior: f32,
+        gumbel_logit: f32,
+        gumbel_noise: f32,
+        player: G::Player,
+        action_shape: usize,
+    ) -> Self {
         Self {
             visit_count: 0,
             total_value: 0.0,
@@ -135,7 +144,7 @@ impl Node {
             prior,
             policy_logit: gumbel_logit + gumbel_noise,
             gumbel_noise,
-            children: Table::new(NUM_POSITIONS),
+            children: Table::new(action_shape),
             expanded: false,
             player,
             virtual_loss: 0,
@@ -158,9 +167,13 @@ impl Node {
     /// 由于 `total_value` 按节点自身视角存储，而外部读取者总是父节点，
     /// 因此返回 `-q_self()` 以自然翻转为父节点视角。
     #[inline]
+    /// 父节点视角的平均 Q 值。
+    ///
+    /// 通过 `Game::flip_perspective` 将自身视角值翻转为父节点视角：
+    /// 零和对弈取反，单智能体可保持原值。
     pub fn q(&self) -> f32 {
         if self.visit_count > 0 {
-            -self.total_value / self.visit_count as f32
+            G::flip_perspective(self.total_value / self.visit_count as f32)
         } else {
             0.0
         }
@@ -203,51 +216,54 @@ impl Node {
 //  MCTS
 // ============================================================
 
-pub struct MCTS {
-    pub arena: Vec<Node>,
+pub struct MCTS<G: Game> {
+    pub arena: Vec<Node<G>>,
 }
 
+/// 单次搜索返回结果
 pub struct SearchResult {
-    pub best_move: usize,
+    /// 选中的最佳动作（平铺索引），若为 action_shape 表示无合法动作
+    pub best_move: ActionId,
+    /// Completed Q 策略（长度为 action_shape）
     pub policy: Vec<f32>,
+    /// MCTS 根节点价值（含 Q 和 NN 混合）
     pub root_value: f32,
-    /// 根节点 NN 干净先验（不含 noise/temperature），用于 Policy Surprise Weighting
+    /// NN 原始先验概率
     pub root_nn_prior: Vec<f32>,
 }
 
-impl MCTS {
+impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
-        Self {
-            arena: vec![Node::new(0.0, 0.0, 0.0, Color::Black)],
-        }
+        Self { arena: Vec::new() }
     }
 
     #[inline]
-    pub fn root(&self) -> &Node {
+    pub fn root(&self) -> &Node<G> {
         &self.arena[0]
     }
 
     #[inline]
-    pub fn root_mut(&mut self) -> &mut Node {
+    pub fn root_mut(&mut self) -> &mut Node<G> {
         &mut self.arena[0]
     }
 
     #[inline]
-    pub fn node(&self, idx: usize) -> &Node {
+    pub fn node(&self, idx: NodeId) -> &Node<G> {
         &self.arena[idx]
     }
 
     #[inline]
-    fn node_mut(&mut self, idx: usize) -> &mut Node {
+    fn node_mut(&mut self, idx: NodeId) -> &mut Node<G> {
         &mut self.arena[idx]
     }
 
-    fn reset(&mut self, player: Color) {
+    fn reset(&mut self, player: G::Player, action_shape: usize) {
         self.arena.clear();
-        self.arena.push(Node::new(0.0, 0.0, 0.0, player));
+        self.arena
+            .push(Node::new(0.0, 0.0, 0.0, player, action_shape));
     }
 
-    fn push_node(&mut self, node: Node) -> usize {
+    fn push_node(&mut self, node: Node<G>) -> NodeId {
         self.arena.push(node);
         self.arena.len() - 1
     }
@@ -256,13 +272,13 @@ impl MCTS {
 
     fn expand_children(
         &mut self,
-        parent: usize,
-        legal: &[(usize, usize)],
+        parent: NodeId,
+        legal: &[ActionId],
         gumbel_noises: &[f32],
-        // (NN_prior, clean_logit) per child
         child_data: &[(f32, f32)],
+        action_shape: usize,
     ) {
-        let child_player = self.node(parent).player.opponent();
+        let child_player = G::next_player(self.node(parent).player);
         let mut child_ids = Vec::with_capacity(legal.len());
         for i in 0..legal.len() {
             let (prior, clean_logit) = child_data[i];
@@ -271,12 +287,12 @@ impl MCTS {
                 clean_logit,
                 gumbel_noises[i],
                 child_player,
+                action_shape,
             )));
         }
         let parent_node = self.node_mut(parent);
-        for (i, &(r, c)) in legal.iter().enumerate() {
-            let idx = Board::pos_to_idx(r, c);
-            parent_node.children.set(idx, child_ids[i]);
+        for (i, &action) in legal.iter().enumerate() {
+            parent_node.children.set(action, child_ids[i]);
         }
     }
 
@@ -293,7 +309,7 @@ impl MCTS {
     /// 计算当前节点对未访问子节点的初始 Q 估计。
     /// 对齐 minizero `calculateInitQValue`（board games 分支）：
     ///   `init_q = (sum_q - 1) / (visited_count + 1)`
-    fn init_q_value(&self, node_idx: usize) -> f32 {
+    fn init_q_value(&self, node_idx: NodeId) -> f32 {
         let node = self.node(node_idx);
         let mut sum_q = 0.0f32;
         let mut visited = 0.0f32;
@@ -320,24 +336,24 @@ impl MCTS {
     /// 使效用波动大的局面多探索（对齐 KataGo Dynamic Variance-Scaled cPUCT）。
     fn puct_walk(
         &self,
-        start_node_idx: usize,
-        board: &mut Board,
-        legal: &mut Vec<(usize, usize)>,
+        start_node_idx: NodeId,
+        game: &mut G,
+        legal: &mut Vec<ActionId>,
         dynamic_cpuct: bool,
         fpu_reduction: f32,
-    ) -> Vec<usize> {
+    ) -> Vec<NodeId> {
         // 方差缩放钳位：防止极端方差导致探索失控
         const VAR_CLAMP_MIN: f32 = 0.1;
         const VAR_CLAMP_MAX: f32 = 4.0;
 
-        let mut path: Vec<usize> = vec![start_node_idx];
+        let mut path: Vec<NodeId> = vec![start_node_idx];
         let mut node_idx = start_node_idx;
 
         loop {
-            if board.game_over || !self.node(node_idx).expanded {
+            if game.is_terminal() || !self.node(node_idx).expanded {
                 return path;
             }
-            board.fill_legal_moves(legal);
+            *legal = game.legal_actions();
             if legal.is_empty() {
                 return path;
             }
@@ -351,10 +367,9 @@ impl MCTS {
             let fpu_q = init_q - fpu_reduction;
 
             let children = &node.children;
-            let mut best: Option<(usize, usize, f32, f32)> = None;
-            for &(r, c) in legal.iter() {
-                let idx = Board::pos_to_idx(r, c);
-                if let Some(ci) = children[idx] {
+            let mut best: Option<(ActionId, NodeId, f32, f32)> = None;
+            for &action in legal.iter() {
+                if let Some(ci) = children[action] {
                     let child = self.node(ci);
                     let n = child.effective_visits() as f32;
                     // q() 已返回父节点视角，fpu_q 也是父节点视角，直接使用
@@ -371,21 +386,18 @@ impl MCTS {
                     let score = q + bias * var_scale * child.prior * sqrt_total / (1.0 + n);
                     let policy = child.prior;
                     if best.map_or(true, |(_, _, s, p)| score > s || (score == s && policy > p)) {
-                        best = Some((idx, ci, score, policy));
+                        best = Some((action, ci, score, policy));
                     }
                 }
             }
 
             let (move_idx, child_idx) = match best {
                 Some((mi, ci, _, _)) => (mi, ci),
-                None => {
-                    let idx = Board::pos_to_idx(legal[0].0, legal[0].1);
-                    (idx, children[idx].unwrap())
-                }
+                None => (legal[0], children[legal[0]].unwrap()),
             };
 
             path.push(child_idx);
-            board.play_idx(move_idx);
+            game.play(move_idx);
             node_idx = child_idx;
         }
     }
@@ -394,19 +406,21 @@ impl MCTS {
 
     pub fn search<E: Evaluator>(
         &mut self,
-        board: &mut Board,
+        game: &mut G,
         evaluator: &E,
         config: &GumbelConfig,
         rng: &mut impl RngExt,
     ) -> SearchResult {
-        self.reset(board.current_player);
-        let legal_moves = board.legal_moves();
+        let action_shape = game.action_shape();
+        self.reset(game.current_player(), action_shape);
+
+        let legal_moves = game.legal_actions();
         if legal_moves.is_empty() {
             return SearchResult {
-                best_move: NUM_POSITIONS,
-                policy: vec![0.0; NUM_POSITIONS],
+                best_move: action_shape,
+                policy: vec![0.0; action_shape],
                 root_value: 0.0,
-                root_nn_prior: vec![0.0; NUM_POSITIONS],
+                root_nn_prior: vec![0.0; action_shape],
             };
         }
 
@@ -414,8 +428,7 @@ impl MCTS {
         let sample_n = config.sample_size;
 
         // ── Phase 1: 根节点 NN 评估 ──
-        let mut root_encoding = vec![0i32; ENCODE_LEN];
-        board.encode_into(&mut root_encoding);
+        let root_encoding = game.encode();
         let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]);
         let root_nn_value = root_values[0];
 
@@ -430,7 +443,7 @@ impl MCTS {
         // 干净 logit：ln(NN prior)，加 epsilon 防止 prior=0 导致 -inf
         let clean_logits: Vec<f32> = legal_moves
             .iter()
-            .map(|&(r, c)| policy_probs[Board::pos_to_idx(r, c)].max(MIN_PROB).ln())
+            .map(|&action| policy_probs[action].max(MIN_PROB).ln())
             .collect();
 
         // Gumbel 噪声（所有场景下都生成）
@@ -441,34 +454,29 @@ impl MCTS {
             legal_moves
                 .iter()
                 .enumerate()
-                .map(|(i, &(r, c))| {
-                    let idx = Board::pos_to_idx(r, c);
-                    (policy_probs[idx], clean_logits[i])
-                })
+                .map(|(i, &action)| (policy_probs[action], clean_logits[i]))
                 .collect()
         } else {
             let dir = Self::dirichlet_noise(legal_moves.len(), config.dirichlet_alpha, rng);
             legal_moves
                 .iter()
                 .enumerate()
-                .map(|(i, &(r, c))| {
-                    let idx = Board::pos_to_idx(r, c);
-                    let prior = (1.0 - config.dirichlet_epsilon) * policy_probs[idx]
+                .map(|(i, &action)| {
+                    let prior = (1.0 - config.dirichlet_epsilon) * policy_probs[action]
                         + config.dirichlet_epsilon * dir[i];
                     (prior, clean_logits[i])
                 })
                 .collect()
         };
 
-        self.expand_children(0, &legal_moves, &gumbel_noises, &child_data);
+        self.expand_children(0, &legal_moves, &gumbel_noises, &child_data, action_shape);
         self.root_mut().expanded = true;
 
         // ── Phase 2: 候选集（按带噪声的 policy_logit 排序取 top-k） ──
         let children = &self.root().children;
-        let mut candidates: Vec<usize> = Vec::with_capacity(legal_moves.len());
-        for &(r, c) in &legal_moves {
-            let idx = Board::pos_to_idx(r, c);
-            if let Some(ci) = children[idx] {
+        let mut candidates: Vec<NodeId> = Vec::with_capacity(legal_moves.len());
+        for &action in &legal_moves {
+            if let Some(ci) = children[action] {
                 candidates.push(ci);
             }
         }
@@ -491,8 +499,8 @@ impl MCTS {
         let mut cur_sample = sample_n;
         let mut sim_budget = Self::gumbel_budget(num_sim, cur_sample);
 
-        let mut sim_board = board.clone();
-        let mut legal_buf = Vec::with_capacity(NUM_POSITIONS);
+        let mut sim_game = game.clone();
+        let mut legal_buf = Vec::with_capacity(action_shape);
         let mut sim_i = 0;
 
         loop {
@@ -505,24 +513,25 @@ impl MCTS {
 
             // 暂存本轮每个 walk 的上下文
             struct EvalCtx {
-                path: Vec<usize>,
+                path: Vec<NodeId>,
                 encoding: Vec<i32>,
-                legal: Vec<(usize, usize)>,
+                legal: Vec<ActionId>,
                 game_over: bool,
-                winner: Option<Color>,
+                /// game_over 时固化当前玩家的 terminal_value，消费阶段直接使用
+                terminal_value: f32,
             }
             let mut contexts: Vec<EvalCtx> = Vec::with_capacity(round);
             let mut encodings: Vec<Vec<i32>> = Vec::with_capacity(round);
 
             for _ in 0..round {
                 // ── selection ──
-                let path: Vec<usize>;
+                let path: Vec<NodeId>;
 
                 if sim_i == 0 {
-                    sim_board.clone_from(board);
+                    sim_game.clone_from(game);
                     path = self.puct_walk(
                         0,
-                        &mut sim_board,
+                        &mut sim_game,
                         &mut legal_buf,
                         config.dynamic_cpuct,
                         config.fpu_reduction,
@@ -541,13 +550,13 @@ impl MCTS {
                     });
                     let start_ci = candidates[0];
 
-                    sim_board.clone_from(board);
+                    sim_game.clone_from(game);
                     let move_idx = self.root().children.position_of(&start_ci).unwrap_or(0);
-                    sim_board.play_idx(move_idx);
+                    sim_game.play(move_idx);
 
                     let p_from = self.puct_walk(
                         start_ci,
-                        &mut sim_board,
+                        &mut sim_game,
                         &mut legal_buf,
                         config.dynamic_cpuct,
                         config.fpu_reduction,
@@ -564,26 +573,24 @@ impl MCTS {
 
                 let leaf_idx = *path.last().unwrap();
 
-                if sim_board.game_over {
+                if sim_game.is_terminal() {
                     contexts.push(EvalCtx {
                         path,
                         encoding: Vec::new(),
                         legal: Vec::new(),
                         game_over: true,
-                        winner: sim_board.winner,
+                        terminal_value: sim_game.terminal_value(),
                     });
                 } else if !self.node(leaf_idx).expanded {
-                    let mut encoding = vec![0i32; ENCODE_LEN];
-                    sim_board.encode_into(&mut encoding);
-                    sim_board.fill_legal_moves(&mut legal_buf);
-                    let legal_leaf = std::mem::take(&mut legal_buf);
+                    let encoding = sim_game.encode();
+                    let legal_leaf = sim_game.legal_actions();
                     encodings.push(encoding.clone());
                     contexts.push(EvalCtx {
                         path,
                         encoding,
                         legal: legal_leaf,
                         game_over: false,
-                        winner: None,
+                        terminal_value: 0.0,
                     });
                 } else {
                     // 已展开的节点（理论上不应该到这里，但保留处理）
@@ -592,7 +599,7 @@ impl MCTS {
                         encoding: Vec::new(),
                         legal: Vec::new(),
                         game_over: false,
-                        winner: None,
+                        terminal_value: 0.0,
                     });
                 }
 
@@ -615,13 +622,7 @@ impl MCTS {
                 }
 
                 if ctx.game_over {
-                    // 叶子节点是输家（winner 刚赢了，轮到输家的回合）
-                    // 从输家视角 value = -WIN_VALUE
-                    let v = match ctx.winner {
-                        Some(_) => -WIN_VALUE,
-                        None => DRAW_VALUE,
-                    };
-                    self.backprop_path(&ctx.path, v);
+                    self.backprop_path(&ctx.path, ctx.terminal_value);
                 } else if !ctx.encoding.is_empty() {
                     let (policies_batch, values_batch) = eval_result.as_ref().unwrap();
                     let probs = Self::softmax_legal(&policies_batch[batch_result_idx], &ctx.legal);
@@ -631,9 +632,8 @@ impl MCTS {
                     let child_data_leaf: Vec<(f32, f32)> = ctx
                         .legal
                         .iter()
-                        .map(|&(r, c)| {
-                            let idx = Board::pos_to_idx(r, c);
-                            let p = probs[idx];
+                        .map(|&action| {
+                            let p = probs[action];
                             (p, p.max(MIN_PROB).ln())
                         })
                         .collect();
@@ -642,9 +642,10 @@ impl MCTS {
                         &ctx.legal,
                         &gumbel_noises_leaf,
                         &child_data_leaf,
+                        action_shape,
                     );
                     self.node_mut(leaf_idx).expanded = true;
-                    // values_batch 已经是叶子玩家视角（encode_into 使用 leaf player 视角编码）
+                    // values_batch 已经是叶子玩家视角（encode 使用 leaf player 视角编码）
                     self.backprop_path(&ctx.path, values_batch[batch_result_idx]);
                     batch_result_idx += 1;
                 }
@@ -703,7 +704,7 @@ impl MCTS {
         (num_sim as f32 / d).floor() as u32
     }
 
-    fn max_root_count(mcts: &MCTS) -> f32 {
+    fn max_root_count(mcts: &MCTS<G>) -> f32 {
         mcts.root()
             .children
             .values()
@@ -712,7 +713,7 @@ impl MCTS {
     }
 
     /// σ-score：带噪声 logit + Q 项。
-    fn sigma_score(node: &Node, max_n: f32, config: &GumbelConfig) -> f32 {
+    fn sigma_score(node: &Node<G>, max_n: f32, config: &GumbelConfig) -> f32 {
         if node.visit_count == 0 {
             return f32::NEG_INFINITY;
         }
@@ -754,7 +755,7 @@ impl MCTS {
         let sv = config.sigma_visit_c;
         let sc = config.sigma_scale_c;
 
-        let mut scores: Vec<(usize, f32)> = Vec::with_capacity(NUM_POSITIONS);
+        let mut scores: Vec<(ActionId, f32)> = Vec::new();
         let mut max_score = f32::NEG_INFINITY;
         for (idx, ci) in children.occupied() {
             let child = self.node(*ci);
@@ -770,7 +771,7 @@ impl MCTS {
             }
         }
 
-        let mut policy = vec![0.0f32; NUM_POSITIONS];
+        let mut policy = vec![0.0f32; children.len()];
         let mut sum = 0.0f32;
         for &(idx, score) in &scores {
             let exp = (score - max_score).exp();
@@ -807,7 +808,7 @@ impl MCTS {
     }
 
     /// 动作选择：softmax over visit_counts，temperature 默认 1.0。
-    fn select_by_softmax_count(&self, temperature: f32, rng: &mut impl RngExt) -> usize {
+    fn select_by_softmax_count(&self, temperature: f32, rng: &mut impl RngExt) -> ActionId {
         use rand::distr::{Distribution, weighted::WeightedIndex};
         let children = &self.root().children;
 
@@ -851,18 +852,13 @@ impl MCTS {
     }
 
     /// 反向传播 value 到路径上所有节点（含 root）。
-    /// 对齐 minizero `backup`：node_path 包含 root，依次 flip value。
-    fn backprop_path(&mut self, path: &[usize], value: f32) {
-        // 叶子节点是 path 最后一个
-        let leaf_player = self.node(*path.last().unwrap()).player;
+    ///
+    /// `value` 是叶子节点视角的回报值。每向上一层，通过
+    /// `Game::flip_perspective` 翻转为上一节点的视角，消除零和对弈的硬编码假设。
+    fn backprop_path(&mut self, path: &[NodeId], mut value: f32) {
         for &node_idx in path.iter().rev() {
-            let node_player = self.node(node_idx).player;
-            let v = if node_player == leaf_player {
-                value
-            } else {
-                -value
-            };
-            self.node_mut(node_idx).add_visit(v);
+            self.node_mut(node_idx).add_visit(value);
+            value = G::flip_perspective(value);
         }
     }
 
@@ -871,52 +867,46 @@ impl MCTS {
     /// Root Policy Softmax Temperature (KataGo):
     /// Scale root priors via `p^(1/T) / Z` before computing ln(prior).
     /// T=1.0 returns unchanged. T>1 pushes distribution toward uniform.
-    fn apply_root_temperature(
-        probs: &[f32],
-        legal: &[(usize, usize)],
-        temperature: f32,
-    ) -> Vec<f32> {
+    fn apply_root_temperature(probs: &[f32], legal: &[ActionId], temperature: f32) -> Vec<f32> {
         if temperature == 1.0 {
             return probs.to_vec();
         }
-        let mut scaled = vec![0.0f32; NUM_POSITIONS];
+        let mut scaled = vec![0.0f32; probs.len()];
         let mut sum = 0.0;
-        for &(r, c) in legal {
-            let idx = Board::pos_to_idx(r, c);
-            let v = probs[idx].max(MIN_PROB).powf(1.0 / temperature);
-            scaled[idx] = v;
+        for &action in legal {
+            let v = probs[action].max(MIN_PROB).powf(1.0 / temperature);
+            scaled[action] = v;
             sum += v;
         }
         if sum > 0.0 {
-            for &(r, c) in legal {
-                scaled[Board::pos_to_idx(r, c)] /= sum;
+            for &action in legal {
+                scaled[action] /= sum;
             }
         }
         scaled
     }
 
     #[inline]
-    fn softmax_legal(logits: &[f32], legal: &[(usize, usize)]) -> Vec<f32> {
+    fn softmax_legal(logits: &[f32], legal: &[ActionId]) -> Vec<f32> {
         let max_logit = legal
             .iter()
-            .map(|&(r, c)| logits[Board::pos_to_idx(r, c)])
+            .map(|&idx| logits[idx])
             .fold(f32::NEG_INFINITY, f32::max);
-        let mut probs = vec![0.0f32; NUM_POSITIONS];
+        let mut probs = vec![0.0f32; logits.len()];
         let mut sum = 0.0f32;
-        for &(r, c) in legal {
-            let idx = Board::pos_to_idx(r, c);
+        for &idx in legal {
             let exp = (logits[idx] - max_logit).exp();
             probs[idx] = exp;
             sum += exp;
         }
         if sum > 0.0 {
-            for &(r, c) in legal {
-                probs[Board::pos_to_idx(r, c)] /= sum;
+            for &idx in legal {
+                probs[idx] /= sum;
             }
         } else {
             let count = legal.len() as f32;
-            for &(r, c) in legal {
-                probs[Board::pos_to_idx(r, c)] = 1.0 / count;
+            for &idx in legal {
+                probs[idx] = 1.0 / count;
             }
         }
         probs

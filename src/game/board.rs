@@ -1,5 +1,7 @@
 //! N子棋棋盘逻辑：可配置大小的棋盘、落子、胜负判定、状态编码
 
+use crate::mcts::game::{ActionId, Game};
+
 /// 棋盘大小
 pub const BOARD_SIZE: usize = 6;
 /// 总位置数
@@ -263,6 +265,65 @@ impl Board {
         let mut data = vec![0i32; ENCODE_LEN];
         self.encode_into(&mut data);
         data
+    }
+}
+
+// ============================================================
+//  Game trait 实现 — 将 Board 适配到 MCTS 泛型接口
+// ============================================================
+
+impl Game for Board {
+    type Player = Color;
+
+    fn encode_shape(&self) -> &[usize] {
+        &[ENCODE_LEN]
+    }
+
+    fn action_shape(&self) -> usize {
+        NUM_POSITIONS
+    }
+
+    fn current_player(&self) -> Color {
+        self.current_player
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.game_over
+    }
+
+    fn terminal_value(&self) -> f32 {
+        match self.winner {
+            Some(w) if w == self.current_player => 1.0,
+            Some(_) => -1.0,
+            None => 0.0,
+        }
+    }
+
+    fn legal_actions(&self) -> Vec<ActionId> {
+        let mut moves = Vec::with_capacity(NUM_POSITIONS);
+        if self.game_over {
+            return moves;
+        }
+        for r in 0..BOARD_SIZE {
+            for c in 0..BOARD_SIZE {
+                if self.cells[r][c] == 0 {
+                    moves.push(Self::pos_to_idx(r, c));
+                }
+            }
+        }
+        moves
+    }
+
+    fn play(&mut self, action: ActionId) -> bool {
+        self.play_idx(action)
+    }
+
+    fn encode(&self) -> Vec<i32> {
+        self.encode_state()
+    }
+
+    fn next_player(current: Color) -> Color {
+        current.opponent()
     }
 }
 
