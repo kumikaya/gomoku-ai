@@ -77,7 +77,7 @@ pub fn self_play<E: Evaluator>(
         let mut search_config = GumbelConfig::pure_gumbel(sims);
         search_config.select_temperature = config.select_temperature;
 
-        let result = mcts.search(&mut board, evaluator, &search_config, rng);
+        let result = mcts.search(&board, evaluator, &search_config, rng);
 
         // 仅完整搜索产生训练样本 (对齐 KataGo cheapSearchTargetWeight=0)
         if is_full_search {

@@ -49,15 +49,17 @@ pub trait Game: Clone + Send {
 
     /// 当前轮到哪个玩家。
     fn current_player(&self) -> Self::Player;
-    /// 游戏是否已结束（终局）。
-    fn is_terminal(&self) -> bool;
 
     /// 终局时**从当前玩家视角**的回报值。
     ///
     /// 应在 `is_terminal() == true` 时调用，返回当前玩家在这一局中的回报：
     /// - 零和对弈：赢了 → 正，输了 → 负，平局 → 0
     /// - 单智能体：达成目标 → 正，失败 → 负，否则 → 自定义
-    fn terminal_value(&self) -> f32;
+    fn terminal_value(&self) -> Option<f32>;
+
+    fn is_terminal(&self) -> bool {
+        self.terminal_value().is_some()
+    }
 
     // ── 动作 ──
 

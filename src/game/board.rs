@@ -149,9 +149,8 @@ impl Board {
         } else if self.step_count >= NUM_POSITIONS {
             self.game_over = true;
             self.winner = None;
-        } else {
-            self.current_player = self.current_player.opponent();
         }
+        self.current_player = self.current_player.opponent();
         true
     }
 
@@ -287,16 +286,16 @@ impl Game for Board {
         self.current_player
     }
 
-    fn is_terminal(&self) -> bool {
-        self.game_over
-    }
-
-    fn terminal_value(&self) -> f32 {
-        match self.winner {
+    fn terminal_value(&self) -> Option<f32> {
+        if !self.game_over {
+            return None;
+        }
+        let value = match self.winner {
             Some(w) if w == self.current_player => 1.0,
             Some(_) => -1.0,
             None => 0.0,
-        }
+        };
+        Some(value)
     }
 
     fn legal_actions(&self) -> Vec<ActionId> {

@@ -64,14 +64,6 @@ impl<T> Table<T> {
             .map(|(i, slot)| (i, slot.as_ref()))
     }
 
-    /// 迭代所有非空值的拷贝。
-    pub fn values_copied(&self) -> impl Iterator<Item = T> + '_
-    where
-        T: Copy,
-    {
-        self.slots.iter().filter_map(|slot| *slot)
-    }
-
     /// 迭代所有非空条目 `(idx, &T)`。
     pub fn occupied(&self) -> impl Iterator<Item = (usize, &T)> {
         self.slots

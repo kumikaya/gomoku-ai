@@ -25,6 +25,7 @@
 use super::game::{ActionId, Game};
 use super::table::Table;
 use crate::inference::Evaluator;
+use itertools::Itertools;
 use rand::RngExt;
 
 /// 对数计算的最小概率下限，防止 ln(0) = -inf
@@ -38,6 +39,10 @@ const MIN_PROB: f32 = 1e-15;
 const PUCT_INIT: f32 = 1.25;
 /// PUCT 基项（对齐 minizero `actor_mcts_puct_base`）
 const PUCT_BASE: f32 = 19652.0;
+
+// 方差缩放钳位：防止极端方差导致探索失控
+const VAR_CLAMP_MIN: f32 = 0.1;
+const VAR_CLAMP_MAX: f32 = 4.0;
 
 /// MCTS 树节点索引。
 pub type NodeId = usize;
@@ -78,9 +83,9 @@ impl Default for GumbelConfig {
             pure_gumbel_noise: true,
             select_temperature: 1.0,
             root_policy_temperature: 1.0,
-            dynamic_cpuct: false,
-            fpu_reduction: 0.15,
-            dirichlet_alpha: 0.3,
+            dynamic_cpuct: true,
+            fpu_reduction: 0.0,
+            dirichlet_alpha: 0.1,
             dirichlet_epsilon: 0.03,
         }
     }
@@ -132,7 +137,7 @@ pub struct Node<G: Game> {
 impl<G: Game> Node<G> {
     pub fn new(
         prior: f32,
-        gumbel_logit: f32,
+        clean_logit: f32,
         gumbel_noise: f32,
         player: G::Player,
         action_shape: usize,
@@ -142,7 +147,7 @@ impl<G: Game> Node<G> {
             total_value: 0.0,
             value_sq_sum: 0.0,
             prior,
-            policy_logit: gumbel_logit + gumbel_noise,
+            policy_logit: clean_logit + gumbel_noise,
             gumbel_noise,
             children: Table::new(action_shape),
             expanded: false,
@@ -232,6 +237,14 @@ pub struct SearchResult {
     pub root_nn_prior: Vec<f32>,
 }
 
+// 暂存本轮每个 walk 的上下文
+struct EvalCtx {
+    path: Vec<NodeId>,
+    legal: Vec<ActionId>,
+    /// game_over 时固化当前玩家的 terminal_value，消费阶段直接使用
+    terminal_value: Option<f32>,
+}
+
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
         Self { arena: Vec::new() }
@@ -279,20 +292,16 @@ impl<G: Game> MCTS<G> {
         action_shape: usize,
     ) {
         let child_player = G::next_player(self.node(parent).player);
-        let mut child_ids = Vec::with_capacity(legal.len());
-        for i in 0..legal.len() {
+        for (i, &action) in legal.iter().enumerate() {
             let (prior, clean_logit) = child_data[i];
-            child_ids.push(self.push_node(Node::new(
+            let child_id = self.push_node(Node::new(
                 prior,
                 clean_logit,
                 gumbel_noises[i],
                 child_player,
                 action_shape,
-            )));
-        }
-        let parent_node = self.node_mut(parent);
-        for (i, &action) in legal.iter().enumerate() {
-            parent_node.children.set(action, child_ids[i]);
+            ));
+            self.node_mut(parent).children.set(action, child_id);
         }
     }
 
@@ -313,7 +322,7 @@ impl<G: Game> MCTS<G> {
         let node = self.node(node_idx);
         let mut sum_q = 0.0f32;
         let mut visited = 0.0f32;
-        for c in node.children.values_copied() {
+        for &c in node.children.values() {
             let child = self.node(c);
             if child.visit_count > 0 {
                 sum_q += child.q();
@@ -338,39 +347,37 @@ impl<G: Game> MCTS<G> {
         &self,
         start_node_idx: NodeId,
         game: &mut G,
-        legal: &mut Vec<ActionId>,
         dynamic_cpuct: bool,
         fpu_reduction: f32,
-    ) -> Vec<NodeId> {
-        // 方差缩放钳位：防止极端方差导致探索失控
-        const VAR_CLAMP_MIN: f32 = 0.1;
-        const VAR_CLAMP_MAX: f32 = 4.0;
-
-        let mut path: Vec<NodeId> = vec![start_node_idx];
+    ) -> impl Iterator<Item = NodeId> {
         let mut node_idx = start_node_idx;
-
-        loop {
-            if game.is_terminal() || !self.node(node_idx).expanded {
-                return path;
+        let mut first = true;
+        std::iter::from_fn(move || {
+            if first {
+                first = false;
+                return Some(node_idx);
             }
-            *legal = game.legal_actions();
-            if legal.is_empty() {
-                return path;
-            }
+            loop {
+                if game.is_terminal() || !self.node(node_idx).expanded {
+                    return None;
+                }
+                let legal = game.legal_actions();
+                if legal.is_empty() {
+                    return None;
+                }
 
-            let node = self.node(node_idx);
-            let total_simulation = node.effective_visits().saturating_sub(1) as f32;
-            let bias = Self::puct_bias(total_simulation);
-            let sqrt_total = total_simulation.sqrt();
-            let init_q = self.init_q_value(node_idx);
-            // FPU Reduction (KataGo): 未访问子节点悲观估计，避免在明显差走法上浪费模拟
-            let fpu_q = init_q - fpu_reduction;
+                let node = self.node(node_idx);
+                let total_simulation = node.effective_visits().max(1) as f32;
+                let bias = Self::puct_bias(total_simulation);
+                let sqrt_total = total_simulation.sqrt();
+                let init_q = self.init_q_value(node_idx);
+                // FPU Reduction (KataGo): 未访问子节点悲观估计，避免在明显差走法上浪费模拟
+                let fpu_q = init_q - fpu_reduction;
 
-            let children = &node.children;
-            let mut best: Option<(ActionId, NodeId, f32, f32)> = None;
-            for &action in legal.iter() {
-                if let Some(ci) = children[action] {
-                    let child = self.node(ci);
+                let children = &node.children;
+                let mut best: Option<(ActionId, NodeId, f32, f32)> = None;
+                for (action, &child_id) in children.occupied() {
+                    let child = self.node(child_id);
                     let n = child.effective_visits() as f32;
                     // q() 已返回父节点视角，fpu_q 也是父节点视角，直接使用
                     let q = if child.visit_count > 0 {
@@ -386,27 +393,27 @@ impl<G: Game> MCTS<G> {
                     let score = q + bias * var_scale * child.prior * sqrt_total / (1.0 + n);
                     let policy = child.prior;
                     if best.map_or(true, |(_, _, s, p)| score > s || (score == s && policy > p)) {
-                        best = Some((action, ci, score, policy));
+                        best = Some((action, child_id, score, policy));
                     }
                 }
+
+                let (move_idx, child_idx) = match best {
+                    Some((mi, ci, _, _)) => (mi, ci),
+                    None => (legal[0], children[legal[0]].unwrap()),
+                };
+
+                game.play(move_idx);
+                node_idx = child_idx;
+                return Some(child_idx);
             }
-
-            let (move_idx, child_idx) = match best {
-                Some((mi, ci, _, _)) => (mi, ci),
-                None => (legal[0], children[legal[0]].unwrap()),
-            };
-
-            path.push(child_idx);
-            game.play(move_idx);
-            node_idx = child_idx;
-        }
+        })
     }
 
     // ── Gumbel Zero search ──
 
     pub fn search<E: Evaluator>(
         &mut self,
-        game: &mut G,
+        game: &G,
         evaluator: &E,
         config: &GumbelConfig,
         rng: &mut impl RngExt,
@@ -473,22 +480,19 @@ impl<G: Game> MCTS<G> {
         self.root_mut().expanded = true;
 
         // ── Phase 2: 候选集（按带噪声的 policy_logit 排序取 top-k） ──
-        let children = &self.root().children;
-        let mut candidates: Vec<NodeId> = Vec::with_capacity(legal_moves.len());
-        for &action in &legal_moves {
-            if let Some(ci) = children[action] {
-                candidates.push(ci);
-            }
-        }
-        candidates.sort_by(|&a, &b| {
-            self.node(b)
-                .policy_logit
-                .partial_cmp(&self.node(a).policy_logit)
-                .unwrap()
-        });
-        if candidates.len() > sample_n {
-            candidates.truncate(sample_n);
-        }
+        let mut candidates: Vec<(ActionId, NodeId)> = self
+            .root()
+            .children
+            .occupied()
+            .map(|(action, &child_id)| (action, child_id))
+            .sorted_by(|&(_, a), &(_, b)| {
+                self.node(b)
+                    .policy_logit
+                    .partial_cmp(&self.node(a).policy_logit)
+                    .unwrap()
+            })
+            .take(sample_n)
+            .collect();
 
         // ── Phase 3: 模拟循环（攒批 evaluate）──
         // 对标 minizero ZeroActor::step()：
@@ -498,9 +502,6 @@ impl<G: Game> MCTS<G> {
 
         let mut cur_sample = sample_n;
         let mut sim_budget = Self::gumbel_budget(num_sim, cur_sample);
-
-        let mut sim_game = game.clone();
-        let mut legal_buf = Vec::with_capacity(action_shape);
         let mut sim_i = 0;
 
         loop {
@@ -510,61 +511,42 @@ impl<G: Game> MCTS<G> {
 
             // ── 一轮批量：连续 walk 攒 batch_size 个叶子 ──
             let round = (num_sim - sim_i).min(batch_size);
-
-            // 暂存本轮每个 walk 的上下文
-            struct EvalCtx {
-                path: Vec<NodeId>,
-                encoding: Vec<i32>,
-                legal: Vec<ActionId>,
-                game_over: bool,
-                /// game_over 时固化当前玩家的 terminal_value，消费阶段直接使用
-                terminal_value: f32,
-            }
             let mut contexts: Vec<EvalCtx> = Vec::with_capacity(round);
             let mut encodings: Vec<Vec<i32>> = Vec::with_capacity(round);
 
             for _ in 0..round {
                 // ── selection ──
-                let path: Vec<NodeId>;
+                let mut sim_game = game.clone();
 
-                if sim_i == 0 {
-                    sim_game.clone_from(game);
-                    path = self.puct_walk(
-                        0,
-                        &mut sim_game,
-                        &mut legal_buf,
-                        config.dynamic_cpuct,
-                        config.fpu_reduction,
-                    );
-                } else {
-                    candidates.sort_by(|&a, &b| {
+                // Sequential Halving: 选 effective_visits 最少的 candidate，
+                // tie-break 选 policy_logit 最大的（首次模拟时所有 candidate
+                // effective_visits == 0，等价于选 Phase 2 排序后的 top-1）。
+                let (action, start_ci) = candidates
+                    .iter()
+                    .copied()
+                    .min_by(|&(_, a), &(_, b)| {
                         self.node(a)
-                            .visit_count
-                            .cmp(&self.node(b).visit_count)
+                            .effective_visits()
+                            .cmp(&self.node(b).effective_visits())
                             .then_with(|| {
                                 self.node(b)
                                     .policy_logit
                                     .partial_cmp(&self.node(a).policy_logit)
                                     .unwrap()
                             })
-                    });
-                    let start_ci = candidates[0];
+                    })
+                    .unwrap();
+                sim_game.play(action);
 
-                    sim_game.clone_from(game);
-                    let move_idx = self.root().children.position_of(&start_ci).unwrap_or(0);
-                    sim_game.play(move_idx);
-
-                    let p_from = self.puct_walk(
-                        start_ci,
-                        &mut sim_game,
-                        &mut legal_buf,
-                        config.dynamic_cpuct,
-                        config.fpu_reduction,
-                    );
-                    let mut full = vec![0];
-                    full.extend(p_from);
-                    path = full;
-                }
+                let p_from = self.puct_walk(
+                    start_ci,
+                    &mut sim_game,
+                    config.dynamic_cpuct,
+                    config.fpu_reduction,
+                );
+                let mut path_vec = vec![0];
+                path_vec.extend(p_from);
+                let path = path_vec;
 
                 // add virtual loss 到这条路径上
                 for &ni in &path {
@@ -573,35 +555,19 @@ impl<G: Game> MCTS<G> {
 
                 let leaf_idx = *path.last().unwrap();
 
-                if sim_game.is_terminal() {
-                    contexts.push(EvalCtx {
-                        path,
-                        encoding: Vec::new(),
-                        legal: Vec::new(),
-                        game_over: true,
-                        terminal_value: sim_game.terminal_value(),
-                    });
-                } else if !self.node(leaf_idx).expanded {
+                let terminal_value = sim_game.terminal_value();
+                let mut legal_leaf = Vec::new();
+                if !sim_game.is_terminal() {
+                    debug_assert!(!self.node(leaf_idx).expanded);
                     let encoding = sim_game.encode();
-                    let legal_leaf = sim_game.legal_actions();
-                    encodings.push(encoding.clone());
-                    contexts.push(EvalCtx {
-                        path,
-                        encoding,
-                        legal: legal_leaf,
-                        game_over: false,
-                        terminal_value: 0.0,
-                    });
-                } else {
-                    // 已展开的节点（理论上不应该到这里，但保留处理）
-                    contexts.push(EvalCtx {
-                        path,
-                        encoding: Vec::new(),
-                        legal: Vec::new(),
-                        game_over: false,
-                        terminal_value: 0.0,
-                    });
+                    encodings.push(encoding);
+                    legal_leaf = sim_game.legal_actions();
                 }
+                contexts.push(EvalCtx {
+                    path,
+                    legal: legal_leaf,
+                    terminal_value,
+                });
 
                 sim_i += 1;
             }
@@ -616,14 +582,14 @@ impl<G: Game> MCTS<G> {
             // ── 消费结果：expand + backprop，清除 virtual loss ──
             let mut batch_result_idx = 0;
             for ctx in contexts.into_iter() {
-                // 清除 virtual loss
+                // 一次性清除 virtual loss（walks 已完成，不再需要发散）
                 for &ni in &ctx.path {
-                    self.node_mut(ni).virtual_loss = self.node(ni).virtual_loss.saturating_sub(1);
+                    self.node_mut(ni).virtual_loss = 0;
                 }
 
-                if ctx.game_over {
-                    self.backprop_path(&ctx.path, ctx.terminal_value);
-                } else if !ctx.encoding.is_empty() {
+                if let Some(terminal_value) = ctx.terminal_value {
+                    self.backprop_path(&ctx.path, terminal_value);
+                } else {
                     let (policies_batch, values_batch) = eval_result.as_ref().unwrap();
                     let probs = Self::softmax_legal(&policies_batch[batch_result_idx], &ctx.legal);
 
@@ -649,20 +615,19 @@ impl<G: Game> MCTS<G> {
                     self.backprop_path(&ctx.path, values_batch[batch_result_idx]);
                     batch_result_idx += 1;
                 }
-                // else: 已展开节点，无操作
             }
 
             // ── sequentialHalving（每轮结束后检查一次）──
             let all_reached = candidates
                 .iter()
-                .all(|&ci| self.node(ci).visit_count_f32() >= sim_budget as f32);
+                .all(|&(_, ci)| self.node(ci).visit_count_f32() >= sim_budget as f32);
 
             if all_reached {
                 let next_budget = Self::gumbel_budget_halved(num_sim, cur_sample, sample_n);
                 if next_budget > 0 && cur_sample > 2 {
                     cur_sample /= 2;
-                    let max_n = Self::max_root_count(self);
-                    candidates.sort_by(|&a, &b| {
+                    let max_n = self.max_root_count();
+                    candidates.sort_by(|&(_, a), &(_, b)| {
                         let sa = Self::sigma_score(self.node(a), max_n, config);
                         let sb = Self::sigma_score(self.node(b), max_n, config);
                         sb.partial_cmp(&sa).unwrap()
@@ -670,7 +635,8 @@ impl<G: Game> MCTS<G> {
                     if candidates.len() > cur_sample {
                         candidates.truncate(cur_sample);
                     }
-                    let base = self.node(candidates[0]).visit_count;
+                    let (_, child_id) = candidates[0];
+                    let base = self.node(child_id).visit_count;
                     sim_budget = base + next_budget;
                 }
             }
@@ -704,11 +670,11 @@ impl<G: Game> MCTS<G> {
         (num_sim as f32 / d).floor() as u32
     }
 
-    fn max_root_count(mcts: &MCTS<G>) -> f32 {
-        mcts.root()
+    fn max_root_count(&self) -> f32 {
+        self.root()
             .children
             .values()
-            .map(|&ci| mcts.node(ci).visit_count_f32())
+            .map(|&ci| self.node(ci).visit_count_f32())
             .fold(0.0, f32::max)
     }
 
@@ -737,7 +703,7 @@ impl<G: Game> MCTS<G> {
 
         let mut pi_sum = 0.0f32;
         let mut q_sum = 0.0f32;
-        for c in children.values_copied() {
+        for &c in children.values() {
             let child = self.node(c);
             if child.visit_count > 0 {
                 pi_sum += child.prior;
@@ -751,21 +717,21 @@ impl<G: Game> MCTS<G> {
             root_nn_value
         };
 
-        let max_n = Self::max_root_count(self);
+        let max_n = self.max_root_count();
         let sv = config.sigma_visit_c;
         let sc = config.sigma_scale_c;
 
         let mut scores: Vec<(ActionId, f32)> = Vec::new();
         let mut max_score = f32::NEG_INFINITY;
-        for (idx, ci) in children.occupied() {
-            let child = self.node(*ci);
+        for (action, &child_id) in children.occupied() {
+            let child = self.node(child_id);
             let value = if child.visit_count > 0 {
                 child.q()
             } else {
                 non_visited_value
             };
             let score = child.logit_without_noise() + (sv + max_n) * sc * value;
-            scores.push((idx, score));
+            scores.push((action, score));
             if score > max_score {
                 max_score = score;
             }
@@ -791,13 +757,9 @@ impl<G: Game> MCTS<G> {
         let root_value = if sum_n > 0.0 {
             children
                 .values()
-                .filter_map(|&ci| {
+                .map(|&ci| {
                     let child = self.node(ci);
-                    if child.visit_count > 0 {
-                        Some(child.visit_count_f32() / sum_n * child.q())
-                    } else {
-                        None
-                    }
+                    child.visit_count_f32() / sum_n * child.q()
                 })
                 .sum()
         } else {
@@ -927,7 +889,7 @@ impl<G: Game> MCTS<G> {
         use rand::distr::Distribution;
         let gumbel = rand_distr::Gumbel::new(0.0, 1.0).unwrap();
         (0..n)
-            .map(|_| (gumbel.sample(rng) as f32).clamp(-40.0_f32, 40.0_f32))
+            .map(|_| (gumbel.sample(rng) as f32).clamp(-5.0_f32, 5.0_f32))
             .collect()
     }
 }

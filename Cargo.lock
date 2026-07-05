@@ -1431,7 +1431,7 @@ dependencies = [
  "float-ord",
  "half",
  "hashbrown 0.17.1",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "num-integer",
  "num-traits",
@@ -1454,7 +1454,7 @@ dependencies = [
  "cubecl-runtime",
  "derive-new",
  "half",
- "itertools",
+ "itertools 0.14.0",
  "log",
 ]
 
@@ -1545,7 +1545,7 @@ dependencies = [
  "half",
  "hashbrown 0.17.1",
  "internment",
- "itertools",
+ "itertools 0.14.0",
  "num-traits",
  "portable-atomic",
  "serde",
@@ -1616,7 +1616,7 @@ dependencies = [
  "dirs",
  "enumset",
  "hashbrown 0.17.1",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "md5",
  "serde",
@@ -1662,7 +1662,7 @@ dependencies = [
  "derive_more",
  "half",
  "hashbrown 0.17.1",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "sanitize-filename",
  "tracing",
@@ -2792,6 +2792,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "indicatif",
+ "itertools 0.15.0",
  "rand 0.10.2",
  "rand_distr",
  "ratatui",
@@ -3285,6 +3286,15 @@ name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -4625,7 +4635,7 @@ dependencies = [
  "compact_str",
  "critical-section",
  "hashbrown 0.17.1",
- "itertools",
+ "itertools 0.14.0",
  "kasuari",
  "lru",
  "palette",
@@ -4690,7 +4700,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indoc",
  "instability",
- "itertools",
+ "itertools 0.14.0",
  "line-clipping",
  "ratatui-core",
  "serde",
@@ -4716,7 +4726,7 @@ dependencies = [
  "built",
  "cfg-if",
  "interpolate_name",
- "itertools",
+ "itertools 0.14.0",
  "libc",
  "libfuzzer-sys",
  "log",
@@ -6120,7 +6130,7 @@ version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
 dependencies = [
- "itertools",
+ "itertools 0.14.0",
  "unicode-segmentation",
  "unicode-width",
 ]
