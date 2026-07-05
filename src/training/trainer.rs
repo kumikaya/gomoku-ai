@@ -2,9 +2,10 @@
 //!
 //! `TrainConfig` 配置训练超参数，`Trainer` 执行完整的 AlphaZero 训练循环。
 
-use crate::game::board::{D4Symmetry, ENCODE_LEN, NUM_POSITIONS};
+use crate::game::board::D4Symmetry;
 use crate::inference::InferenceServer;
 use crate::network::transformer::GomokuNetwork;
+use crate::network::transformer::policy_out_dim;
 use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 use crate::training::buffer::RolloutBuffer;
 use crate::training::lr_schedule::LrSchedule;
@@ -354,6 +355,9 @@ impl Trainer {
     ) -> EpochStats {
         let mut stats = EpochStats::default();
         let identity_prob = 1.0 / D4Symmetry::COUNT as f32;
+        let symmetry = D4Symmetry::new(model.board_size);
+        let npos = policy_out_dim(model.board_size);
+        let encode_len = model.board_size * model.board_size;
 
         let num_batches = self.config.mini_batches_per_iteration;
         let pb = ProgressBar::new(num_batches as u64);
@@ -373,12 +377,8 @@ impl Trainer {
                 .iter()
                 .map(|&i| {
                     let record = self.buffer.get(i);
-                    let (state, policy) = D4Symmetry::random_augment(
-                        &record.state,
-                        &record.policy,
-                        rng,
-                        identity_prob,
-                    );
+                    let (state, policy) =
+                        symmetry.random_augment(&record.state, &record.policy, rng, identity_prob);
                     PlayRecord {
                         state,
                         policy,
@@ -389,14 +389,14 @@ impl Trainer {
                 .collect();
             let batch_len = mini_batch.len();
 
-            let (flat_states, flat_policies, flat_values) = Self::flatten_batch(&mini_batch);
+            let (flat_states, flat_policies, flat_values) = Self::flatten_batch(&mini_batch, npos);
 
             let state_tensor = Tensor::<2, Int>::from_data(
-                burn::tensor::TensorData::new(flat_states, [batch_len as i32, ENCODE_LEN as i32]),
+                burn::tensor::TensorData::new(flat_states, [batch_len as i32, encode_len as i32]),
                 train_device,
             );
             let policy_target = Tensor::<1>::from_floats(flat_policies.as_slice(), train_device)
-                .reshape([batch_len, NUM_POSITIONS]);
+                .reshape([batch_len, npos]);
             let value_target_tensor =
                 Tensor::<1>::from_floats(flat_values.as_slice(), train_device)
                     .reshape([batch_len, 1]);
@@ -484,10 +484,11 @@ impl Trainer {
 
     // ── 数据辅助 ──
 
-    fn flatten_batch(batch: &[PlayRecord]) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
+    fn flatten_batch(batch: &[PlayRecord], npos: usize) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
         let batch_size = batch.len();
-        let mut states = Vec::with_capacity(batch_size * ENCODE_LEN);
-        let mut policies = Vec::with_capacity(batch_size * NUM_POSITIONS);
+        let encode_len = batch.first().map(|r| r.state.len()).unwrap_or(0);
+        let mut states = Vec::with_capacity(batch_size * encode_len);
+        let mut policies = Vec::with_capacity(batch_size * npos);
         let mut values = Vec::with_capacity(batch_size);
 
         for record in batch {

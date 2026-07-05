@@ -5,7 +5,7 @@
 //! - `EloTracker`: Elo 评分追踪（1500 基准）
 //! - `BaselineServer`: 长期缓存 baseline 的 InferenceServer，避免重复创建 GPU 线程
 
-use crate::game::board::{Board, Color, NUM_POSITIONS};
+use crate::game::board::{Board, Color};
 use crate::inference::InferenceServer;
 use crate::mcts::node::{GumbelConfig, MCTS};
 use crate::network::transformer::GomokuNetwork;
@@ -279,7 +279,9 @@ fn play_eval_game(
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-    let max_moves = NUM_POSITIONS * 2;
+    let max_moves = board.num_positions() * 2;
+
+    let npos = board.num_positions();
 
     for _ in 0..max_moves {
         let is_black = board.current_player == Color::Black;
@@ -293,7 +295,7 @@ fn play_eval_game(
 
         let result = mcts.search(&mut board, eval, &config, &mut rng);
 
-        if result.best_move >= NUM_POSITIONS || !board.play_idx(result.best_move) {
+        if result.best_move >= npos || !board.play_idx(result.best_move) {
             break;
         }
 

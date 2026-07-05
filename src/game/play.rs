@@ -5,7 +5,7 @@
 
 use std::io;
 
-use crate::game::board::{BOARD_SIZE, Board, Color, NUM_POSITIONS};
+use crate::game::board::{Board, Color};
 use crate::inference::Evaluator;
 use crate::mcts::node::{GumbelConfig, MCTS};
 
@@ -57,10 +57,12 @@ fn run_game_loop<E: Evaluator>(
 ) -> io::Result<()> {
     let player_color = Color::Black;
 
+    let board = Board::new();
+    let half = board.board_size / 2;
     let mut state = GameState {
-        board: Board::new(),
-        cursor_row: BOARD_SIZE / 2,
-        cursor_col: BOARD_SIZE / 2,
+        board,
+        cursor_row: half,
+        cursor_col: half,
         mcts: MCTS::new(),
         message: format!(
             "你的回合 ({}) — 箭头键移动, 空格落子, Q 退出",
@@ -109,13 +111,13 @@ fn run_game_loop<E: Evaluator>(
                         state.cursor_row = state.cursor_row.saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        state.cursor_row = (state.cursor_row + 1).min(BOARD_SIZE - 1);
+                        state.cursor_row = (state.cursor_row + 1).min(state.board.board_size - 1);
                     }
                     KeyCode::Left => {
                         state.cursor_col = state.cursor_col.saturating_sub(1);
                     }
                     KeyCode::Right => {
-                        state.cursor_col = (state.cursor_col + 1).min(BOARD_SIZE - 1);
+                        state.cursor_col = (state.cursor_col + 1).min(state.board.board_size - 1);
                     }
                     _ => {}
                 }
@@ -130,9 +132,10 @@ fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: 
         .mcts
         .search(&mut state.board, evaluator, &config, &mut rand::rng());
 
-    if result.best_move < NUM_POSITIONS {
+    let npos = state.board.num_positions();
+    if result.best_move < npos {
         state.board.play_idx(result.best_move);
-        let (r, c) = Board::idx_to_pos(result.best_move);
+        let (r, c) = state.board.idx_to_pos(result.best_move);
         state.message = format!("AI 落了 ({},{}) — 你的回合", r, c);
     }
 }
@@ -165,8 +168,9 @@ struct BoardWidget<'a> {
 impl Widget for BoardWidget<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         // 终端窗口太小时直接提示，不 panic
-        let board_width = (BOARD_SIZE * 3 + 1) as u16;
-        let board_height = (BOARD_SIZE + 2) as u16;
+        let bs = self.state.board.board_size;
+        let board_width = (bs * 3 + 1) as u16;
+        let board_height = (bs + 2) as u16;
         if area.width < board_width || area.height < board_height + 2 {
             buf.set_string(
                 area.x,
@@ -179,8 +183,10 @@ impl Widget for BoardWidget<'_> {
         let x_offset = area.x + (area.width.saturating_sub(board_width)) / 2;
         let y_offset = area.y + (area.height.saturating_sub(board_height)) / 2;
 
+        let bs = self.state.board.board_size;
+
         // 列标
-        for c in 0..BOARD_SIZE {
+        for c in 0..bs {
             let ch = (b'A' + c as u8) as char;
             buf.set_string(
                 x_offset + c as u16 * 3 + 2,
@@ -192,7 +198,7 @@ impl Widget for BoardWidget<'_> {
             );
         }
 
-        for r in 0..BOARD_SIZE {
+        for r in 0..bs {
             // 行标
             let row_label = format!("{:2}", r);
             buf.set_string(
@@ -202,7 +208,7 @@ impl Widget for BoardWidget<'_> {
                 Style::default().fg(TuiColor::Gray),
             );
 
-            for c in 0..BOARD_SIZE {
+            for c in 0..bs {
                 let sx = x_offset + c as u16 * 3 + 2;
                 let sy = y_offset + r as u16 + 1;
 
@@ -230,8 +236,8 @@ impl Widget for BoardWidget<'_> {
             }
         }
 
-        // 在 (7,7) 天元位置加标记
-        let half_size = BOARD_SIZE / 2;
+        // 在天元位置加标记
+        let half_size = bs / 2;
         if self.state.board.get(half_size, half_size) == 0
             && !(self.state.cursor_row == half_size && self.state.cursor_col == half_size)
         {

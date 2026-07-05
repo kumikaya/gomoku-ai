@@ -86,12 +86,15 @@ impl RolloutBuffer {
 
 #[cfg(test)]
 mod tests {
+    use crate::game::board::Board;
+
     use super::*;
 
     fn dummy_record(value: f32, weight: f32) -> PlayRecord {
+        let npos = Board::DEFAULT_BOARD_SIZE * Board::DEFAULT_BOARD_SIZE;
         PlayRecord {
-            state: vec![0i32; crate::game::board::ENCODE_LEN],
-            policy: vec![0.0f32; crate::game::board::NUM_POSITIONS],
+            state: vec![0i32; npos],
+            policy: vec![0.0f32; npos],
             value,
             sample_weight: weight,
         }

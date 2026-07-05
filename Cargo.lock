@@ -2793,6 +2793,7 @@ dependencies = [
  "crossterm",
  "indicatif",
  "itertools 0.15.0",
+ "ndarray 0.17.2",
  "rand 0.10.2",
  "rand_distr",
  "ratatui",

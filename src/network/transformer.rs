@@ -1,8 +1,8 @@
 //! Transformer Decoder 架构的五子棋网络
 //!
-//! 输入：[batch, BOARD_SIZE²]  i32 (0=空, 1=黑, 2=白)
+//! 输入：[batch, board_size²]  i32 (0=空, 1=黑, 2=白)
 //! 输出：
-//!   - 策略 logits：[batch, BOARD_SIZE²]  各落子点未归一化分数
+//!   - 策略 logits：[batch, board_size²]  各落子点未归一化分数
 //!   - 局势价值：  [batch, 1]  范围 [-1, 1]（Tanh）
 //!
 //! 架构：
@@ -10,7 +10,7 @@
 //!   → N × TransformerBlock (self-attn + FFN, post-LN)
 //!   → Policy head (per-position Linear) + Value head (mean pool + MLP → Tanh)
 
-use crate::game::board::BOARD_SIZE;
+use crate::game::board::Board;
 use crate::network::pos_embed::{Pos2DEmbed, Pos2DEmbedConfig};
 
 use burn::tensor::activation::{relu, tanh};
@@ -48,7 +48,7 @@ pub struct GomokuNetworkConfig {
 impl Default for GomokuNetworkConfig {
     fn default() -> Self {
         Self {
-            board_size: BOARD_SIZE,
+            board_size: Board::DEFAULT_BOARD_SIZE,
             d_model: 128,
             d_ff: 512,
             n_heads: 4,
@@ -171,7 +171,7 @@ impl GomokuNetwork {
 
     /// 前向传播。
     ///
-    /// 输入 [batch, BOARD_SIZE²] i32 → 策略 [batch, BOARD_SIZE²] + 价值 [batch, 1]
+    /// 输入 [batch, board_size²] i32 → 策略 [batch, board_size²] + 价值 [batch, 1]
     pub fn forward(&self, input: Tensor<2, Int>) -> (Tensor<2>, Tensor<2>) {
         let batch = input.dims()[0];
         let seq = input.dims()[1] as usize;

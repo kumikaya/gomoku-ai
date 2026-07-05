@@ -17,7 +17,7 @@ const BATCH_TIMEOUT: Duration = Duration::from_micros(200);
 
 /// 批量评估接口。
 ///
-/// 输入 `states`：每个元素是 `ENCODE_LEN` 长度的 i32 编码棋盘。
+/// 输入 `states`：每个元素是 board_size² 长度的 i32 编码棋盘。
 /// 返回 `(policies, values)`：
 /// - `policies[i]`：长度 `POLICY_OUT` 的原始 logits
 /// - `values[i]`：单个 f32 标量，范围 [-1, 1]

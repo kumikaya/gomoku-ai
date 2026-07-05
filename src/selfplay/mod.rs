@@ -8,7 +8,7 @@
 //!
 //! 对齐 KataGo: cheapSearchTargetWeight=0 → 快速搜索的样本不写入训练数据。
 
-use crate::game::board::{Board, Color, NUM_POSITIONS};
+use crate::game::board::{Board, Color};
 use crate::inference::Evaluator;
 use crate::mcts::node::{GumbelConfig, MCTS};
 use rand::RngExt;
@@ -107,7 +107,8 @@ pub fn self_play<E: Evaluator>(
 fn compute_kl(nn_prior: &[f32], mcts_policy: &[f32]) -> f32 {
     let epsilon = 1e-12f32;
     let mut kl = 0.0f32;
-    for i in 0..NUM_POSITIONS {
+    let npos = nn_prior.len().min(mcts_policy.len());
+    for i in 0..npos {
         let p = nn_prior[i].max(epsilon);
         let q = mcts_policy[i].max(epsilon);
         if p > epsilon {
