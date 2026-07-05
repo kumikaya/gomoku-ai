@@ -1,11 +1,13 @@
-//! 五子棋棋盘逻辑：15×15 棋盘、落子、胜负判定、状态编码
+//! N子棋棋盘逻辑：可配置大小的棋盘、落子、胜负判定、状态编码
 
 /// 棋盘大小
-pub const BOARD_SIZE: usize = 8;
+pub const BOARD_SIZE: usize = 6;
 /// 总位置数
 pub const NUM_POSITIONS: usize = BOARD_SIZE * BOARD_SIZE;
 /// 棋盘编码长度（扁平序列：0=空, 1=己方, 2=对方）
 pub const ENCODE_LEN: usize = NUM_POSITIONS;
+/// 默认获胜所需连子数（五子棋）
+pub const DEFAULT_WIN_LENGTH: usize = 4;
 
 /// 玩家颜色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +44,26 @@ pub struct Board {
     pub step_count: usize,
     pub game_over: bool,
     pub winner: Option<Color>,
+    /// 获胜所需连续棋子数（N子棋的 N）
+    pub win_length: usize,
 }
 
 impl Board {
+    /// 创建默认棋盘（N子棋，默认 5 连获胜）。
+    /// 棋盘大小由 `BOARD_SIZE` 常量决定。
     pub fn new() -> Self {
+        Self::with_win_length(DEFAULT_WIN_LENGTH)
+    }
+
+    /// 创建自定义 N 子棋棋盘。
+    ///
+    /// `n` 为获胜所需连续棋子数，必须满足 2 ≤ n ≤ BOARD_SIZE。
+    pub fn with_win_length(n: usize) -> Self {
+        assert!(n >= 2, "win_length must be at least 2");
+        assert!(
+            n <= BOARD_SIZE,
+            "win_length cannot exceed BOARD_SIZE ({BOARD_SIZE})"
+        );
         Self {
             cells: [[0; BOARD_SIZE]; BOARD_SIZE],
             current_player: Color::Black,
@@ -53,6 +71,7 @@ impl Board {
             step_count: 0,
             game_over: false,
             winner: None,
+            win_length: n,
         }
     }
 
@@ -166,19 +185,23 @@ impl Board {
         }
     }
 
-    /// 检查在 (row, col) 处落子后是否形成五连。
+    /// 检查在 (row, col) 处落子后是否形成 N 连。
     ///
+    /// N 由 `self.win_length` 决定。
     /// 检查四个方向：水平(→)、垂直(↓)、主对角线(↘)、副对角线(↗)。
-    /// 每个方向从落子点向两端延伸，统计连续同色棋子数，达到 5 即获胜。
+    /// 每个方向从落子点向两端延伸，统计连续同色棋子数，达到 N 即获胜。
     fn check_win(&self, row: usize, col: usize) -> bool {
         let stone = self.cells[row][col];
         if stone == 0 {
             return false;
         }
+        let n = self.win_length;
+        // 最多只需检查 n-1 步远
+        let max_step = (n - 1) as i64;
         let directions: [(isize, isize); 4] = [(0, 1), (1, 0), (1, 1), (1, -1)];
         for &(dr, dc) in &directions {
             let mut count = 1;
-            for i in 1..5i64 {
+            for i in 1..=max_step {
                 let nr = row as i64 + dr as i64 * i;
                 let nc = col as i64 + dc as i64 * i;
                 if nr < 0 || nr >= BOARD_SIZE as i64 || nc < 0 || nc >= BOARD_SIZE as i64 {
@@ -190,7 +213,7 @@ impl Board {
                     break;
                 }
             }
-            for i in 1..5i64 {
+            for i in 1..=max_step {
                 let nr = row as i64 - dr as i64 * i;
                 let nc = col as i64 - dc as i64 * i;
                 if nr < 0 || nr >= BOARD_SIZE as i64 || nc < 0 || nc >= BOARD_SIZE as i64 {
@@ -202,7 +225,7 @@ impl Board {
                     break;
                 }
             }
-            if count >= 5 {
+            if count >= n {
                 return true;
             }
         }
