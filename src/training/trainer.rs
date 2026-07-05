@@ -366,13 +366,9 @@ impl Trainer {
                 .template("  Training: {bar:40.green/dim} {pos}/{len} batches ({eta})")
                 .unwrap(),
         );
+        let all_indices = self.buffer.sample(rng);
 
-        for _ in 0..num_batches {
-            // 每次 mini-batch 独立从 buffer 采样 batch_size 个样本
-            let batch_size = self.config.batch_size.min(self.buffer.len());
-            let all_indices = self.buffer.sample(rng);
-            let chunk = &all_indices[..batch_size];
-
+        for chunk in all_indices.chunks(self.config.batch_size).take(num_batches) {
             let mini_batch: Vec<PlayRecord> = chunk
                 .iter()
                 .map(|&i| {
