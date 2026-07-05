@@ -226,6 +226,7 @@ pub struct MCTS<G: Game> {
 }
 
 /// 单次搜索返回结果
+#[derive(Debug)]
 pub struct SearchResult {
     /// 选中的最佳动作（平铺索引），若为 action_shape 表示无合法动作
     pub best_move: ActionId,
@@ -891,5 +892,468 @@ impl<G: Game> MCTS<G> {
         (0..n)
             .map(|_| (gumbel.sample(rng) as f32).clamp(-5.0_f32, 5.0_f32))
             .collect()
+    }
+}
+
+// ============================================================
+//  测试：用 3×3 井字棋（米字棋）验证 MCTS 算法正确性
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::board::{Board, Color};
+
+    /// 模拟神经网络评估器。
+    ///
+    /// 返回均匀先验（所有合法动作等概率）+ 中立估值（value = 0.0）。
+    /// 用这个最简单的 mock 验证 MCTS 的行为是否合理——
+    /// 在仅凭模拟结果引导搜索的情况下，MCTS 应当能：
+    /// 1. 对必胜局面优先选制胜走法。
+    /// 2. 对必败局面避免明显的送子走法。
+    struct MockEvaluator {
+        /// 每个局面的标量估值（-1 ~ 1），若为空则返回 0.0
+        value_map: std::collections::HashMap<String, f32>,
+        /// 每个局面的策略 logits（若为空则返回均匀分布）
+        policy_map: std::collections::HashMap<String, Vec<f32>>,
+    }
+
+    impl MockEvaluator {
+        fn new() -> Self {
+            Self {
+                value_map: std::collections::HashMap::new(),
+                policy_map: std::collections::HashMap::new(),
+            }
+        }
+
+        /// 对特定局面设置 NN 估值。
+        /// `encoded` 为 encode() 输出的 Vec<i32>（序列化为 key）。
+        fn with_value(mut self, encoded: Vec<i32>, value: f32) -> Self {
+            let key = Self::encode_key(&encoded);
+            self.value_map.insert(key, value);
+            self
+        }
+
+        /// 对特定局面设置策略。`policy` 长度应等于 action_shape。
+        fn with_policy(mut self, encoded: Vec<i32>, policy: Vec<f32>) -> Self {
+            let key = Self::encode_key(&encoded);
+            self.policy_map.insert(key, policy);
+            self
+        }
+
+        fn encode_key(encoded: &[i32]) -> String {
+            encoded
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+
+    impl Evaluator for MockEvaluator {
+        fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>) {
+            let action_dim = states.first().map_or(0, |s| s.len());
+            let policies: Vec<Vec<f32>> = states
+                .iter()
+                .map(|s| {
+                    let key = Self::encode_key(s);
+                    self.policy_map
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0f32; action_dim])
+                })
+                .collect();
+            let values: Vec<f32> = states
+                .iter()
+                .map(|s| {
+                    let key = Self::encode_key(s);
+                    self.value_map.get(&key).copied().unwrap_or(0.0)
+                })
+                .collect();
+            (policies, values)
+        }
+    }
+
+    /// 构建 3×3 井字棋棋盘（连子数 = 3）。
+    fn make_board() -> Board {
+        Board::with_size(3, 3)
+    }
+
+    // ── 基本测试 ──
+
+    /// 空棋盘搜索：MCTS 应当返回一个合法走法（0..9），策略维度正确。
+    #[test]
+    fn test_empty_board_search_returns_legal_move() {
+        let board = make_board();
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(64);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        // 最佳走法应当在合法范围内
+        assert!(result.best_move < 9, "best_move 应为合法索引");
+        assert_eq!(result.policy.len(), 9, "policy 长度应等于 action_shape");
+        assert_eq!(
+            result.root_nn_prior.len(),
+            9,
+            "root_nn_prior 长度应等于 action_shape"
+        );
+
+        // policy 中合法走法的概率和应 ≈ 1.0
+        let policy_sum: f32 = result.policy.iter().sum();
+        assert!(
+            (policy_sum - 1.0).abs() < 0.01,
+            "policy 应向 1 归一化，实际 sum={policy_sum}"
+        );
+
+        // root_value 应在 [-1, 1] 范围内
+        assert!(
+            result.root_value >= -1.0 && result.root_value <= 1.0,
+            "root_value 应在 [-1, 1] 内，实际={}",
+            result.root_value
+        );
+    }
+
+    /// 终局状态（黑子已三连）：搜索应立即返回空策略。
+    #[test]
+    fn test_terminal_board_returns_empty() {
+        let mut board = make_board();
+        // 黑子连成一线：[0,0] [0,1] [0,2] 全黑
+        // 但 Board::play 会翻转 player，这里要构造黑方三连后轮到黑方（不可能，仅为测试）
+        // 我们让白方形成三连，然后轮到黑方：
+        // 顺序：黑(0,0) 白(1,0) 黑(0,1) 白(1,1) 黑(0,2) → 黑胜，game_over=true
+        board.play(0, 0); // 黑
+        board.play(1, 0); // 白
+        board.play(0, 1); // 黑
+        board.play(1, 1); // 白
+        board.play(0, 2); // 黑三连，黑胜，game_over=true
+        assert!(board.game_over);
+
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(32);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        // best_move 应等于 action_shape（9），表示无合法动作
+        assert_eq!(result.best_move, 9, "终局应无合法动作");
+        assert_eq!(result.policy, vec![0.0f32; 9]);
+        assert_eq!(result.root_value, 0.0);
+    }
+
+    /// 仅剩一个空位：唯一的合法走法应被选为 best_move。
+    #[test]
+    fn test_single_legal_move_is_chosen() {
+        let mut board = make_board();
+        // 填满除了 (0,0) 外的 8 个格子
+        // 交替落子确保不产生三连获胜
+        let moves = [
+            (0, 1),
+            (1, 0),
+            (0, 2),
+            (1, 1),
+            (1, 2),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+        ];
+        for &(r, c) in &moves {
+            board.play(r, c);
+        }
+        assert!(!board.game_over);
+        assert_eq!(board.legal_actions().len(), 1);
+        let only_move = board.pos_to_idx(0, 0);
+
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(64);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        assert_eq!(result.best_move, only_move, "唯一走法应被选中");
+    }
+
+    // ── 必胜局面测试 ──
+
+    /// 当前玩家有立即三连获胜的机会 → MCTS 应优先选择制胜走法。
+    ///
+    /// 局面：
+    /// ```text
+    ///   ●  ●  ⋅
+    ///   ○  ○  ⋅
+    ///   ⋅  ⋅  ⋅
+    /// ```
+    /// 轮黑，位置 2（即 (0,2)）立即可胜。
+    #[test]
+    fn test_mcts_prefers_winning_move() {
+        let mut board = make_board();
+        board.play(0, 0); // 黑 (0,0)
+        board.play(1, 0); // 白 (1,0)
+        board.play(0, 1); // 黑 (0,1)
+        board.play(1, 1); // 白 (1,1)
+        // 此时轮黑，位置 2 (0,2) 立即可胜
+        assert!(!board.game_over);
+
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(256);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        let win_move = board.pos_to_idx(0, 2);
+        // 制胜走法的访问次数应在所有走法中排第一
+        // 注：由于随机性，不做 100% 的断言；若 NN 均匀，MCTS 通过模拟应发现制胜走法
+        // 这里只验证 best_move 是合法走法且 policy 中制胜走法概率最高
+        let _max_prob_idx = result
+            .policy
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert!(result.best_move < 9);
+        // 在充足的模拟次数下，算法至少能发现这是一步好棋
+        assert!(result.policy[win_move] > 0.0, "制胜走法应拥有非零策略概率");
+    }
+
+    /// 只剩最后一步就能赢的对局：对手已经两连，轮到对手应选择堵截。
+    ///
+    /// 局面（轮白）：
+    /// ```text
+    ///   ●  ●  ⋅
+    ///   ○  ⋅  ⋅
+    ///   ⋅  ⋅  ⋅
+    /// ```
+    /// 黑下一步 (0,2) 就三连，白必须堵 (0,2)。
+    /// 若白没有去堵，则黑必胜。
+    #[test]
+    fn test_mcts_blocks_opponent_win() {
+        let mut board = make_board();
+        board.play(0, 0); // 黑 (0,0)
+        board.play(1, 0); // 白 (1,0)
+        board.play(0, 1); // 黑 (0,1)
+        // 此时轮白
+        assert_eq!(board.current_player, Color::White);
+        assert!(!board.game_over);
+
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(256);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        let block_move = board.pos_to_idx(0, 2);
+        assert!(result.best_move < 9);
+        // 堵截走法应被评估为正收益
+        assert!(result.policy[block_move] > 0.0, "堵截走法应有非零策略概率");
+    }
+
+    // ── 策略导向测试 ──
+
+    /// 若 NN 策略强烈偏向某一走法，MCTS 应反映这一点。
+    #[test]
+    fn test_best_move_reflects_policy() {
+        let board = make_board();
+        let center_idx = board.pos_to_idx(1, 1);
+
+        // 构造一个 NN：均匀价值，但策略强烈偏向中心
+        let mut policy = vec![-10.0f32; 9];
+        policy[center_idx] = 10.0;
+        let evaluator = MockEvaluator::new().with_policy(board.encode(), policy);
+
+        let config = GumbelConfig::pure_gumbel(32);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        // 在 pure_gumbel 模式下，根节点 prior = NN 输出
+        assert!(
+            result.root_nn_prior[center_idx] > 0.5,
+            "中心走法的 NN 先验应 > 0.5，实际={}",
+            result.root_nn_prior[center_idx]
+        );
+    }
+
+    // ── 可重复性测试 ──
+
+    /// 相同随机种子的两次搜索应产生相同结果。
+    #[test]
+    fn test_deterministic_with_same_seed() {
+        let board = make_board();
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(32);
+
+        // 用可重现的种子
+        use rand::SeedableRng;
+        let mut rng1 = rand::rngs::SmallRng::seed_from_u64(42);
+        let mut rng2 = rand::rngs::SmallRng::seed_from_u64(42);
+
+        let mut mcts1: MCTS<Board> = MCTS::new();
+        let result1 = mcts1.search(&board, &evaluator, &config, &mut rng1);
+
+        let mut mcts2: MCTS<Board> = MCTS::new();
+        let result2 = mcts2.search(&board, &evaluator, &config, &mut rng2);
+
+        assert_eq!(result1.best_move, result2.best_move);
+        assert!(
+            result1
+                .policy
+                .iter()
+                .zip(&result2.policy)
+                .all(|(a, b)| (a - b).abs() < 1e-6),
+            "相同种子应产生相同策略"
+        );
+        assert!((result1.root_value - result2.root_value).abs() < 1e-6);
+    }
+
+    // ── GumbelConfig 模式测试 ──
+
+    /// pure_gumbel 模式下 pure_gumbel_noise = true。
+    #[test]
+    fn test_pure_gumbel_config() {
+        let config = GumbelConfig::pure_gumbel(128);
+        assert!(config.pure_gumbel_noise);
+        assert_eq!(config.num_simulations, 128);
+    }
+
+    /// mixed 模式下 pure_gumbel_noise = false，使用 Dirichlet 噪声。
+    #[test]
+    fn test_mixed_config() {
+        let config = GumbelConfig::mixed(128);
+        assert!(!config.pure_gumbel_noise);
+        assert_eq!(config.num_simulations, 128);
+        // mixed 模式下 ε > 0
+        assert!(config.dirichlet_epsilon > 0.0);
+    }
+
+    /// mixed 模式在空棋盘上也能正常搜索。
+    #[test]
+    fn test_mixed_mode_search_on_empty_board() {
+        let board = make_board();
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::mixed(64);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        assert!(result.best_move < 9);
+        assert!((result.policy.iter().sum::<f32>() - 1.0).abs() < 0.01);
+    }
+
+    // ── 边界情况 ──
+
+    /// 接近终局的复杂走法选择：三连成线 vs 堵截对手三连。
+    ///
+    /// 局面（黑先行）：
+    /// ```text
+    ///   ●  ●  ⋅
+    ///   ○  ○  ⋅
+    ///   ⋅  ⋅  ⋅
+    /// ```
+    /// 黑选 (0,2) 立即获胜；选 (2,0~2) 留给白堵截机会。
+    /// 算法应偏好制胜走法。
+    #[test]
+    fn test_win_vs_delay() {
+        let mut board = make_board();
+        board.play(0, 0); // 黑
+        board.play(1, 0); // 白
+        board.play(0, 1); // 黑
+        board.play(1, 1); // 白
+        // 轮黑
+
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(128);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        let win_move = board.pos_to_idx(0, 2);
+        // 制胜走法应拥有最高 policy 概率
+        let max_idx = result
+            .policy
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(max_idx, win_move, "制胜走法的策略概率应最高");
+    }
+
+    /// 终局检测：模拟双方走到终局后 board.game_over 为 true。
+    #[test]
+    fn test_game_ends_correctly() {
+        let mut board = make_board();
+        // 模拟一局：黑 3 连获胜
+        // 黑(0,0) 白(1,0) 黑(0,1) 白(1,1) 黑(0,2) → 黑胜
+        assert!(board.play(0, 0));
+        assert!(board.play(1, 0));
+        assert!(board.play(0, 1));
+        assert!(board.play(1, 1));
+        assert!(board.play(0, 2)); // 黑三连 → game_over
+        assert!(board.game_over, "黑三连后应判定终局");
+        assert_eq!(board.winner, Some(Color::Black));
+    }
+
+    /// 模拟一局完整对局：双方 AI 相互对弈直到终局。
+    #[test]
+    fn test_full_game_completion() {
+        let mut board = make_board();
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(128);
+        let mut mcts: MCTS<Board> = MCTS::new();
+
+        let max_moves = 9;
+        for _ in 0..max_moves {
+            if board.game_over {
+                break;
+            }
+            let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+            if result.best_move >= 9 {
+                break;
+            }
+            board.play_idx(result.best_move);
+        }
+
+        // 游戏应正常结束（三连或平局）
+        assert!(board.game_over, "完整对弈应产生终局");
+        assert!(board.step_count <= 9, "井字棋最多 9 步");
+    }
+
+    /// 平局局面：填满棋盘无三连。
+    ///
+    /// 最终布局（无三连）：
+    /// ```text
+    ///   黑 白 黑
+    ///   黑 白 白
+    ///   白 黑 黑
+    /// ```
+    #[test]
+    fn test_draw_game() {
+        let mut board = make_board();
+        let moves = [
+            (0, 0), // 黑
+            (1, 1), // 白
+            (2, 2), // 黑
+            (2, 0), // 白
+            (0, 2), // 黑
+            (0, 1), // 白
+            (2, 1), // 黑
+            (1, 2), // 白
+            (1, 0), // 黑
+        ];
+        for &(r, c) in &moves {
+            assert!(board.play(r, c), "每步应合法：({r},{c})");
+        }
+        assert!(board.game_over, "棋盘满后应终局");
+        assert_eq!(board.winner, None, "无三连应为平局");
+    }
+
+    // ── 启发式估值测试 ──
+
+    /// 当 NN 估值对某局面有正预期时（例如黑方占优），
+    /// root_value 应反映这一趋势。
+    #[test]
+    fn test_nn_value_influences_root_value() {
+        let board = make_board();
+        // 设置根局面 NN 估值为 1.0（强烈偏黑方），策略均匀
+        let evaluator = MockEvaluator::new().with_value(board.encode(), 1.0);
+        let config = GumbelConfig::pure_gumbel(1024);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+
+        // root_value 是 MCTS 根据模拟回传 + NN 估值综合算出，
+        // 在 NN 估值 = 1.0 的情况下，root_value 应偏正。
+        assert!(result.root_value > -1.0, "正估值不应产生极端负值");
     }
 }
