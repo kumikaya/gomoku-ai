@@ -75,11 +75,11 @@ pub struct GumbelConfig {
 impl Default for GumbelConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 16,
+            num_simulations: 50,
             sample_size: 16,
             think_batch_size: 8,
             sigma_visit_c: 50.0,
-            sigma_scale_c: 1.0,
+            sigma_scale_c: 0.1,
             pure_gumbel_noise: true,
             select_temperature: 1.0,
             root_policy_temperature: 1.0,
@@ -694,6 +694,10 @@ impl<G: Game> MCTS<G> {
     }
 
     /// Completed Q policy: clean logit + Q-term softmax.
+    ///
+    /// Uses LightZero-style Q rescaling: min-max normalize Q to [0,1],
+    /// then scale by (maxvisit_init + max_n) * value_scale to keep
+    /// Q contribution similar in magnitude to logit (no single term dominates).
     fn build_completed_q_policy(
         &self,
         root_nn_value: f32,
@@ -702,36 +706,65 @@ impl<G: Game> MCTS<G> {
     ) -> (Vec<f32>, f32) {
         let children = &self.root().children;
 
-        let mut pi_sum = 0.0f32;
-        let mut q_sum = 0.0f32;
-        for &c in children.values() {
-            let child = self.node(c);
-            if child.visit_count > 0 {
-                pi_sum += child.prior;
-                q_sum += child.prior * child.q();
-            }
-        }
+        // Collect all children: (action, child_id, q_if_visited, prior)
+        let entries: Vec<(ActionId, usize, Option<f32>, f32)> = children
+            .occupied()
+            .map(|(action, &child_id)| {
+                let child = self.node(child_id);
+                let q = if child.visit_count > 0 {
+                    Some(child.q())
+                } else {
+                    None
+                };
+                (action, child_id, q, child.prior)
+            })
+            .collect();
 
-        let non_visited_value = if pi_sum > 0.0 {
-            1.0 / (1.0 + num_sim as f32) * (root_nn_value + (num_sim as f32 / pi_sum) * q_sum)
+        // Mixed value for unvisited children (LightZero _compute_mixed_value)
+        let priors_q: f32 = entries
+            .iter()
+            .filter(|&&(_, _, q, _)| q.is_some())
+            .map(|&(_, _, _, p)| p)
+            .sum();
+        let prior_weighted_q: f32 = entries
+            .iter()
+            .filter_map(|&(_, _, q, p)| q.map(|v| p * v))
+            .sum();
+        let mixed_value = if priors_q > 0.0 {
+            (root_nn_value + (num_sim as f32 / priors_q) * prior_weighted_q)
+                / (1.0 + num_sim as f32)
         } else {
             root_nn_value
         };
 
-        let max_n = self.max_root_count();
-        let sv = config.sigma_visit_c;
-        let sc = config.sigma_scale_c;
+        // Build completed list: (action, child_id, completed_q)
+        let completed: Vec<(ActionId, usize, f32)> = entries
+            .iter()
+            .map(|&(a, ci, q, _)| (a, ci, q.unwrap_or(mixed_value)))
+            .collect();
+
+        // LightZero Q rescale: min-max normalize to [0,1]
+        let (q_min, q_max) = completed.iter().fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(min, max), &(_, _, v)| (min.min(v), max.max(v)),
+        );
+        let q_gap = (q_max - q_min).max(1e-8);
+
+        // Score = clean_logit + visit_scale * sigma_scale * rescaled_q
+        // LightZero: visit_scale = maxvisit_init + max_n,
+        // effective_scale = visit_scale * value_scale where value_scale << 1
+        let max_n = completed
+            .iter()
+            .map(|&(_, ci, _)| self.node(ci).visit_count_f32())
+            .fold(0.0f32, f32::max);
+        let effective_scale = (config.sigma_visit_c + max_n) * config.sigma_scale_c;
 
         let mut scores: Vec<(ActionId, f32)> = Vec::new();
         let mut max_score = f32::NEG_INFINITY;
-        for (action, &child_id) in children.occupied() {
-            let child = self.node(child_id);
-            let value = if child.visit_count > 0 {
-                child.q()
-            } else {
-                non_visited_value
-            };
-            let score = child.logit_without_noise() + (sv + max_n) * sc * value;
+        for &(action, child_id, q) in &completed {
+            let rescaled_q = (q - q_min) / q_gap;
+            let clean_logit = self.node(child_id).logit_without_noise();
+            let score = clean_logit + effective_scale * rescaled_q;
             scores.push((action, score));
             if score > max_score {
                 max_score = score;
