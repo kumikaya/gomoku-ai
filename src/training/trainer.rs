@@ -4,9 +4,9 @@
 
 use crate::game::board::D4Symmetry;
 use crate::inference::InferenceServer;
-use crate::network::transformer::GomokuNetwork;
 use crate::network::transformer::policy_out_dim;
-use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
+use crate::network::transformer::GomokuNetwork;
+use crate::selfplay::{self_play, PlayRecord, SelfPlayConfig};
 use crate::training::buffer::RolloutBuffer;
 use crate::training::lr_schedule::LrSchedule;
 use crate::training::metrics::{BatchStats, EpochStats, TrainingLogger};
@@ -21,7 +21,7 @@ use burn::{
     grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
     optim::{AdamWConfig, GradientsParams},
-    tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
+    tensor::{activation::log_softmax, Device, FloatDType, Int, Tensor},
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::StdRng;
@@ -69,7 +69,7 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 50,
+            num_simulations: 64,
             games_per_iteration: 64,
             batch_size: 512,
             mini_batches_per_iteration: 100,

@@ -75,7 +75,7 @@ pub struct GumbelConfig {
 impl Default for GumbelConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 50,
+            num_simulations: 64,
             sample_size: 16,
             think_batch_size: 8,
             sigma_visit_c: 50.0,
