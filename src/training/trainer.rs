@@ -4,9 +4,9 @@
 
 use crate::game::board::D4Symmetry;
 use crate::inference::InferenceServer;
-use crate::network::transformer::policy_out_dim;
 use crate::network::transformer::GomokuNetwork;
-use crate::selfplay::{self_play, PlayRecord, SelfPlayConfig};
+use crate::network::transformer::policy_out_dim;
+use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
 use crate::training::buffer::RolloutBuffer;
 use crate::training::lr_schedule::LrSchedule;
 use crate::training::metrics::{BatchStats, EpochStats, TrainingLogger};
@@ -21,7 +21,7 @@ use burn::{
     grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
     optim::{AdamWConfig, GradientsParams},
-    tensor::{activation::log_softmax, Device, FloatDType, Int, Tensor},
+    tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::StdRng;
@@ -98,7 +98,7 @@ impl Default for TrainConfig {
 pub struct Trainer {
     config: TrainConfig,
     device: Device,
-    buffer: RolloutBuffer,
+    buffer: RolloutBuffer<PlayRecord>,
     metrics_logger: TrainingLogger,
 }
 
@@ -109,7 +109,7 @@ impl Trainer {
         Self {
             config,
             device,
-            buffer: RolloutBuffer::new(cap),
+            buffer: RolloutBuffer::<PlayRecord>::new(cap),
             metrics_logger,
         }
     }
@@ -359,20 +359,26 @@ impl Trainer {
         let npos = policy_out_dim(model.board_size);
         let encode_len = model.board_size * model.board_size;
 
-        let num_batches = self.config.mini_batches_per_iteration;
+        let batch_size = self.config.batch_size;
+        let mini_batches_per_iteration = self.config.mini_batches_per_iteration;
+        let num_batches = mini_batches_per_iteration.min(self.buffer.len() / batch_size);
         let pb = ProgressBar::new(num_batches as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("  Training: {bar:40.green/dim} {pos}/{len} batches ({eta})")
                 .unwrap(),
         );
-        let all_indices = self.buffer.sample(rng);
+        // 加权有放回采样，每 batch 独立采样一次
+        let weights: Vec<_> = self.buffer.iter().map(|i| i.sample_weight).collect();
 
-        for chunk in all_indices.chunks(self.config.batch_size).take(num_batches) {
+        for _ in 0..num_batches {
+            let chunk: Vec<_> = self
+                .buffer
+                .sample_batch(batch_size, &weights, rng)
+                .collect();
             let mini_batch: Vec<PlayRecord> = chunk
-                .iter()
-                .map(|&i| {
-                    let record = self.buffer.get(i);
+                .into_iter()
+                .map(|record| {
                     let (state, policy) =
                         symmetry.random_augment(&record.state, &record.policy, rng, identity_prob);
                     PlayRecord {
@@ -383,19 +389,17 @@ impl Trainer {
                     }
                 })
                 .collect();
-            let batch_len = mini_batch.len();
-
             let (flat_states, flat_policies, flat_values) = Self::flatten_batch(&mini_batch, npos);
 
             let state_tensor = Tensor::<2, Int>::from_data(
-                burn::tensor::TensorData::new(flat_states, [batch_len as i32, encode_len as i32]),
+                burn::tensor::TensorData::new(flat_states, [batch_size as i32, encode_len as i32]),
                 train_device,
             );
             let policy_target = Tensor::<1>::from_floats(flat_policies.as_slice(), train_device)
-                .reshape([batch_len, npos]);
+                .reshape([batch_size, npos]);
             let value_target_tensor =
                 Tensor::<1>::from_floats(flat_values.as_slice(), train_device)
-                    .reshape([batch_len, 1]);
+                    .reshape([batch_size, 1]);
             let (policy_logits, value_pred) = model.forward(state_tensor);
 
             let log_probs = log_softmax(policy_logits.clone(), 1);
@@ -409,7 +413,7 @@ impl Trainer {
 
             let val_pred: Vec<f32> = value_pred
                 .clone()
-                .reshape([batch_len])
+                .reshape([batch_size])
                 .cast(FloatDType::F32)
                 .into_data()
                 .to_vec()
@@ -446,7 +450,7 @@ impl Trainer {
                 policy_loss: policy_loss_scalar,
                 value_loss: value_loss_scalar,
                 entropy,
-                batch_size: batch_len,
+                batch_size,
             });
 
             // 反向传播 + 参数更新

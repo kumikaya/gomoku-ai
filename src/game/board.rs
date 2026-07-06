@@ -429,13 +429,8 @@ impl D4Symmetry {
 
         for src in 0..npos {
             new_state[map[src]] = state[src];
-        }
-
-        // 策略分布重排
-        for src in 0..npos {
             new_policy[map[src]] = policy[src];
         }
-
         (new_state, new_policy)
     }
 
