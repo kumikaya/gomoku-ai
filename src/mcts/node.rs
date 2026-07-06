@@ -75,11 +75,11 @@ pub struct GumbelConfig {
 impl Default for GumbelConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 32,
+            num_simulations: 16,
             sample_size: 16,
             think_batch_size: 8,
             sigma_visit_c: 50.0,
-            sigma_scale_c: 3.0,
+            sigma_scale_c: 1.0,
             pure_gumbel_noise: true,
             select_temperature: 1.0,
             root_policy_temperature: 1.0,
@@ -693,7 +693,7 @@ impl<G: Game> MCTS<G> {
             + (config.sigma_visit_c + max_n) * config.sigma_scale_c * var_scale * node.q()
     }
 
-    /// Completed Q policy：用**去噪声** logit + Q 项，再做 softmax。
+    /// Completed Q policy: clean logit + Q-term softmax.
     fn build_completed_q_policy(
         &self,
         root_nn_value: f32,

@@ -49,7 +49,7 @@ pub struct SelfPlayConfig {
 impl Default for SelfPlayConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 32,
+            num_simulations: 16,
             select_temperature: 1.0,
             full_search_prob: 0.4,
             fast_sim_factor: 0.25,

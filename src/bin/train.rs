@@ -15,8 +15,8 @@ struct Cli {
     #[arg(short = 'g', long, default_value = "128")]
     games: usize,
 
-    /// 每次 MCTS 模拟次数（Gumbel Zero 只需 16~64）
-    #[arg(short = 's', long, default_value = "64")]
+    /// 每次 MCTS 模拟次数
+    #[arg(short = 's', long, default_value = "16")]
     simulations: usize,
 
     /// 学习率
@@ -47,7 +47,7 @@ struct Cli {
     #[arg(long, default_value = "20")]
     eval_games: usize,
 
-    /// 评估模拟次数（默认 64）
+    /// 评估模拟次数
     #[arg(long, default_value = "64")]
     eval_simulations: usize,
 

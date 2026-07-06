@@ -69,7 +69,7 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 32,
+            num_simulations: 16,
             games_per_iteration: 64,
             batch_size: 512,
             mini_batches_per_iteration: 100,
