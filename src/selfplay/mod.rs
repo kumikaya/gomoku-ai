@@ -1,12 +1,6 @@
 //! 自对弈数据生成
 //!
 //! 使用 MCTS (Gumbel Zero) 指导双方走棋，生成 (状态, 策略, 价值) 训练样本。
-//!
-//! Playout Cap Randomization (KataGo): 每步随机决定做"完整搜索"还是"快速搜索"。
-//! - 完整搜索: num_simulations 全量模拟 → 产生训练样本 + 选择走法
-//! - 快速搜索: fast_sim_factor * num_simulations → 仅用于选择走法推进棋局，不产生样本
-//!
-//! 对齐 KataGo: cheapSearchTargetWeight=0 → 快速搜索的样本不写入训练数据。
 
 use crate::game::board::{Board, Color};
 use crate::inference::Evaluator;
@@ -22,7 +16,6 @@ pub struct PlayRecord {
     /// 仅完整搜索产生样本，权重即 KL 值。写入时按权重复制多份 (KataGo frequency weighting).
     pub sample_weight: f32,
     /// 走这步棋的玩家（仅用于自对弈结束后用游戏结果修正 value，不参与训练）。
-    #[doc(hidden)]
     pub player: Color,
 }
 
@@ -40,10 +33,6 @@ impl SelfPlayGame {
 pub struct SelfPlayConfig {
     pub num_simulations: usize,
     pub select_temperature: f32,
-    /// 完整搜索概率 (0.0-1.0)，其余步做快速搜索仅用于推进棋局不产生样本。
-    pub full_search_prob: f32,
-    /// 快速搜索的模拟数比例 (相对于 num_simulations).
-    pub fast_sim_factor: f32,
 }
 
 impl Default for SelfPlayConfig {
@@ -51,15 +40,11 @@ impl Default for SelfPlayConfig {
         Self {
             num_simulations: 64,
             select_temperature: 1.0,
-            full_search_prob: 0.4,
-            fast_sim_factor: 0.25,
         }
     }
 }
 
-/// 运行一局自对弈。
-///
-/// 完整搜索 → 产生训练样本；快速搜索 → 仅推进棋局。
+/// 运行一局自对弈。每一步都产生训练样本。
 pub fn self_play<E: Evaluator>(
     evaluator: &E,
     config: &SelfPlayConfig,
@@ -70,30 +55,20 @@ pub fn self_play<E: Evaluator>(
     let mut mcts = MCTS::new();
 
     loop {
-        let is_full_search = rng.random::<f32>() < config.full_search_prob;
-        let sims = if is_full_search {
-            config.num_simulations
-        } else {
-            (config.num_simulations as f32 * config.fast_sim_factor).max(1.0) as usize
-        };
-
-        let mut search_config = GumbelConfig::pure_gumbel(sims);
+        let mut search_config = GumbelConfig::pure_gumbel(config.num_simulations);
         search_config.select_temperature = config.select_temperature;
 
         let result = mcts.search(&board, evaluator, &search_config, rng);
 
-        // 仅完整搜索产生训练样本 (对齐 KataGo cheapSearchTargetWeight=0)
-        if is_full_search {
-            let kl = compute_kl(&result.root_nn_prior, &result.policy);
-            records.push(PlayRecord {
-                state: board.encode_state(),
-                policy: result.policy,
-                // 先写入 MCTS root value 作为占位，游戏结束后用最终结果修正
-                value: 0.0,
-                sample_weight: kl,
-                player: board.current_player,
-            });
-        }
+        let kl = compute_kl(&result.root_nn_prior, &result.policy);
+        records.push(PlayRecord {
+            state: board.encode_state(),
+            policy: result.policy,
+            // 先写入 MCTS root value 作为占位，游戏结束后用最终结果修正
+            value: 0.0,
+            sample_weight: kl,
+            player: board.current_player,
+        });
 
         board.play_idx(result.best_move);
 
