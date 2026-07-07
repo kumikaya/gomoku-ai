@@ -24,8 +24,8 @@ ndarray = "0.17.2"
 rand = "0.10.1"
 rand_distr = "0.6.0"
 ratatui = "0.30.2"
-
 serde = "1.0.228"
+smart-default = "0.7.1"
 
 [profile.dev.package."*"]
 opt-level = 3

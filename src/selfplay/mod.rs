@@ -6,14 +6,16 @@ use crate::game::board::{Board, Color};
 use crate::inference::Evaluator;
 use crate::mcts::node::{GumbelConfig, MCTS};
 use rand::RngExt;
+use smart_default::SmartDefault;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, SmartDefault)]
 pub struct PlayRecord {
     pub state: Vec<i32>,
     pub policy: Vec<f32>,
     pub value: f32,
     /// 训练样本权重 (Policy Surprise = KL(nn_prior || mcts_posterior)).
     /// 仅完整搜索产生样本，权重即 KL 值。写入时按权重复制多份 (KataGo frequency weighting).
+    #[default = 1.0]
     pub sample_weight: f32,
     /// 走这步棋的玩家（仅用于自对弈结束后用游戏结果修正 value，不参与训练）。
     pub player: Color,
@@ -67,7 +69,7 @@ pub async fn self_play<E: Evaluator>(
             policy: result.policy,
             // 先写入 MCTS root value 作为占位，游戏结束后用最终结果修正
             value: result.root_value,
-            sample_weight: kl,
+            sample_weight: 1.0 + kl,
             player: board.current_player,
         });
 

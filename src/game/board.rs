@@ -51,9 +51,9 @@ pub struct Board {
 
 impl Board {
     /// 默认棋盘边长
-    pub const DEFAULT_BOARD_SIZE: usize = 6;
+    pub const DEFAULT_BOARD_SIZE: usize = 3;
     /// 默认获胜所需连子数
-    pub const DEFAULT_WIN_LENGTH: usize = 4;
+    pub const DEFAULT_WIN_LENGTH: usize = 3;
 
     /// 创建默认棋盘（使用默认边长和默认获胜连子数）。
     pub fn new() -> Self {
