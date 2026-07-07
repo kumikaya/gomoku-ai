@@ -75,7 +75,6 @@ struct AnalyzeResultData {
     mcts_q: Vec<f32>,
     mcts_visits: Vec<u32>,
     mcts_policy: Vec<f32>,
-    root_value: f32,
 }
 
 /// 输入模拟次数的浮层
@@ -269,7 +268,6 @@ async fn run_analysis<E: Evaluator>(state: &mut AnalyzeState, evaluator: &E) {
         mcts_q: result.children_q,
         mcts_visits: result.children_visits,
         mcts_policy: result.policy,
-        root_value: result.root_value,
     });
 
     if total_visits == 0 {
@@ -316,10 +314,6 @@ fn render(frame: &mut Frame, state: &AnalyzeState, sim_overlay: &SimInputOverlay
     // 如果计算中且无结果，不渲染侧边栏
     if !state.computing {
         if let Some(ref result) = state.current_result {
-            // 按总模拟次数归一化 access counts → 百分比
-            let total: u32 = result.mcts_visits.iter().sum();
-            let total = total.max(1);
-
             // 在右侧区域打印当前光标指向格子的数值
             let idx = state.board.pos_to_idx(state.cursor_row, state.cursor_col);
             let info = format!(
@@ -343,7 +337,6 @@ fn render(frame: &mut Frame, state: &AnalyzeState, sim_overlay: &SimInputOverlay
                 .style(Style::default().fg(TuiColor::Cyan));
 
             // 放在棋盘区域的右下角或右侧
-            let npos = state.board_size * state.board_size;
             let board_width = (state.board_size * 3 + 1) as u16;
             let x_rem = area.width.saturating_sub(board_width);
             let info_rect = Rect {

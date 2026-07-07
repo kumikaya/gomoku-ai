@@ -162,10 +162,16 @@ impl<G: Game> Node<G> {
         self.visit_count as f32
     }
 
-    /// 父节点视角的平均 Q 值（PUCT / completedQ / 所有外部读取的正确视角）。
-    ///
-    /// 由于 `total_value` 按节点自身视角存储，而外部读取者总是父节点，
-    /// 因此返回 `-q_self()` 以自然翻转为父节点视角。
+    /// 节点自身视角的均值（不翻转，用于 getNormalizedMean）。
+    #[inline]
+    pub fn mean_self(&self) -> f32 {
+        if self.visit_count > 0 {
+            self.total_value / self.visit_count as f32
+        } else {
+            0.0
+        }
+    }
+
     #[inline]
     /// 父节点视角的平均 Q 值。
     ///
@@ -173,7 +179,7 @@ impl<G: Game> Node<G> {
     /// 零和对弈取反，单智能体可保持原值。
     pub fn q(&self) -> f32 {
         if self.visit_count > 0 {
-            G::flip_perspective(self.total_value / self.visit_count as f32)
+            G::flip_perspective(self.mean_self())
         } else {
             0.0
         }
@@ -212,6 +218,10 @@ impl<G: Game> Node<G> {
 
 pub struct MCTS<G: Game> {
     pub arena: Vec<Node<G>>,
+    /// minizero tree_value_bound: 全局值下界，用于 getNormalizedMean
+    pub value_min: f32,
+    /// minizero tree_value_bound: 全局值上界，用于 getNormalizedMean
+    pub value_max: f32,
 }
 
 /// 单次搜索返回结果
@@ -236,7 +246,11 @@ pub struct SearchResult {
 // 暂存本轮每个 walk 的上下文
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
-        Self { arena: Vec::new() }
+        Self {
+            arena: Vec::new(),
+            value_min: f32::INFINITY,
+            value_max: f32::NEG_INFINITY,
+        }
     }
 
     #[inline]
@@ -263,6 +277,8 @@ impl<G: Game> MCTS<G> {
         self.arena.clear();
         self.arena
             .push(Node::new(0.0, 0.0, 0.0, player, action_shape));
+        self.value_max = f32::NEG_INFINITY;
+        self.value_min = f32::INFINITY;
     }
 
     fn push_node(&mut self, node: Node<G>) -> NodeId {
@@ -420,7 +436,7 @@ impl<G: Game> MCTS<G> {
         }
 
         let num_sim = config.num_simulations;
-        let sample_n = config.sample_size;
+        let sample_n = config.sample_size.min(legal_moves.len());
 
         // ── Phase 1: 根节点 NN 评估 ──
         let root_encoding = game.encode();
@@ -559,15 +575,19 @@ impl<G: Game> MCTS<G> {
                     cur_sample /= 2;
                     let max_n = self.max_root_count();
                     candidates.sort_by(|&(_, a), &(_, b)| {
-                        let sa = Self::sigma_score(self.node(a), max_n, config);
-                        let sb = Self::sigma_score(self.node(b), max_n, config);
+                        let sa = self.sigma_score(self.node(a), max_n, config);
+                        let sb = self.sigma_score(self.node(b), max_n, config);
                         sb.partial_cmp(&sa).unwrap()
                     });
                     if candidates.len() > cur_sample {
                         candidates.truncate(cur_sample);
                     }
-                    let (_, child_id) = candidates[0];
-                    let base = self.node(child_id).visit_count;
+                    // 用剩余候选中的最小访问数作为基准
+                    let base = candidates
+                        .iter()
+                        .map(|&(_, ci)| self.node(ci).visit_count)
+                        .min()
+                        .unwrap();
                     sim_budget = base + next_budget;
                 }
             }
@@ -581,7 +601,7 @@ impl<G: Game> MCTS<G> {
         let mut children_visits = vec![0u32; action_shape];
         for (action, &child_id) in self.root().children.occupied() {
             let node = self.node(child_id);
-            children_q[action] = node.q();
+            children_q[action] = self.normalized_q(node);
             children_visits[action] = node.visit_count;
         }
 
@@ -621,8 +641,21 @@ impl<G: Game> MCTS<G> {
             .fold(0.0, f32::max)
     }
 
-    /// σ-score：带噪声 logit + Q 项。
-    fn sigma_score(node: &Node<G>, max_n: f32, config: &GumbelConfig) -> f32 {
+    /// minizero getNormalizedMean: global min-max rescale self-perspective
+    /// mean to [-1,1], then flip to parent perspective.
+    #[inline]
+    fn normalized_q(&self, node: &Node<G>) -> f32 {
+        if node.visit_count == 0 {
+            return 0.0;
+        }
+        let gap = (self.value_max - self.value_min).max(1e-8);
+        let v = (node.mean_self() - self.value_min) / gap; // [0, 1]
+        let v = (2.0 * v - 1.0).clamp(-1.0, 1.0); // [-1, 1]
+        G::flip_perspective(v) // flip to parent perspective
+    }
+
+    /// σ-score：带噪声 logit + normalized Q 项。
+    fn sigma_score(&self, node: &Node<G>, max_n: f32, config: &GumbelConfig) -> f32 {
         if node.visit_count == 0 {
             return f32::NEG_INFINITY;
         }
@@ -632,7 +665,10 @@ impl<G: Game> MCTS<G> {
             1.0
         };
         node.policy_logit
-            + (config.sigma_visit_c + max_n) * config.sigma_scale_c * var_scale * node.q()
+            + (config.sigma_visit_c + max_n)
+                * config.sigma_scale_c
+                * var_scale
+                * self.normalized_q(node)
     }
 
     /// Completed Q policy (minizero-style): clean logit + Q-term softmax.
@@ -646,13 +682,13 @@ impl<G: Game> MCTS<G> {
     ) -> (Vec<f32>, f32) {
         let children = &self.root().children;
 
-        // Collect all children: (action, child_id, q_if_visited, prior)
+        // Collect all children: (action, child_id, normalized_q_if_visited, prior)
         let entries: Vec<(ActionId, usize, Option<f32>, f32)> = children
             .occupied()
             .map(|(action, &child_id)| {
                 let child = self.node(child_id);
                 let q = if child.visit_count > 0 {
-                    Some(child.q())
+                    Some(self.normalized_q(child))
                 } else {
                     None
                 };
@@ -720,7 +756,7 @@ impl<G: Game> MCTS<G> {
                 .values()
                 .map(|&ci| {
                     let child = self.node(ci);
-                    child.visit_count_f32() / sum_n * child.q()
+                    child.visit_count_f32() / sum_n * self.normalized_q(child)
                 })
                 .sum()
         } else {
@@ -740,7 +776,7 @@ impl<G: Game> MCTS<G> {
             .filter_map(|(_, c)| c.copied())
             .max_by_key(|ci| self.node(*ci).visit_count);
         let threshold_q = max_count_child
-            .map(|ci| self.node(ci).q() - 0.1)
+            .map(|ci| self.normalized_q(self.node(ci)) - 0.1)
             .unwrap_or(f32::NEG_INFINITY);
 
         let probs: Vec<f64> = children
@@ -748,7 +784,7 @@ impl<G: Game> MCTS<G> {
             .map(|(_, c)| {
                 if let Some(ci) = c {
                     let child = self.node(*ci);
-                    if child.visit_count == 0 || child.q() < threshold_q {
+                    if child.visit_count == 0 || self.normalized_q(child) < threshold_q {
                         0.0
                     } else {
                         (child.visit_count as f64).powf(1.0 / temperature as f64)
@@ -781,6 +817,9 @@ impl<G: Game> MCTS<G> {
     fn backprop_path(&mut self, path: &[NodeId], mut value: f32) {
         for &node_idx in path.iter().rev() {
             self.node_mut(node_idx).add_visit(value);
+            let m = self.node(node_idx).mean_self();
+            self.value_min = self.value_min.min(m);
+            self.value_max = self.value_max.max(m);
             value = G::flip_perspective(value);
         }
     }
