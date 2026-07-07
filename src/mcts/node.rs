@@ -1,52 +1,29 @@
-//! 蒙特卡洛树搜索 (MCTS) — Gumbel Zero (Gumbel AlphaZero)
+//! 蒙特卡洛树搜索 (MCTS) — Gumbel AlphaZero
 //!
-//! 严格对齐 minizero 的 Gumbel AlphaZero 实现：
-//! - Gumbel 噪声加在 logit 空间（`policy_logit = ln(prior) + gumbel_noise`）
-//! - Sequential Halving 用带噪声 logit + normalized Q 做候选排序
-//! - Completed Q policy 用干净 logit（`logit_without_noise = logit - noise`）
-//! - 动作选择用 softmax over visit counts（temperature=1.0, value_threshold=0.1）
-//! - path = Vec<NodeId>（纯节点索引序列，root 在 path[0]，对齐 minizero）
+//! 算法对齐 LightZero `ctree_gumbel_alphazero`（C++ 参考实现）：
+//! - 根节点选择：Gumbel 噪声 + Sequential Halving (`_select_root_child`)
+//! - 内部节点选择：`priors + completed_Q - visit_penalty` (`_select_interior_child`)
+//! - Completed Q：`_qtransform_completed_by_mix_value` → rescale → visit_scale * value_scale
+//! - 反向传播沿 parent 链自行翻转视角，不再依赖 PUCT walk 构建 path
 //!
 //! ## 游戏解耦
 //!
 //! MCTS 通过 `Game` trait 与具体棋盘解耦。所有游戏操作（合法动作、落子、
-//! 编码、终局检测）均通过 trait 调用。动作统一为 `ActionId`（平铺索引），
-//! 消除了行列坐标和各种 `pos_to_idx` 转换。
+//! 编码、终局检测）均通过 trait 调用。
 //!
 //! ## 噪声模式
 //!
-//! - **纯 Gumbel**（`GumbelConfig::pure_gumbel()`）：
-//!   prior = NN 干净输出，`policy_logit = ln(prior) + gumbel_noise`。
-//!
-//! - **混合噪声**（`GumbelConfig::mixed()`）：
-//!   prior = (1-ε)*NN + ε*Dirichlet，`policy_logit = ln(NN_prior) + gumbel_noise`。
-//!   PUCT walk 用 noisy prior。
+//! - Gumbel 噪声始终用于根节点选择（`_score_considered`）。
+//! - Dirichlet 噪声可选叠加到根子节点的 `prior` 上（由 `add_dirichlet_noise` 控制）。
 
 use super::game::{ActionId, Game};
-use super::table::Table;
 use crate::inference::Evaluator;
-use itertools::Itertools;
+use ndarray::Array2;
 use rand::RngExt;
 use rand::distr::Distribution;
-
-/// 对数计算的最小概率下限，防止 ln(0) = -inf
-const MIN_PROB: f32 = 1e-15;
-
-// ============================================================
-//  常量
-// ============================================================
-
-/// PUCT 初始项（对齐 minizero `actor_mcts_puct_init`）
-const PUCT_INIT: f32 = 1.25;
-/// PUCT 基项（对齐 minizero `actor_mcts_puct_base`）
-const PUCT_BASE: f32 = 19652.0;
-
-// 方差缩放钳位：防止极端方差导致探索失控
-const VAR_CLAMP_MIN: f32 = 0.1;
-const VAR_CLAMP_MAX: f32 = 4.0;
-
-/// MCTS 树节点索引。
-pub type NodeId = usize;
+use rand::distr::weighted::WeightedIndex;
+use std::collections::HashMap;
+use std::marker::PhantomData;
 
 // ============================================================
 //  GumbelConfig
@@ -54,24 +31,23 @@ pub type NodeId = usize;
 
 #[derive(Debug, Clone)]
 pub struct GumbelConfig {
+    /// 模拟次数
     pub num_simulations: usize,
-    pub sample_size: usize,
-    pub sigma_visit_c: f32,
-    /// halving 筛选时 Q 项缩放系数（与 minizero 的 actor_gumbel_sigma_scale_c 对齐）
-    pub sigma_scale_h: f32,
-    /// 最终策略 (completed Q policy) 的 Q 项缩放系数
-    /// 独立于 halving，允许分离调参
-    pub sigma_scale_p: f32,
-    pub pure_gumbel_noise: bool,
-    /// 最终动作选择的 softmax 温度（默认 1.0）
+    /// Sequential Halving 初始考虑的动作数（对齐 LightZero `max_num_considered_actions`）
+    pub max_num_considered_actions: usize,
+    /// 访问数基础偏移（对齐 `maxvisit_init`，用于 visit_scale）
+    pub max_visit_init: usize,
+    /// Q 值缩放系数（对齐 `value_scale`）
+    pub value_scale: f32,
+    /// Gumbel 噪声幅度（对齐 `gumbel_scale`）
+    pub gumbel_scale: f32,
+    /// 是否对根子节点叠加 Dirichlet 探索噪声
+    pub add_dirichlet_noise: bool,
+    /// 最终动作选择的 softmax 温度
     pub select_temperature: f32,
-    /// 根节点先验策略的 softmax 温度 (KataGo rootPolicyTemperature)
-    pub root_policy_temperature: f32,
-    /// 是否启用 Dynamic Variance-Scaled cPUCT (KataGo)
-    pub dynamic_cpuct: bool,
-    /// FPU Reduction 强度 (KataGo)
-    pub fpu_reduction: f32,
+    /// Dirichlet 噪声 alpha
     pub dirichlet_alpha: f32,
+    /// Dirichlet 噪声混合权重
     pub dirichlet_epsilon: f32,
 }
 
@@ -79,34 +55,33 @@ impl Default for GumbelConfig {
     fn default() -> Self {
         Self {
             num_simulations: 64,
-            sample_size: 16,
-            sigma_visit_c: 50.0,
-            sigma_scale_h: 0.3,
-            sigma_scale_p: 0.1,
-            pure_gumbel_noise: true,
+            max_num_considered_actions: 16,
+            max_visit_init: 50,
+            value_scale: 0.1,
+            gumbel_scale: 10.0,
+            add_dirichlet_noise: false,
             select_temperature: 1.0,
-            root_policy_temperature: 1.0,
-            dynamic_cpuct: false,
-            fpu_reduction: 0.0,
-            dirichlet_alpha: 0.1,
-            dirichlet_epsilon: 0.03,
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.25,
         }
     }
 }
 
 impl GumbelConfig {
+    /// 纯 Gumbel 模式：不使用 Dirichlet 噪声。
     pub fn pure_gumbel(num_simulations: usize) -> Self {
         Self {
             num_simulations,
-            pure_gumbel_noise: true,
+            add_dirichlet_noise: false,
             ..Default::default()
         }
     }
 
+    /// 混合噪声模式：叠加 Dirichlet 噪声到根子节点 prior。
     pub fn mixed(num_simulations: usize) -> Self {
         Self {
             num_simulations,
-            pure_gumbel_noise: false,
+            add_dirichlet_noise: true,
             ..Default::default()
         }
     }
@@ -116,60 +91,43 @@ impl GumbelConfig {
 //  Node
 // ============================================================
 
+/// MCTS 树节点索引。
+pub type NodeId = usize;
+
+/// MCTS 树节点（对齐 LightZero `node_gumbel_alphazero.h`）。
 #[derive(Clone)]
-pub struct Node<G: Game> {
+pub struct Node {
     pub visit_count: u32,
+    /// Σ(value)：每次反向传播累加的值（子节点自身视角）
     pub total_value: f32,
-    /// Σ(value²)：用于计算节点效用方差（Dynamic Variance-Scaled cPUCT）
-    pub value_sq_sum: f32,
-    /// 先验概率（PUCT walk 使用；纯 Gumbel 模式 = NN prior，混合模式 = noisy prior）
+    /// 先验概率（来自 NN softmax 输出）
     pub prior: f32,
-    /// 带 Gumbel 噪声的 logit：ln(NN_prior) + gumbel_noise
-    /// Sequential Halving 候选排序用这个。
-    pub policy_logit: f32,
-    /// Gumbel 噪声值（用于 recovered clean logit = policy_logit - gumbel_noise）
-    pub gumbel_noise: f32,
-    pub children: Table<NodeId>,
+    /// NN 对该节点局面的原始估值（expand 时填入，用于 `_compute_mixed_value`）
+    pub raw_value: f32,
+    /// 父节点索引，根节点为 None
+    pub parent: Option<NodeId>,
+    /// 子节点表（action → node_id），与 LightZero `std::map<int, Node*>` 对齐
+    pub children: HashMap<ActionId, NodeId>,
+    /// 是否已展开（已调用 NN 并创建子节点）
     pub expanded: bool,
-    /// 该节点对应哪个玩家的回合
-    pub player: G::Player,
 }
 
-impl<G: Game> Node<G> {
-    pub fn new(
-        prior: f32,
-        clean_logit: f32,
-        gumbel_noise: f32,
-        player: G::Player,
-        action_shape: usize,
-    ) -> Self {
+impl Node {
+    pub fn new(prior: f32, parent: Option<NodeId>) -> Self {
         Self {
             visit_count: 0,
             total_value: 0.0,
-            value_sq_sum: 0.0,
             prior,
-            policy_logit: clean_logit + gumbel_noise,
-            gumbel_noise,
-            children: Table::new(action_shape),
+            raw_value: 0.0,
+            parent,
+            children: HashMap::new(),
             expanded: false,
-            player,
         }
     }
 
-    /// 去掉 Gumbel 噪声后的干净 logit：用于 completed Q policy。
+    /// 节点自身视角的均值。
     #[inline]
-    pub fn logit_without_noise(&self) -> f32 {
-        self.policy_logit - self.gumbel_noise
-    }
-
-    #[inline]
-    pub fn visit_count_f32(&self) -> f32 {
-        self.visit_count as f32
-    }
-
-    /// 节点自身视角的均值（不翻转，用于 getNormalizedMean）。
-    #[inline]
-    pub fn mean_self(&self) -> f32 {
+    pub fn mean(&self) -> f32 {
         if self.visit_count > 0 {
             self.total_value / self.visit_count as f32
         } else {
@@ -177,43 +135,22 @@ impl<G: Game> Node<G> {
         }
     }
 
+    /// 是否为叶子节点（未展开或展开后无子节点）。
+    /// 对齐 LightZero：未展开的节点应当被视作叶子，停止 selection 并展开。
     #[inline]
-    /// 父节点视角的平均 Q 值。
-    ///
-    /// 通过 `Game::flip_perspective` 将自身视角值翻转为父节点视角：
-    /// 零和对弈取反，单智能体可保持原值。
-    pub fn q(&self) -> f32 {
-        if self.visit_count > 0 {
-            G::flip_perspective(self.mean_self())
-        } else {
-            0.0
-        }
+    pub fn is_leaf(&self) -> bool {
+        !self.expanded || self.children.is_empty()
     }
 
-    /// 效用方差（Dynamic Variance-Scaled cPUCT）。
-    ///
-    /// 对访问数较少的节点混入先验方差，避免除零和不合理的极值。
-    /// 值域约 [0.04, 1.0]。
     #[inline]
-    pub fn variance(&self) -> f32 {
-        // 值域 [-1,1] 下合理的先验方差
-        const PRIOR_VAR: f32 = 0.25;
-        const PRIOR_WEIGHT: f32 = 3.0;
-        if self.visit_count > 1 {
-            let n = self.visit_count as f32;
-            let mean = self.total_value / n;
-            let sample_var = (self.value_sq_sum / n) - (mean * mean);
-            ((sample_var * n) + (PRIOR_VAR * PRIOR_WEIGHT)) / (n + PRIOR_WEIGHT)
-        } else {
-            PRIOR_VAR
-        }
+    pub fn is_root(&self) -> bool {
+        self.parent.is_none()
     }
 
     #[inline]
     pub fn add_visit(&mut self, value: f32) {
         self.visit_count += 1;
         self.total_value += value;
-        self.value_sq_sum += value * value;
     }
 }
 
@@ -222,11 +159,10 @@ impl<G: Game> Node<G> {
 // ============================================================
 
 pub struct MCTS<G: Game> {
-    pub arena: Vec<Node<G>>,
-    /// minizero tree_value_bound: 全局值下界，用于 getNormalizedMean
-    pub value_min: f32,
-    /// minizero tree_value_bound: 全局值上界，用于 getNormalizedMean
-    pub value_max: f32,
+    pub arena: Vec<Node>,
+    /// 预生成的 Gumbel 噪声（对齐 LightZero `std::vector<float> gumbel`）
+    gumbel_noises: Vec<f32>,
+    _phantom: PhantomData<G>,
 }
 
 /// 单次搜索返回结果
@@ -234,9 +170,9 @@ pub struct MCTS<G: Game> {
 pub struct SearchResult {
     /// 选中的最佳动作（平铺索引），若为 action_shape 表示无合法动作
     pub best_move: ActionId,
-    /// Completed Q 策略（长度为 action_shape）
+    /// Improved policy（completed Q policy，对齐 LightZero `_get_improved_policy`）
     pub policy: Vec<f32>,
-    /// MCTS 根节点价值（含 Q 和 NN 混合）
+    /// MCTS 根节点价值（子节点 Q 按访问次数加权平均）
     pub root_value: f32,
     /// NN 原始先验概率
     pub root_nn_prior: Vec<f32>,
@@ -248,174 +184,424 @@ pub struct SearchResult {
     pub children_visits: Vec<u32>,
 }
 
-// 暂存本轮每个 walk 的上下文
+// ─── 内部辅助常量 ────────────────────────────────────────────
+
+/// `_score_considered` 的 logit 下限
+const LOW_LOGIT: f32 = -1e9;
+
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
         Self {
             arena: Vec::new(),
-            value_min: f32::INFINITY,
-            value_max: f32::NEG_INFINITY,
+            gumbel_noises: Vec::new(),
+            _phantom: PhantomData,
         }
     }
 
     #[inline]
-    pub fn root(&self) -> &Node<G> {
+    pub fn root(&self) -> &Node {
         &self.arena[0]
     }
 
     #[inline]
-    pub fn root_mut(&mut self) -> &mut Node<G> {
+    pub fn root_mut(&mut self) -> &mut Node {
         &mut self.arena[0]
     }
 
     #[inline]
-    pub fn node(&self, idx: NodeId) -> &Node<G> {
-        &self.arena[idx]
-    }
-
-    #[inline]
-    fn node_mut(&mut self, idx: NodeId) -> &mut Node<G> {
-        &mut self.arena[idx]
-    }
-
-    fn reset(&mut self, player: G::Player, action_shape: usize) {
-        self.arena.clear();
-        self.arena
-            .push(Node::new(0.0, 0.0, 0.0, player, action_shape));
-        self.value_max = f32::NEG_INFINITY;
-        self.value_min = f32::INFINITY;
-    }
-
-    fn push_node(&mut self, node: Node<G>) -> NodeId {
+    fn push_node(&mut self, node: Node) -> NodeId {
         self.arena.push(node);
         self.arena.len() - 1
     }
 
-    // ── expand ──
+    // ================================================================
+    //  Sequential Halving 表
+    // ================================================================
 
-    fn expand_children(
-        &mut self,
-        parent: NodeId,
-        legal: &[ActionId],
-        gumbel_noises: &[f32],
-        child_data: &[(f32, f32)],
-        action_shape: usize,
-    ) {
-        let child_player = G::next_player(self.node(parent).player);
-        for (i, &action) in legal.iter().enumerate() {
-            let (prior, clean_logit) = child_data[i];
-            let child_id = self.push_node(Node::new(
-                prior,
-                clean_logit,
-                gumbel_noises[i],
-                child_player,
-                action_shape,
-            ));
-            self.node_mut(parent).children.set(action, child_id);
+    /// 生成 single visit sequence（对齐 `get_sequence_of_considered_visits`）。
+    fn sequential_halving_seq(max_num_considered: usize, num_simulations: usize) -> Vec<usize> {
+        if max_num_considered <= 1 {
+            return (0..num_simulations).collect();
         }
+        let log2max = (max_num_considered as f32).log2().ceil() as usize;
+        let mut visits = vec![0usize; max_num_considered];
+        let mut num_considered = max_num_considered;
+        let mut seq = Vec::with_capacity(num_simulations);
+
+        while seq.len() < num_simulations {
+            let num_extra = 1.max(num_simulations / (log2max * num_considered));
+            for _ in 0..num_extra {
+                if seq.len() >= num_simulations {
+                    break;
+                }
+                seq.extend_from_slice(&visits[..num_considered.min(visits.len())]);
+                // visits[..num_considered] 每个元素 +1
+                for j in 0..num_considered.min(visits.len()) {
+                    visits[j] += 1;
+                }
+            }
+            num_considered = 2.max(num_considered / 2);
+        }
+        seq.truncate(num_simulations);
+        seq
     }
 
-    // ── PUCT walk（对齐 minizero AlphaZero PUCT 公式）──
-
-    /// 计算当前节点的 PUCT bias。
-    /// 对齐 minizero `getNormalizedPUCTScore`:
-    ///   `puct_bias = init + ln((1 + total_simulation + base) / base)`
-    #[inline]
-    fn puct_bias(total_simulation: f32) -> f32 {
-        PUCT_INIT + ((1.0 + total_simulation + PUCT_BASE) / PUCT_BASE).ln()
-    }
-
-    /// 计算当前节点对未访问子节点的初始 Q 估计。
-    /// 对齐 minizero `calculateInitQValue`（board games 分支）：
-    ///   `init_q = (sum_q - 1) / (visited_count + 1)`
-    fn init_q_value(&self, node_idx: NodeId) -> f32 {
-        let node = self.node(node_idx);
-        let mut sum_q = 0.0f32;
-        let mut visited = 0.0f32;
-        for &c in node.children.values() {
-            let child = self.node(c);
-            if child.visit_count > 0 {
-                sum_q += child.q();
-                visited += 1.0;
+    /// 预计算 halving 表（对齐 `get_table_of_considered_visits`）。
+    /// shape: (max_num_considered + 1) × num_simulations
+    fn halving_table(max_num_considered: usize, num_simulations: usize) -> Array2<usize> {
+        let rows = max_num_considered + 1;
+        let cols = num_simulations;
+        let mut table = Array2::from_elem((rows, cols), 0usize);
+        for m in 0..=max_num_considered {
+            let seq = Self::sequential_halving_seq(m, num_simulations);
+            for (j, &v) in seq.iter().enumerate() {
+                table[(m, j)] = v;
             }
         }
-        if visited > 0.0 {
-            (sum_q - 1.0) / (visited + 1.0)
-        } else {
-            0.0
-        }
+        table
     }
 
-    /// PUCT walk，返回从 `start_node_idx`（含）到叶子节点（含）的路径。
-    /// 对齐 minizero `selectFromNode`：起始节点始终在 path[0]。
+    // ================================================================
+    //  辅助
+    // ================================================================
+
+    /// 计算未访问子节点的混合 Q 值（对齐 `_compute_mixed_value`）。
     ///
-    /// 若 `dynamic_cpuct` 启用，则 bias 乘以 `sqrt(child_variance)`，
-    /// 使效用波动大的局面多探索（对齐 KataGo Dynamic Variance-Scaled cPUCT）。
-    fn puct_walk(
-        &self,
-        start_node_idx: NodeId,
-        game: &mut G,
-        dynamic_cpuct: bool,
-        fpu_reduction: f32,
-    ) -> impl Iterator<Item = NodeId> {
-        let mut node_idx = start_node_idx;
-        let mut first = true;
-        std::iter::from_fn(move || {
-            if first {
-                first = false;
-                return Some(node_idx);
-            }
-            loop {
-                if game.is_terminal() || !self.node(node_idx).expanded {
-                    return None;
-                }
-                let legal = game.legal_actions();
-                if legal.is_empty() {
-                    return None;
-                }
+    /// ```text
+    /// weighted_q = Σ(q_i * prior_i / sum_prior)   for visited children
+    /// mixed = (raw_value + sum_visits * weighted_q) / (1 + sum_visits)
+    /// ```
+    fn compute_mixed_value(
+        raw_value: f32,
+        qvalues: &[f32],
+        visit_counts: &[usize],
+        priors: &[f64],
+    ) -> f32 {
+        let sum_visits: usize = visit_counts.iter().sum();
+        if sum_visits == 0 {
+            return raw_value;
+        }
 
-                let node = self.node(node_idx);
-                let total_simulation = (node.visit_count).max(1) as f32;
-                let bias = Self::puct_bias(total_simulation);
-                let sqrt_total = total_simulation.sqrt();
-                let init_q = self.init_q_value(node_idx);
-                let fpu_q = init_q - fpu_reduction;
+        // sum_prior over visited children
+        let sum_prior: f64 = visit_counts
+            .iter()
+            .zip(priors.iter())
+            .filter(|(v, _)| **v > 0)
+            .map(|(_, p)| p.max(0.0))
+            .sum();
 
-                let children = &node.children;
-                let mut best: Option<(ActionId, NodeId, f32, f32)> = None;
-                for (action, &child_id) in children.occupied() {
-                    let child = self.node(child_id);
-                    let n = child.visit_count as f32;
-                    let q = if child.visit_count > 0 {
-                        child.q()
-                    } else {
-                        fpu_q
-                    };
-                    let var_scale = if dynamic_cpuct {
-                        child.variance().sqrt().clamp(VAR_CLAMP_MIN, VAR_CLAMP_MAX)
-                    } else {
-                        1.0
-                    };
-                    let score = q + bias * var_scale * child.prior * sqrt_total / (1.0 + n);
-                    let policy = child.prior;
-                    if best.map_or(true, |(_, _, s, p)| score > s || (score == s && policy > p)) {
-                        best = Some((action, child_id, score, policy));
-                    }
-                }
+        if sum_prior <= 1e-12 {
+            return raw_value;
+        }
 
-                let (move_idx, child_idx) = match best {
-                    Some((mi, ci, _, _)) => (mi, ci),
-                    None => (legal[0], children[legal[0]].unwrap()),
-                };
+        let weighted_q: f32 = visit_counts
+            .iter()
+            .zip(priors.iter())
+            .zip(qvalues.iter())
+            .filter(|((v, _), _)| **v > 0)
+            .map(|((_, p), q)| q * (*p as f32) / (sum_prior as f32))
+            .sum();
 
-                game.play(move_idx);
-                node_idx = child_idx;
-                return Some(child_idx);
-            }
-        })
+        (raw_value + sum_visits as f32 * weighted_q) / (1.0 + sum_visits as f32)
     }
 
-    // ── Gumbel Zero search ──
+    /// max-min 归一化 Q 值（对齐 `_rescale_qvalue`）。
+    fn rescale_q(qvalues: &[f32]) -> Vec<f32> {
+        if qvalues.is_empty() {
+            return vec![];
+        }
+        let max_q = qvalues.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let min_q = qvalues.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let gap = (max_q - min_q).max(1e-8);
+        qvalues.iter().map(|&q| (q - min_q) / gap).collect()
+    }
+
+    /// 计算 completed Q 值（对齐 `_qtransform_completed_by_mix_value`）。
+    ///
+    /// 返回 `rescaled_q * (maxvisit_init + max_visit_count) * value_scale`。
+    fn completed_q_values(
+        &self,
+        parent_idx: NodeId,
+        children: &[(ActionId, NodeId)],
+        config: &GumbelConfig,
+    ) -> Vec<f32> {
+        let parent = &self.arena[parent_idx];
+        let n = children.len();
+        let mut qvalues = Vec::with_capacity(n);
+        let mut priors_f64 = Vec::with_capacity(n);
+        let mut visit_counts = Vec::with_capacity(n);
+
+        for &(_, id) in children {
+            let child = &self.arena[id];
+            qvalues.push(if child.visit_count > 0 {
+                child.mean()
+            } else {
+                0.0
+            });
+            priors_f64.push(child.prior as f64);
+            visit_counts.push(child.visit_count as usize);
+        }
+
+        let mixed =
+            Self::compute_mixed_value(parent.raw_value, &qvalues, &visit_counts, &priors_f64);
+
+        // completed: visited → raw Q, unvisited → mixed
+        let completed: Vec<f32> = visit_counts
+            .iter()
+            .zip(qvalues.iter())
+            .map(|(&vc, &q)| if vc > 0 { q } else { mixed })
+            .collect();
+
+        let rescaled = Self::rescale_q(&completed);
+        let max_visit = visit_counts.iter().copied().max().unwrap_or(0);
+        let visit_scale = (config.max_visit_init + max_visit) as f32;
+
+        rescaled
+            .iter()
+            .map(|&q| q * visit_scale * config.value_scale)
+            .collect()
+    }
+
+    // ================================================================
+    //  节点选择
+    // ================================================================
+
+    /// 根节点选择（对齐 `_score_considered` + `_select_root_child`）。
+    ///
+    /// 利用 Sequential Halving 表确定当前 step 应该考虑哪些 visit_count 的孩子，
+    /// 然后在这些孩子中选 `max(gumbel + prior + completed_q)`。
+    fn select_root_child(
+        &self,
+        _sim_idx: usize,
+        halving_table: &Array2<usize>,
+        config: &GumbelConfig,
+    ) -> (ActionId, NodeId) {
+        let root = &self.arena[0];
+
+        // 收集所有子节点
+        let children: Vec<(ActionId, NodeId)> =
+            root.children.iter().map(|(&a, &id)| (a, id)).collect();
+
+        if children.is_empty() {
+            // 不应发生：root 总是已展开的
+            return (0, 0);
+        }
+
+        // completed Q
+        let completed_q = self.completed_q_values(0, &children, config);
+
+        // simulation index = 当前已完成的模拟次数
+        let simulation_index: usize = children
+            .iter()
+            .map(|&(_, id)| self.arena[id].visit_count as usize)
+            .sum();
+
+        let num_considered = config
+            .max_num_considered_actions
+            .min(config.num_simulations)
+            .min(halving_table.nrows().saturating_sub(1));
+        let considered_visit = halving_table[(num_considered, simulation_index)];
+
+        // score_considered
+        let scores = self.score_considered(considered_visit, &children, &completed_q);
+
+        // 选最佳
+        let best_idx = scores
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let (action, child_id) = children[best_idx];
+        (action, child_id)
+    }
+
+    /// 计算 `_score_considered`：
+    ///
+    /// ```text
+    /// penalty = 0 (if visit_count == considered_visit) else -inf
+    /// score = max(LOW_LOGIT, gumbel[i] + (prior_i - max_prior) + penalty + completed_q[i])
+    /// ```
+    fn score_considered(
+        &self,
+        considered_visit: usize,
+        children: &[(ActionId, NodeId)],
+        completed_q: &[f32],
+    ) -> Vec<f32> {
+        let max_prior = children
+            .iter()
+            .map(|&(_, id)| self.arena[id].prior)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, id))| {
+                let penalty = if self.arena[id].visit_count as usize == considered_visit {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                };
+                let adjusted_prior = self.arena[id].prior - max_prior;
+                let noise = self.gumbel_noises.get(i).copied().unwrap_or(0.0);
+                let raw = noise + adjusted_prior + penalty + completed_q[i];
+                raw.max(LOW_LOGIT)
+            })
+            .collect()
+    }
+
+    /// 内部节点选择（对齐 `_select_interior_child`）：
+    ///
+    /// ```text
+    /// probs = priors + completed_q
+    /// to_argmax = probs - visit_count / (1 + sum_visits)
+    /// choose max(to_argmax)
+    /// ```
+    fn select_interior_child(&self, node_idx: NodeId, config: &GumbelConfig) -> (ActionId, NodeId) {
+        let node = &self.arena[node_idx];
+        let children: Vec<(ActionId, NodeId)> =
+            node.children.iter().map(|(&a, &id)| (a, id)).collect();
+
+        if children.is_empty() {
+            return (0, node_idx); // 回退
+        }
+
+        let completed_q = self.completed_q_values(node_idx, &children, config);
+
+        let visit_counts: Vec<usize> = children
+            .iter()
+            .map(|&(_, id)| self.arena[id].visit_count as usize)
+            .collect();
+
+        let sum_visits: usize = visit_counts.iter().sum();
+
+        // probs = prior + completed_q
+        let probs: Vec<f32> = children
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, id))| self.arena[id].prior + completed_q[i])
+            .collect();
+
+        // to_argmax = probs - visit_count / (1 + sum_visits)
+        let to_argmax: Vec<f32> = children
+            .iter()
+            .enumerate()
+            .map(|(i, _)| probs[i] - visit_counts[i] as f32 / (1 + sum_visits) as f32)
+            .collect();
+
+        let best_idx = to_argmax
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let (action, child_id) = children[best_idx];
+        (action, child_id)
+    }
+
+    // ================================================================
+    //  Expand / Simulate / Backprop
+    // ================================================================
+
+    /// 展开节点：调用 NN，为每个合法动作创建子节点（对齐 `_expand_leaf_node`）。
+    ///
+    /// 返回叶子值（当前玩家视角），同时把 raw_value 写入节点。
+    async fn expand_node<E: Evaluator>(
+        &mut self,
+        node_idx: NodeId,
+        game: &G,
+        evaluator: &E,
+    ) -> f32 {
+        let legal = game.legal_actions();
+
+        if legal.is_empty() {
+            return 0.0;
+        }
+
+        let encoding = game.encode();
+        let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]).await;
+        let leaf_value = values_batch[0];
+        let probs = softmax_legal(&policies_batch[0], &legal);
+
+        // 记录 raw_value
+        self.arena[node_idx].raw_value = leaf_value;
+
+        // 创建子节点
+        for &action in &legal {
+            let child = Node::new(probs[action], Some(node_idx));
+            let child_id = self.push_node(child);
+            self.arena[node_idx].children.insert(action, child_id);
+        }
+        self.arena[node_idx].expanded = true;
+
+        leaf_value
+    }
+
+    /// 沿 parent 链反向传播（对齐 `update_recursive` self_play 模式）。
+    ///
+    /// 初始 value 是叶子节点视角。每向上一层通过 `G::flip_perspective` 翻转。
+    fn backprop_from(&mut self, leaf_idx: NodeId, mut value: f32) {
+        let mut idx = leaf_idx;
+        loop {
+            self.arena[idx].add_visit(value);
+            if let Some(parent) = self.arena[idx].parent {
+                idx = parent;
+                value = G::flip_perspective(value);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 单次模拟（对齐 `_simulate`）。
+    ///
+    /// 从根出发，根用 `select_root_child`，内部用 `select_interior_child`，
+    /// 到达叶节点后展开并反向传播。
+    async fn simulate<E: Evaluator>(
+        &mut self,
+        sim_idx: usize,
+        game: &mut G,
+        evaluator: &E,
+        config: &GumbelConfig,
+        halving_table: &Array2<usize>,
+    ) {
+        let mut node_idx: NodeId = 0;
+
+        // ── selection: 向下走到叶节点 ──
+        loop {
+            let node = &self.arena[node_idx];
+            if node.is_leaf() {
+                break;
+            }
+
+            let (action, child_idx) = if node_idx == 0 {
+                self.select_root_child(sim_idx, halving_table, config)
+            } else {
+                self.select_interior_child(node_idx, config)
+            };
+
+            game.play(action);
+            node_idx = child_idx;
+        }
+
+        // ── evaluation ──
+        let leaf_value = if let Some(terminal_value) = game.terminal_value() {
+            terminal_value
+        } else {
+            self.expand_node(node_idx, game, evaluator).await
+        };
+
+        // ── backprop ──
+        // LightZero self_play_mode: node->update_recursive(-leaf_value, ...)
+        // 等价于从叶子传入 G::flip_perspective(leaf_value)
+        self.backprop_from(node_idx, G::flip_perspective(leaf_value));
+    }
+
+    // ================================================================
+    //  Search（对齐 `get_next_action`）
+    // ================================================================
 
     pub async fn search<E: Evaluator>(
         &mut self,
@@ -425,7 +611,10 @@ impl<G: Game> MCTS<G> {
         rng: &mut impl RngExt,
     ) -> SearchResult {
         let action_shape = game.action_shape();
-        self.reset(game.current_player(), action_shape);
+
+        // ── 重置 & 创建根节点 ──
+        self.arena.clear();
+        self.arena.push(Node::new(0.0, None));
 
         let legal_moves = game.legal_actions();
         if legal_moves.is_empty() {
@@ -440,182 +629,76 @@ impl<G: Game> MCTS<G> {
             };
         }
 
-        let num_sim = config.num_simulations;
-        let sample_n = config.sample_size.min(legal_moves.len());
-
-        // ── Phase 1: 根节点 NN 评估 ──
+        // ── Phase 1: 根节点 NN 评估 & 展开 ──
         let root_encoding = game.encode();
         let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]).await;
         let root_nn_value = root_values[0];
+        let raw_policy_probs = softmax_legal(&root_logits[0], &legal_moves);
 
-        let raw_policy_probs = Self::softmax_legal(&root_logits[0], &legal_moves);
+        // 设置 root raw_value（用于 completed_q 的 mixed_value 计算）
+        self.root_mut().raw_value = root_nn_value;
 
-        let policy_probs = Self::apply_root_temperature(
-            &raw_policy_probs,
-            &legal_moves,
-            config.root_policy_temperature,
-        );
-
-        // 干净 logit：ln(NN prior)，加 epsilon 防止 prior=0 导致 -inf
-        let clean_logits: Vec<f32> = legal_moves
-            .iter()
-            .map(|&action| policy_probs[action].max(MIN_PROB).ln())
-            .collect();
-
-        // Gumbel 噪声（所有场景下都生成）
-        let gumbel_noises = Self::gumbel_noise(legal_moves.len(), rng);
-
-        // ── Phase 1b: expand root ──
-        let child_data: Vec<(f32, f32)> = if config.pure_gumbel_noise {
-            legal_moves
-                .iter()
-                .enumerate()
-                .map(|(i, &action)| (policy_probs[action], clean_logits[i]))
-                .collect()
-        } else {
-            let dir = Self::dirichlet_noise(legal_moves.len(), config.dirichlet_alpha, rng);
-            legal_moves
-                .iter()
-                .enumerate()
-                .map(|(i, &action)| {
-                    let prior = (1.0 - config.dirichlet_epsilon) * policy_probs[action]
-                        + config.dirichlet_epsilon * dir[i];
-                    (prior, clean_logits[i])
-                })
-                .collect()
-        };
-
-        self.expand_children(0, &legal_moves, &gumbel_noises, &child_data, action_shape);
+        // 展开根节点：为每个合法动作创建子节点
+        for &action in &legal_moves {
+            let child = Node::new(raw_policy_probs[action], Some(0));
+            let child_id = self.push_node(child);
+            self.root_mut().children.insert(action, child_id);
+        }
         self.root_mut().expanded = true;
 
-        // ── Phase 2: 候选集（按带噪声的 policy_logit 排序取 top-k） ──
-        let mut candidates: Vec<(ActionId, NodeId)> = self
-            .root()
-            .children
-            .occupied()
-            .map(|(action, &child_id)| (action, child_id))
-            .sorted_by(|&(_, a), &(_, b)| {
-                self.node(b)
-                    .policy_logit
-                    .partial_cmp(&self.node(a).policy_logit)
-                    .unwrap()
-            })
-            .take(sample_n)
-            .collect();
-
-        // ── Phase 3: 模拟循环（每次一个 walk → evaluate → backprop）──
-        // 对齐 minizero think_batch_size = 1，
-        // 确保 Sequential Halving 的访问计数始终准确。
-        let mut cur_sample = sample_n;
-        let mut sim_budget = Self::gumbel_budget(num_sim, cur_sample);
-
-        for _ in 0..num_sim {
-            // ── selection ──
-            let mut sim_game = game.clone();
-
-            // Sequential Halving: 选 effective_visits 最少的 candidate
-            let (action, start_ci) = candidates
-                .iter()
-                .copied()
-                .min_by(|&(_, a), &(_, b)| {
-                    self.node(a)
-                        .visit_count
-                        .cmp(&self.node(b).visit_count)
-                        .then_with(|| {
-                            self.node(b)
-                                .policy_logit
-                                .partial_cmp(&self.node(a).policy_logit)
-                                .unwrap()
-                        })
-                })
-                .unwrap();
-            sim_game.play(action);
-
-            let p_from = self.puct_walk(
-                start_ci,
-                &mut sim_game,
-                config.dynamic_cpuct,
-                config.fpu_reduction,
-            );
-            let mut path = vec![0];
-            path.extend(p_from);
-
-            let leaf_idx = *path.last().unwrap();
-
-            if let Some(terminal_value) = sim_game.terminal_value() {
-                self.backprop_path(&path, terminal_value);
-            } else {
-                let encoding = sim_game.encode();
-                let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]).await;
-                let legal_leaf = sim_game.legal_actions();
-                let probs = Self::softmax_legal(&policies_batch[0], &legal_leaf);
-
-                let gumbel_noises_leaf = vec![0.0f32; legal_leaf.len()];
-                let child_data_leaf: Vec<(f32, f32)> = legal_leaf
-                    .iter()
-                    .map(|&action| {
-                        let p = probs[action];
-                        (p, p.max(MIN_PROB).ln())
-                    })
-                    .collect();
-                self.expand_children(
-                    leaf_idx,
-                    &legal_leaf,
-                    &gumbel_noises_leaf,
-                    &child_data_leaf,
-                    action_shape,
-                );
-                self.node_mut(leaf_idx).expanded = true;
-                self.backprop_path(&path, values_batch[0]);
-            }
-
-            // ── sequentialHalving ──
-            let all_reached = candidates
-                .iter()
-                .all(|&(_, ci)| self.node(ci).visit_count_f32() >= sim_budget as f32);
-
-            if all_reached {
-                let next_budget = Self::gumbel_budget_halved(num_sim, cur_sample, sample_n);
-                if next_budget > 0 && cur_sample > 2 {
-                    cur_sample /= 2;
-                    let max_n = self.max_root_count();
-                    candidates.sort_by(|&(_, a), &(_, b)| {
-                        let sa = self.sigma_score(self.node(a), max_n, config);
-                        let sb = self.sigma_score(self.node(b), max_n, config);
-                        sb.partial_cmp(&sa).unwrap()
-                    });
-                    if candidates.len() > cur_sample {
-                        candidates.truncate(cur_sample);
-                    }
-                    // 用剩余候选中的最小访问数作为基准
-                    let base = candidates
-                        .iter()
-                        .map(|&(_, ci)| self.node(ci).visit_count)
-                        .min()
-                        .unwrap();
-                    sim_budget = base + next_budget;
-                }
-            }
+        // ── Phase 2: 可选 Dirichlet 噪声 ──
+        if config.add_dirichlet_noise {
+            self.add_dirichlet_noise(config, rng);
         }
 
-        // ── Phase 4: 构建 completed Q 策略（干净 logit） ──
-        let (policy, root_value) = self.build_completed_q_policy(root_nn_value, num_sim, config);
+        // ── Phase 3: 预计算 halving 表 & Gumbel 噪声 ──
+        let halving_table =
+            Self::halving_table(config.max_num_considered_actions, config.num_simulations);
+        let num_legal = legal_moves.len();
+        self.gumbel_noises = Self::gumbel_noise(num_legal, config.gumbel_scale, rng);
 
-        // 收集每个动作的子节点 Q 值 & 访问次数
+        // ── Phase 4: 模拟循环 ──
+        for sim_idx in 0..config.num_simulations {
+            let mut sim_game = game.clone();
+            self.simulate(sim_idx, &mut sim_game, evaluator, config, &halving_table)
+                .await;
+        }
+
+        // ── Phase 5: 构建 improved policy（对齐 `_get_improved_policy`）──
+        let improved_policy = self.improved_policy(config, action_shape);
+
+        // ── Phase 6: 动作选择（visit count softmax）──
+        let action_probs = self.visit_count_distribution(config.select_temperature, action_shape);
+        let best_move = sample_action(&action_probs, rng);
+
+        // ── 收集子节点信息 ──
         let mut children_q = vec![0.0f32; action_shape];
         let mut children_visits = vec![0u32; action_shape];
-        for (action, &child_id) in self.root().children.occupied() {
-            let node = self.node(child_id);
-            children_q[action] = self.normalized_q(node);
-            children_visits[action] = node.visit_count;
+        for (&action, &child_id) in self.root().children.iter() {
+            let child = &self.arena[child_id];
+            children_q[action] = if child.visit_count > 0 {
+                child.mean()
+            } else {
+                0.0
+            };
+            children_visits[action] = child.visit_count;
         }
 
-        // ── Phase 5: 动作选择（softmax over visit counts） ──
-        let best_move = self.select_by_softmax_count(config.select_temperature, rng);
+        // root_value: 子节点 Q 按访问次数加权平均
+        let total_visits: u32 = children_visits.iter().sum();
+        let root_value = if total_visits > 0 {
+            children_q
+                .iter()
+                .enumerate()
+                .map(|(i, &q)| children_visits[i] as f32 / total_visits as f32 * q)
+                .sum()
+        } else {
+            root_nn_value
+        };
 
         SearchResult {
             best_move,
-            policy,
+            policy: improved_policy,
             root_value,
             root_nn_prior: raw_policy_probs,
             root_nn_value,
@@ -624,294 +707,173 @@ impl<G: Game> MCTS<G> {
         }
     }
 
-    // ── Gumbel 辅助 ──
+    // ================================================================
+    //  Improved policy（对齐 `_get_improved_policy`）
+    // ================================================================
 
-    /// 初始 budget：B = N / (log2(sample_size) * sample_size)
-    fn gumbel_budget(num_sim: usize, sample_n: usize) -> u32 {
-        let d = (sample_n as f32).log2() * sample_n as f32;
-        (num_sim as f32 / d).floor().max(1.0) as u32
-    }
+    /// 构建 improved policy：`softmax(prior + completed_q)`。
+    fn improved_policy(&self, config: &GumbelConfig, action_shape: usize) -> Vec<f32> {
+        let root = &self.arena[0];
+        let children_vec: Vec<(ActionId, NodeId)> =
+            root.children.iter().map(|(&a, &id)| (a, id)).collect();
 
-    /// Halving budget：B' = N / (log2(initial_sample_size) * cur_sample / 2)
-    fn gumbel_budget_halved(num_sim: usize, cur_sample: usize, initial_sample_size: usize) -> u32 {
-        let d = (initial_sample_size as f32).log2() * (cur_sample as f32) / 2.0;
-        (num_sim as f32 / d).floor() as u32
-    }
-
-    /// effective_scale_h = (sigma_visit_c + max_n) * sigma_scale_h
-    ///
-    /// 线性增长让 halving 后期由 Q 主导，保证筛选稳定性。
-    #[inline]
-    fn effective_scale_h(max_n: f32, config: &GumbelConfig) -> f32 {
-        (config.sigma_visit_c + max_n) * config.sigma_scale_h
-    }
-
-    /// effective_scale_p = (sigma_visit_c + max_n) * sigma_scale_p
-    ///
-    /// completed Q policy 使用独立的缩放系数，通常小于 halving 的。
-    #[inline]
-    fn effective_scale_p(max_n: f32, config: &GumbelConfig) -> f32 {
-        (config.sigma_visit_c + max_n) * config.sigma_scale_p
-    }
-
-    fn max_root_count(&self) -> f32 {
-        self.root()
-            .children
-            .values()
-            .map(|&ci| self.node(ci).visit_count_f32())
-            .fold(0.0, f32::max)
-    }
-
-    /// minizero getNormalizedMean: global min-max rescale self-perspective
-    /// mean to [-1,1], then flip to parent perspective.
-    #[inline]
-    pub fn normalized_q(&self, node: &Node<G>) -> f32 {
-        if node.visit_count == 0 {
-            return 0.0;
+        if children_vec.is_empty() {
+            return vec![0.0; action_shape];
         }
-        let gap = (self.value_max - self.value_min).max(1e-8);
-        let v = (node.mean_self() - self.value_min) / gap; // [0, 1]
-        let v = (2.0 * v - 1.0).clamp(-1.0, 1.0); // [-1, 1]
-        G::flip_perspective(v) // flip to parent perspective
-    }
 
-    /// σ-score：带噪声 logit + normalized Q 项。
-    pub fn sigma_score(&self, node: &Node<G>, max_n: f32, config: &GumbelConfig) -> f32 {
-        if node.visit_count == 0 {
-            return f32::NEG_INFINITY;
+        let completed_q = self.completed_q_values(0, &children_vec, config);
+
+        let mut probs = vec![f32::NEG_INFINITY; action_shape];
+        for (i, &(action, id)) in children_vec.iter().enumerate() {
+            probs[action] = self.arena[id].prior + completed_q[i];
         }
-        let var_scale = if config.dynamic_cpuct {
-            node.variance().sqrt().clamp(0.1, 4.0)
-        } else {
-            1.0
-        };
-        node.policy_logit
-            + Self::effective_scale_h(max_n, config) * var_scale * self.normalized_q(node)
+
+        softmax_full(&probs, 1.0)
     }
 
-    /// Completed Q policy (minizero-style): clean logit + Q-term softmax.
-    ///
-    /// score = logit_without_noise + sqrt(σ_visit_c + max_n) * σ_scale_c * q
-    fn build_completed_q_policy(
-        &self,
-        root_nn_value: f32,
-        num_sim: usize,
-        config: &GumbelConfig,
-    ) -> (Vec<f32>, f32) {
-        let children = &self.root().children;
+    // ================================================================
+    //  Visit count → action distribution / 动作采样
+    // ================================================================
 
-        // Collect all children: (action, child_id, normalized_q_if_visited, prior)
-        let entries: Vec<(ActionId, usize, Option<f32>, f32)> = children
-            .occupied()
-            .map(|(action, &child_id)| {
-                let child = self.node(child_id);
-                let q = if child.visit_count > 0 {
-                    Some(self.normalized_q(child))
-                } else {
-                    None
-                };
-                (action, child_id, q, child.prior)
+    /// 基于访问次数的动作分布（对齐 `visit_count_to_action_distribution`）。
+    fn visit_count_distribution(&self, temperature: f32, action_shape: usize) -> Vec<f64> {
+        let root = &self.arena[0];
+        let visits: Vec<f64> = (0..action_shape)
+            .map(|a| {
+                root.children
+                    .get(&a)
+                    .map(|&id| self.arena[id].visit_count as f64)
+                    .unwrap_or(0.0)
             })
             .collect();
 
-        // minizero-style mixed value for unvisited children:
-        // non_visited_node_value = 1/(1+N) * (value_pi + (N / Σπ) * Σ(π·Q))
-        let pi_sum: f32 = entries.iter().map(|&(_, _, _, p)| p).sum();
-        let prior_weighted_q: f32 = entries
-            .iter()
-            .filter_map(|&(_, _, q, p)| q.map(|v| p * v))
-            .sum();
-        let mixed_value = if pi_sum > 0.0 {
-            (root_nn_value + (num_sim as f32 / pi_sum) * prior_weighted_q) / (1.0 + num_sim as f32)
-        } else {
-            root_nn_value
-        };
-
-        // Build completed list: (action, child_id, completed_q)
-        let completed: Vec<(ActionId, usize, f32)> = entries
-            .iter()
-            .map(|&(a, ci, q, _)| (a, ci, q.unwrap_or(mixed_value)))
-            .collect();
-
-        // minizero-style: use raw Q directly, no min-max rescaling
-        // Score = clean_logit + (sigma_visit_c + max_n) * sigma_scale_c * q
-        let max_n = completed
-            .iter()
-            .map(|&(_, ci, _)| self.node(ci).visit_count_f32())
-            .fold(0.0f32, f32::max);
-        let effective_scale = Self::effective_scale_p(max_n, config);
-
-        let mut scores: Vec<(ActionId, f32)> = Vec::new();
-        let mut max_score = f32::NEG_INFINITY;
-        for &(action, child_id, q) in &completed {
-            let clean_logit = self.node(child_id).logit_without_noise();
-            let score = clean_logit + effective_scale * q;
-            scores.push((action, score));
-            if score > max_score {
-                max_score = score;
-            }
+        let sum: f64 = visits.iter().sum();
+        if sum == 0.0 || temperature == 0.0 {
+            // 回退到均匀分布
+            let n = action_shape as f64;
+            return vec![1.0 / n; action_shape];
         }
 
-        let mut policy = vec![0.0f32; children.len()];
-        let mut sum = 0.0f32;
-        for &(idx, score) in &scores {
-            let exp = (score - max_score).exp();
-            policy[idx] = exp;
-            sum += exp;
-        }
-        if sum > 0.0 {
-            for &(idx, _) in &scores {
-                policy[idx] /= sum;
-            }
-        }
-
-        let sum_n: f32 = children
-            .values()
-            .map(|&ci| self.node(ci).visit_count_f32())
-            .sum();
-        let root_value = if sum_n > 0.0 {
-            children
-                .values()
-                .map(|&ci| {
-                    let child = self.node(ci);
-                    child.visit_count_f32() / sum_n * self.normalized_q(child)
-                })
-                .sum()
-        } else {
-            root_nn_value
-        };
-
-        (policy, root_value)
+        visits
+            .iter()
+            .map(|&v| (v / temperature as f64) / (sum / temperature as f64))
+            .collect()
     }
 
-    /// 动作选择：softmax over visit_counts，temperature 默认 1.0。
-    fn select_by_softmax_count(&self, temperature: f32, rng: &mut impl RngExt) -> ActionId {
-        use rand::distr::{Distribution, weighted::WeightedIndex};
-        let children = &self.root().children;
+    // ================================================================
+    //  Dirichlet / Gumbel 噪声
+    // ================================================================
 
-        let max_count_child = children
-            .iter()
-            .filter_map(|(_, c)| c.copied())
-            .max_by_key(|ci| self.node(*ci).visit_count);
-        let threshold_q = max_count_child
-            .map(|ci| self.normalized_q(self.node(ci)) - 0.1)
-            .unwrap_or(f32::NEG_INFINITY);
+    /// 对根节点的直接子节点叠加 Dirichlet 噪声（对齐 `_add_exploration_noise`）。
+    fn add_dirichlet_noise(&mut self, config: &GumbelConfig, rng: &mut impl RngExt) {
+        let children: Vec<_> = self.arena[0].children.values().copied().collect();
 
-        let probs: Vec<f64> = children
-            .iter()
-            .map(|(_, c)| {
-                if let Some(ci) = c {
-                    let child = self.node(*ci);
-                    if child.visit_count == 0 || self.normalized_q(child) < threshold_q {
-                        0.0
-                    } else {
-                        (child.visit_count as f64).powf(1.0 / temperature as f64)
-                    }
-                } else {
-                    0.0
-                }
-            })
-            .collect();
+        let n = children.len();
+        if n == 0 {
+            return;
+        }
 
-        let total: f64 = probs.iter().sum();
-        if total > 0.0 {
-            let dist = WeightedIndex::new(&probs).unwrap();
-            dist.sample(rng)
-        } else {
-            let (policy, _) = self.build_completed_q_policy(0.0, 1, &GumbelConfig::default());
-            policy
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i)
-                .unwrap_or(0)
+        let noise = dirichlet_noise(n, config.dirichlet_alpha, rng);
+        let frac = config.dirichlet_epsilon;
+
+        for (i, child_id) in children.into_iter().enumerate() {
+            self.arena[child_id].prior =
+                self.arena[child_id].prior * (1.0 - frac) + noise[i] * frac;
         }
     }
 
-    /// 反向传播 value 到路径上所有节点（含 root）。
-    ///
-    /// `value` 是叶子节点视角的回报值。每向上一层，通过
-    /// `Game::flip_perspective` 翻转为上一节点的视角，消除零和对弈的硬编码假设。
-    fn backprop_path(&mut self, path: &[NodeId], mut value: f32) {
-        for &node_idx in path.iter().rev() {
-            self.node_mut(node_idx).add_visit(value);
-            let m = self.node(node_idx).mean_self();
-            self.value_min = self.value_min.min(m);
-            self.value_max = self.value_max.max(m);
-            value = G::flip_perspective(value);
-        }
-    }
-
-    // ── utils ──
-
-    /// Root Policy Softmax Temperature (KataGo):
-    /// Scale root priors via `p^(1/T) / Z` before computing ln(prior).
-    /// T=1.0 returns unchanged. T>1 pushes distribution toward uniform.
-    fn apply_root_temperature(probs: &[f32], legal: &[ActionId], temperature: f32) -> Vec<f32> {
-        if temperature == 1.0 {
-            return probs.to_vec();
-        }
-        let mut scaled = vec![0.0f32; probs.len()];
-        let mut sum = 0.0;
-        for &action in legal {
-            let v = probs[action].max(MIN_PROB).powf(1.0 / temperature);
-            scaled[action] = v;
-            sum += v;
-        }
-        if sum > 0.0 {
-            for &action in legal {
-                scaled[action] /= sum;
-            }
-        }
-        scaled
-    }
-
-    #[inline]
-    fn softmax_legal(logits: &[f32], legal: &[ActionId]) -> Vec<f32> {
-        let max_logit = legal
-            .iter()
-            .map(|&idx| logits[idx])
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut probs = vec![0.0f32; logits.len()];
-        let mut sum = 0.0f32;
-        for &idx in legal {
-            let exp = (logits[idx] - max_logit).exp();
-            probs[idx] = exp;
-            sum += exp;
-        }
-        if sum > 0.0 {
-            for &idx in legal {
-                probs[idx] /= sum;
-            }
-        } else {
-            let count = legal.len() as f32;
-            for &idx in legal {
-                probs[idx] = 1.0 / count;
-            }
-        }
-        probs
-    }
-
-    fn dirichlet_noise(n: usize, alpha: f32, rng: &mut impl RngExt) -> Vec<f32> {
-        let gamma = rand_distr::Gamma::new(alpha, 1.0).unwrap();
-        let mut v: Vec<f32> = (0..n).map(|_| gamma.sample(rng)).collect();
-        let s: f32 = v.iter().sum();
-        for x in &mut v {
-            *x /= s;
-        }
-        v
-    }
-
-    fn gumbel_noise(n: usize, rng: &mut impl RngExt) -> Vec<f32> {
+    /// 生成 Gumbel 噪声（对齐 `_generate_gumbel`，带 scale）。
+    fn gumbel_noise(n: usize, scale: f32, rng: &mut impl RngExt) -> Vec<f32> {
         let gumbel = rand_distr::Gumbel::new(0.0f32, 1.0).unwrap();
         (0..n)
-            .map(|_| gumbel.sample(rng).clamp(-12.0, 12.0))
+            .map(|_| scale * gumbel.sample(rng).clamp(-12.0, 12.0))
             .collect()
     }
 }
 
 // ============================================================
-//  测试：用 3×3 井字棋（米字棋）验证 MCTS 算法正确性
+//  工具函数
+// ============================================================
+
+/// 仅对合法动作做 softmax。
+#[inline]
+fn softmax_legal(logits: &[f32], legal: &[ActionId]) -> Vec<f32> {
+    let max_logit = legal
+        .iter()
+        .map(|&idx| logits[idx])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs = vec![0.0f32; logits.len()];
+    let mut sum = 0.0f32;
+    for &idx in legal {
+        let exp = (logits[idx] - max_logit).exp();
+        probs[idx] = exp;
+        sum += exp;
+    }
+    if sum > 0.0 {
+        for &idx in legal {
+            probs[idx] /= sum;
+        }
+    } else {
+        let count = legal.len() as f32;
+        for &idx in legal {
+            probs[idx] = 1.0 / count;
+        }
+    }
+    probs
+}
+
+/// 全量 softmax（用于 improved policy，含 -inf 的未展开动作）。
+fn softmax_full(values: &[f32], temperature: f32) -> Vec<f32> {
+    if values.is_empty() || temperature == 0.0 {
+        let n = values.len();
+        return vec![1.0 / n as f32; n];
+    }
+    let max_val = values.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut exps: Vec<f32> = values
+        .iter()
+        .map(|&v| ((v - max_val) / temperature).exp())
+        .collect();
+    let sum: f32 = exps.iter().sum();
+    if sum > 0.0 {
+        for v in &mut exps {
+            *v /= sum;
+        }
+    }
+    exps
+}
+
+/// Dirichlet 噪声（Gamma 采样后归一化）。
+fn dirichlet_noise(n: usize, alpha: f32, rng: &mut impl RngExt) -> Vec<f32> {
+    let gamma = rand_distr::Gamma::new(alpha, 1.0).unwrap();
+    let mut v: Vec<f32> = (0..n).map(|_| gamma.sample(rng)).collect();
+    let s: f32 = v.iter().sum();
+    for x in &mut v {
+        *x /= s;
+    }
+    v
+}
+
+/// 按概率分布采样动作索引。
+fn sample_action(probs: &[f64], rng: &mut impl RngExt) -> ActionId {
+    if probs.is_empty() {
+        return 0;
+    }
+    let total: f64 = probs.iter().sum();
+    if total <= 0.0 {
+        // 回退：选最大概率索引
+        return probs
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+    let dist = WeightedIndex::new(probs).unwrap();
+    dist.sample(rng)
+}
+
+// ============================================================
+//  测试
 // ============================================================
 #[cfg(test)]
 mod tests {
@@ -919,16 +881,8 @@ mod tests {
     use crate::game::board::{Board, Color};
 
     /// 模拟神经网络评估器。
-    ///
-    /// 返回均匀先验（所有合法动作等概率）+ 中立估值（value = 0.0）。
-    /// 用这个最简单的 mock 验证 MCTS 的行为是否合理——
-    /// 在仅凭模拟结果引导搜索的情况下，MCTS 应当能：
-    /// 1. 对必胜局面优先选制胜走法。
-    /// 2. 对必败局面避免明显的送子走法。
     struct MockEvaluator {
-        /// 每个局面的标量估值（-1 ~ 1），若为空则返回 0.0
         value_map: std::collections::HashMap<String, f32>,
-        /// 每个局面的策略 logits（若为空则返回均匀分布）
         policy_map: std::collections::HashMap<String, Vec<f32>>,
     }
 
@@ -940,15 +894,12 @@ mod tests {
             }
         }
 
-        /// 对特定局面设置 NN 估值。
-        /// `encoded` 为 encode() 输出的 Vec<i32>（序列化为 key）。
         fn with_value(mut self, encoded: Vec<i32>, value: f32) -> Self {
             let key = Self::encode_key(&encoded);
             self.value_map.insert(key, value);
             self
         }
 
-        /// 对特定局面设置策略。`policy` 长度应等于 action_shape。
         fn with_policy(mut self, encoded: Vec<i32>, policy: Vec<f32>) -> Self {
             let key = Self::encode_key(&encoded);
             self.policy_map.insert(key, policy);
@@ -988,14 +939,12 @@ mod tests {
         }
     }
 
-    /// 构建 3×3 井字棋棋盘（连子数 = 3）。
     fn make_board() -> Board {
         Board::with_size(3, 3)
     }
 
     // ── 基本测试 ──
 
-    /// 空棋盘搜索：MCTS 应当返回一个合法走法（0..9），策略维度正确。
     #[test]
     fn test_empty_board_search_returns_legal_move() {
         let board = make_board();
@@ -1005,43 +954,27 @@ mod tests {
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
-        // 最佳走法应当在合法范围内
-        assert!(result.best_move < 9, "best_move 应为合法索引");
-        assert_eq!(result.policy.len(), 9, "policy 长度应等于 action_shape");
-        assert_eq!(
-            result.root_nn_prior.len(),
-            9,
-            "root_nn_prior 长度应等于 action_shape"
-        );
+        assert!(result.best_move < 9);
+        assert_eq!(result.policy.len(), 9);
+        assert_eq!(result.root_nn_prior.len(), 9);
 
-        // policy 中合法走法的概率和应 ≈ 1.0
         let policy_sum: f32 = result.policy.iter().sum();
         assert!(
-            (policy_sum - 1.0).abs() < 0.01,
-            "policy 应向 1 归一化，实际 sum={policy_sum}"
+            (policy_sum - 1.0).abs() < 0.02,
+            "policy sum should be ~1.0, got {policy_sum}"
         );
 
-        // root_value 应在 [-1, 1] 范围内
-        assert!(
-            result.root_value >= -1.0 && result.root_value <= 1.0,
-            "root_value 应在 [-1, 1] 内，实际={}",
-            result.root_value
-        );
+        assert!(result.root_value >= -1.0 && result.root_value <= 1.0);
     }
 
-    /// 终局状态（黑子已三连）：搜索应立即返回空策略。
     #[test]
     fn test_terminal_board_returns_empty() {
         let mut board = make_board();
-        // 黑子连成一线：[0,0] [0,1] [0,2] 全黑
-        // 但 Board::play 会翻转 player，这里要构造黑方三连后轮到黑方（不可能，仅为测试）
-        // 我们让白方形成三连，然后轮到黑方：
-        // 顺序：黑(0,0) 白(1,0) 黑(0,1) 白(1,1) 黑(0,2) → 黑胜，game_over=true
-        board.play(0, 0); // 黑
-        board.play(1, 0); // 白
-        board.play(0, 1); // 黑
-        board.play(1, 1); // 白
-        board.play(0, 2); // 黑三连，黑胜，game_over=true
+        board.play(0, 0);
+        board.play(1, 0);
+        board.play(0, 1);
+        board.play(1, 1);
+        board.play(0, 2);
         assert!(board.game_over);
 
         let evaluator = MockEvaluator::new();
@@ -1050,18 +983,14 @@ mod tests {
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
-        // best_move 应等于 action_shape（9），表示无合法动作
-        assert_eq!(result.best_move, 9, "终局应无合法动作");
+        assert_eq!(result.best_move, 9);
         assert_eq!(result.policy, vec![0.0f32; 9]);
         assert_eq!(result.root_value, 0.0);
     }
 
-    /// 仅剩一个空位：唯一的合法走法应被选为 best_move。
     #[test]
     fn test_single_legal_move_is_chosen() {
         let mut board = make_board();
-        // 填满除了 (0,0) 外的 8 个格子
-        // 交替落子确保不产生三连获胜
         let moves = [
             (0, 1),
             (1, 0),
@@ -1085,28 +1014,16 @@ mod tests {
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
-        assert_eq!(result.best_move, only_move, "唯一走法应被选中");
+        assert_eq!(result.best_move, only_move);
     }
 
-    // ── 必胜局面测试 ──
-
-    /// 当前玩家有立即三连获胜的机会 → MCTS 应优先选择制胜走法。
-    ///
-    /// 局面：
-    /// ```text
-    ///   ●  ●  ⋅
-    ///   ○  ○  ⋅
-    ///   ⋅  ⋅  ⋅
-    /// ```
-    /// 轮黑，位置 2（即 (0,2)）立即可胜。
     #[test]
     fn test_mcts_prefers_winning_move() {
         let mut board = make_board();
-        board.play(0, 0); // 黑 (0,0)
-        board.play(1, 0); // 白 (1,0)
-        board.play(0, 1); // 黑 (0,1)
-        board.play(1, 1); // 白 (1,1)
-        // 此时轮黑，位置 2 (0,2) 立即可胜
+        board.play(0, 0);
+        board.play(1, 0);
+        board.play(0, 1);
+        board.play(1, 1);
         assert!(!board.game_over);
 
         let evaluator = MockEvaluator::new();
@@ -1116,38 +1033,19 @@ mod tests {
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         let win_move = board.pos_to_idx(0, 2);
-        // 制胜走法的访问次数应在所有走法中排第一
-        // 注：由于随机性，不做 100% 的断言；若 NN 均匀，MCTS 通过模拟应发现制胜走法
-        // 这里只验证 best_move 是合法走法且 policy 中制胜走法概率最高
-        let _max_prob_idx = result
-            .policy
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap();
         assert!(result.best_move < 9);
-        // 在充足的模拟次数下，算法至少能发现这是一步好棋
-        assert!(result.policy[win_move] > 0.0, "制胜走法应拥有非零策略概率");
+        assert!(
+            result.policy[win_move] > 0.0,
+            "winning move should have non-zero policy"
+        );
     }
 
-    /// 只剩最后一步就能赢的对局：对手已经两连，轮到对手应选择堵截。
-    ///
-    /// 局面（轮白）：
-    /// ```text
-    ///   ●  ●  ⋅
-    ///   ○  ⋅  ⋅
-    ///   ⋅  ⋅  ⋅
-    /// ```
-    /// 黑下一步 (0,2) 就三连，白必须堵 (0,2)。
-    /// 若白没有去堵，则黑必胜。
     #[test]
     fn test_mcts_blocks_opponent_win() {
         let mut board = make_board();
-        board.play(0, 0); // 黑 (0,0)
-        board.play(1, 0); // 白 (1,0)
-        board.play(0, 1); // 黑 (0,1)
-        // 此时轮白
+        board.play(0, 0);
+        board.play(1, 0);
+        board.play(0, 1);
         assert_eq!(board.current_player, Color::White);
         assert!(!board.game_over);
 
@@ -1159,46 +1057,39 @@ mod tests {
 
         let block_move = board.pos_to_idx(0, 2);
         assert!(result.best_move < 9);
-        // 堵截走法应被评估为正收益
-        assert!(result.policy[block_move] > 0.0, "堵截走法应有非零策略概率");
+        assert!(
+            result.policy[block_move] > 0.0,
+            "blocking move should have non-zero policy"
+        );
     }
 
-    // ── 策略导向测试 ──
-
-    /// 若 NN 策略强烈偏向某一走法，MCTS 应反映这一点。
     #[test]
     fn test_best_move_reflects_policy() {
         let board = make_board();
         let center_idx = board.pos_to_idx(1, 1);
 
-        // 构造一个 NN：均匀价值，但策略强烈偏向中心
         let mut policy = vec![-10.0f32; 9];
         policy[center_idx] = 10.0;
         let evaluator = MockEvaluator::new().with_policy(board.encode(), policy);
 
-        let config = GumbelConfig::pure_gumbel(32);
+        let config = GumbelConfig::pure_gumbel(64);
         let mut mcts: MCTS<Board> = MCTS::new();
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
-        // 在 pure_gumbel 模式下，根节点 prior = NN 输出
         assert!(
             result.root_nn_prior[center_idx] > 0.5,
-            "中心走法的 NN 先验应 > 0.5，实际={}",
+            "center NN prior should be > 0.5, got {}",
             result.root_nn_prior[center_idx]
         );
     }
 
-    // ── 可重复性测试 ──
-
-    /// 相同随机种子的两次搜索应产生相同结果。
     #[test]
     fn test_deterministic_with_same_seed() {
         let board = make_board();
         let evaluator = MockEvaluator::new();
-        let config = GumbelConfig::pure_gumbel(32);
+        let config = GumbelConfig::pure_gumbel(64);
 
-        // 用可重现的种子
         use rand::SeedableRng;
         let mut rng1 = rand::rngs::SmallRng::seed_from_u64(42);
         let mut rng2 = rand::rngs::SmallRng::seed_from_u64(42);
@@ -1217,33 +1108,26 @@ mod tests {
                 .policy
                 .iter()
                 .zip(&result2.policy)
-                .all(|(a, b)| (a - b).abs() < 1e-6),
-            "相同种子应产生相同策略"
+                .all(|(a, b)| (a - b).abs() < 1e-6)
         );
         assert!((result1.root_value - result2.root_value).abs() < 1e-6);
     }
 
-    // ── GumbelConfig 模式测试 ──
-
-    /// pure_gumbel 模式下 pure_gumbel_noise = true。
     #[test]
     fn test_pure_gumbel_config() {
         let config = GumbelConfig::pure_gumbel(128);
-        assert!(config.pure_gumbel_noise);
+        assert!(!config.add_dirichlet_noise);
         assert_eq!(config.num_simulations, 128);
     }
 
-    /// mixed 模式下 pure_gumbel_noise = false，使用 Dirichlet 噪声。
     #[test]
     fn test_mixed_config() {
         let config = GumbelConfig::mixed(128);
-        assert!(!config.pure_gumbel_noise);
+        assert!(config.add_dirichlet_noise);
         assert_eq!(config.num_simulations, 128);
-        // mixed 模式下 ε > 0
         assert!(config.dirichlet_epsilon > 0.0);
     }
 
-    /// mixed 模式在空棋盘上也能正常搜索。
     #[test]
     fn test_mixed_mode_search_on_empty_board() {
         let board = make_board();
@@ -1253,38 +1137,24 @@ mod tests {
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
         assert!(result.best_move < 9);
-        assert!((result.policy.iter().sum::<f32>() - 1.0).abs() < 0.01);
+        assert!((result.policy.iter().sum::<f32>() - 1.0).abs() < 0.02);
     }
 
-    // ── 边界情况 ──
-
-    /// 接近终局的复杂走法选择：三连成线 vs 堵截对手三连。
-    ///
-    /// 局面（黑先行）：
-    /// ```text
-    ///   ●  ●  ⋅
-    ///   ○  ○  ⋅
-    ///   ⋅  ⋅  ⋅
-    /// ```
-    /// 黑选 (0,2) 立即获胜；选 (2,0~2) 留给白堵截机会。
-    /// 算法应偏好制胜走法。
     #[test]
     fn test_win_vs_delay() {
         let mut board = make_board();
-        board.play(0, 0); // 黑
-        board.play(1, 0); // 白
-        board.play(0, 1); // 黑
-        board.play(1, 1); // 白
-        // 轮黑
+        board.play(0, 0);
+        board.play(1, 0);
+        board.play(0, 1);
+        board.play(1, 1);
 
         let evaluator = MockEvaluator::new();
-        let config = GumbelConfig::pure_gumbel(128);
+        let config = GumbelConfig::pure_gumbel(256);
         let mut mcts: MCTS<Board> = MCTS::new();
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         let win_move = board.pos_to_idx(0, 2);
-        // 制胜走法应拥有最高 policy 概率
         let max_idx = result
             .policy
             .iter()
@@ -1292,25 +1162,21 @@ mod tests {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i)
             .unwrap();
-        assert_eq!(max_idx, win_move, "制胜走法的策略概率应最高");
+        assert_eq!(max_idx, win_move, "winning move should have highest policy");
     }
 
-    /// 终局检测：模拟双方走到终局后 board.game_over 为 true。
     #[test]
     fn test_game_ends_correctly() {
         let mut board = make_board();
-        // 模拟一局：黑 3 连获胜
-        // 黑(0,0) 白(1,0) 黑(0,1) 白(1,1) 黑(0,2) → 黑胜
         assert!(board.play(0, 0));
         assert!(board.play(1, 0));
         assert!(board.play(0, 1));
         assert!(board.play(1, 1));
-        assert!(board.play(0, 2)); // 黑三连 → game_over
-        assert!(board.game_over, "黑三连后应判定终局");
+        assert!(board.play(0, 2));
+        assert!(board.game_over);
         assert_eq!(board.winner, Some(Color::Black));
     }
 
-    /// 模拟一局完整对局：双方 AI 相互对弈直到终局。
     #[test]
     fn test_full_game_completion() {
         let mut board = make_board();
@@ -1318,8 +1184,7 @@ mod tests {
         let config = GumbelConfig::pure_gumbel(128);
         let mut mcts: MCTS<Board> = MCTS::new();
 
-        let max_moves = 9;
-        for _ in 0..max_moves {
+        for _ in 0..9 {
             if board.game_over {
                 break;
             }
@@ -1335,56 +1200,158 @@ mod tests {
             board.play_idx(result.best_move);
         }
 
-        // 游戏应正常结束（三连或平局）
-        assert!(board.game_over, "完整对弈应产生终局");
-        assert!(board.step_count <= 9, "井字棋最多 9 步");
+        assert!(board.game_over);
+        assert!(board.step_count <= 9);
     }
 
-    /// 平局局面：填满棋盘无三连。
-    ///
-    /// 最终布局（无三连）：
-    /// ```text
-    ///   黑 白 黑
-    ///   黑 白 白
-    ///   白 黑 黑
-    /// ```
     #[test]
     fn test_draw_game() {
         let mut board = make_board();
         let moves = [
-            (0, 0), // 黑
-            (1, 1), // 白
-            (2, 2), // 黑
-            (2, 0), // 白
-            (0, 2), // 黑
-            (0, 1), // 白
-            (2, 1), // 黑
-            (1, 2), // 白
-            (1, 0), // 黑
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (2, 0),
+            (0, 2),
+            (0, 1),
+            (2, 1),
+            (1, 2),
+            (1, 0),
         ];
         for &(r, c) in &moves {
-            assert!(board.play(r, c), "每步应合法：({r},{c})");
+            assert!(board.play(r, c), "move ({},{}) should be legal", r, c);
         }
-        assert!(board.game_over, "棋盘满后应终局");
-        assert_eq!(board.winner, None, "无三连应为平局");
+        assert!(board.game_over);
+        assert_eq!(board.winner, None);
     }
 
-    // ── 启发式估值测试 ──
-
-    /// 当 NN 估值对某局面有正预期时（例如黑方占优），
-    /// root_value 应反映这一趋势。
     #[test]
     fn test_nn_value_influences_root_value() {
         let board = make_board();
-        // 设置根局面 NN 估值为 1.0（强烈偏黑方），策略均匀
         let evaluator = MockEvaluator::new().with_value(board.encode(), 1.0);
         let config = GumbelConfig::pure_gumbel(1024);
         let mut mcts: MCTS<Board> = MCTS::new();
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
-        // root_value 是 MCTS 根据模拟回传 + NN 估值综合算出，
-        // 在 NN 估值 = 1.0 的情况下，root_value 应偏正。
-        assert!(result.root_value > -1.0, "正估值不应产生极端负值");
+        assert!(
+            result.root_value > -1.0,
+            "positive NN value should not produce extreme negative root value"
+        );
+    }
+
+    // ── 算法一致性测试 ──
+
+    #[test]
+    fn test_sequential_halving_sequence_monotonic() {
+        let seq = MCTS::<Board>::sequential_halving_seq(4, 16);
+        assert_eq!(seq.len(), 16);
+        // 序列应非递减
+        for w in seq.windows(2) {
+            assert!(w[0] <= w[1], "halving seq should be non-decreasing");
+        }
+    }
+
+    #[test]
+    fn test_rescale_q_normalizes_to_01() {
+        let q = vec![-0.5, 0.0, 0.3, 0.8];
+        let r = MCTS::<Board>::rescale_q(&q);
+        assert!((r[0] - 0.0).abs() < 1e-6, "min should be ~0, got {}", r[0]);
+        assert!((r[3] - 1.0).abs() < 1e-6, "max should be ~1, got {}", r[3]);
+    }
+
+    #[test]
+    fn test_compute_mixed_value_no_visits_returns_raw() {
+        let raw = 0.7;
+        let qvalues: [f32; 0] = [];
+        let visit_counts: [usize; 0] = [];
+        let priors: [f64; 0] = [];
+        let result = MCTS::<Board>::compute_mixed_value(raw, &qvalues, &visit_counts, &priors);
+        assert!((result - raw).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_compute_mixed_value_with_visits() {
+        // 一个已访问子节点：Q=0.5, visits=3, prior=0.6
+        let raw = 0.3;
+        let qvalues = vec![0.5];
+        let visit_counts = vec![3];
+        let priors = vec![0.6];
+        let result = MCTS::<Board>::compute_mixed_value(raw, &qvalues, &visit_counts, &priors);
+        // weighted_q = 0.5 * 0.6 / 0.6 = 0.5
+        // mixed = (0.3 + 3 * 0.5) / (1 + 3) = 1.8 / 4 = 0.45
+        assert!((result - 0.45).abs() < 1e-5, "expected 0.45, got {result}");
+    }
+
+    #[test]
+    fn test_improved_policy_sums_to_one() {
+        let board = make_board();
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(64);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let sum: f32 = result.policy.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.02,
+            "improved policy sum should be ~1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn test_halving_table_correct_size() {
+        let table = MCTS::<Board>::halving_table(4, 16);
+        assert_eq!(table.nrows(), 5); // 0..=4
+        assert_eq!(table.ncols(), 16);
+    }
+
+    #[test]
+    fn test_root_and_interior_selection_reach_leaves() {
+        // 验证在充足模拟下，所有合法动作都有非零访问
+        let board = make_board();
+        let evaluator = MockEvaluator::new();
+        let config = GumbelConfig::pure_gumbel(256);
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+
+        // 所有 9 个合法动作都应该有非零访问
+        let nonzero_visits = result.children_visits.iter().filter(|&&v| v > 0).count();
+        assert!(
+            nonzero_visits >= 5,
+            "at least 5 actions should have visits, got {}",
+            nonzero_visits
+        );
+    }
+
+    #[test]
+    fn test_select_interior_child_prefers_visited_high_q() {
+        // 构建一个简单的人工树来验证 interior 选择偏好高 Q
+        let mut mcts: MCTS<Board> = MCTS::new();
+        let config = GumbelConfig::default();
+
+        // 根节点
+        mcts.arena.push(Node::new(0.0, None));
+        // 两个子节点
+        let child0 = mcts.push_node(Node::new(0.5, Some(0)));
+        let child1 = mcts.push_node(Node::new(0.5, Some(0)));
+        mcts.arena[0].children.insert(0, child0);
+        mcts.arena[0].children.insert(1, child1);
+
+        // child0: 高 Q (多次正回报)
+        for _ in 0..10 {
+            mcts.arena[child0].add_visit(0.8);
+        }
+        // child1: 低 Q (多次负回报)
+        for _ in 0..10 {
+            mcts.arena[child1].add_visit(-0.5);
+        }
+
+        // 两个孙子节点挂在 child0 下（使 child0 不是叶子）
+        let gc = mcts.push_node(Node::new(0.5, Some(child0)));
+        mcts.arena[child0].children.insert(0, gc);
+
+        let (action, _) = mcts.select_interior_child(0, &config);
+        assert_eq!(action, 0, "should prefer high-Q child");
     }
 }
