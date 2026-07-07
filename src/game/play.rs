@@ -28,7 +28,8 @@ pub fn play_game<E: Evaluator>(evaluator: &E, num_simulations: usize) {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let result = run_game_loop(&mut terminal, evaluator, num_simulations);
+    let result =
+        futures_executor::block_on(run_game_loop(&mut terminal, evaluator, num_simulations));
 
     disable_raw_mode().unwrap();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
@@ -50,7 +51,7 @@ struct GameState {
     game_over: bool,
 }
 
-fn run_game_loop<E: Evaluator>(
+async fn run_game_loop<E: Evaluator>(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     evaluator: &E,
     num_simulations: usize,
@@ -101,7 +102,7 @@ fn run_game_loop<E: Evaluator>(
                             // 如果人类落子后游戏未结束，轮到 AI
                             if !state.board.game_over {
                                 terminal.draw(|f| render(f, &state))?;
-                                ai_move(&mut state, evaluator, num_simulations);
+                                ai_move(&mut state, evaluator, num_simulations).await;
                             }
                         } else {
                             state.message = "该位置已有棋子！".into();
@@ -126,11 +127,12 @@ fn run_game_loop<E: Evaluator>(
     }
 }
 
-fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
+async fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
     let config = GumbelConfig::pure_gumbel(num_simulations);
     let result = state
         .mcts
-        .search(&mut state.board, evaluator, &config, &mut rand::rng());
+        .search(&mut state.board, evaluator, &config, &mut rand::rng())
+        .await;
 
     let npos = state.board.num_positions();
     if result.best_move < npos {

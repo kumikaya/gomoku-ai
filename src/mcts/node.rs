@@ -390,7 +390,7 @@ impl<G: Game> MCTS<G> {
 
     // ── Gumbel Zero search ──
 
-    pub fn search<E: Evaluator>(
+    pub async fn search<E: Evaluator>(
         &mut self,
         game: &G,
         evaluator: &E,
@@ -415,7 +415,7 @@ impl<G: Game> MCTS<G> {
 
         // ── Phase 1: 根节点 NN 评估 ──
         let root_encoding = game.encode();
-        let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]);
+        let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]).await;
         let root_nn_value = root_values[0];
 
         let raw_policy_probs = Self::softmax_legal(&root_logits[0], &legal_moves);
@@ -516,7 +516,7 @@ impl<G: Game> MCTS<G> {
                 self.backprop_path(&path, terminal_value);
             } else {
                 let encoding = sim_game.encode();
-                let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]);
+                let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]).await;
                 let legal_leaf = sim_game.legal_actions();
                 let probs = Self::softmax_legal(&policies_batch[0], &legal_leaf);
 
@@ -898,7 +898,7 @@ mod tests {
     }
 
     impl Evaluator for MockEvaluator {
-        fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>) {
+        async fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>) {
             let action_dim = states.first().map_or(0, |s| s.len());
             let policies: Vec<Vec<f32>> = states
                 .iter()
@@ -935,7 +935,8 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         // 最佳走法应当在合法范围内
         assert!(result.best_move < 9, "best_move 应为合法索引");
@@ -979,7 +980,8 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(32);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         // best_move 应等于 action_shape（9），表示无合法动作
         assert_eq!(result.best_move, 9, "终局应无合法动作");
@@ -1013,7 +1015,8 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         assert_eq!(result.best_move, only_move, "唯一走法应被选中");
     }
@@ -1042,7 +1045,8 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(256);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         let win_move = board.pos_to_idx(0, 2);
         // 制胜走法的访问次数应在所有走法中排第一
@@ -1083,7 +1087,8 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(256);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         let block_move = board.pos_to_idx(0, 2);
         assert!(result.best_move < 9);
@@ -1106,7 +1111,8 @@ mod tests {
 
         let config = GumbelConfig::pure_gumbel(32);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         // 在 pure_gumbel 模式下，根节点 prior = NN 输出
         assert!(
@@ -1131,10 +1137,12 @@ mod tests {
         let mut rng2 = rand::rngs::SmallRng::seed_from_u64(42);
 
         let mut mcts1: MCTS<Board> = MCTS::new();
-        let result1 = mcts1.search(&board, &evaluator, &config, &mut rng1);
+        let result1 =
+            futures_executor::block_on(mcts1.search(&board, &evaluator, &config, &mut rng1));
 
         let mut mcts2: MCTS<Board> = MCTS::new();
-        let result2 = mcts2.search(&board, &evaluator, &config, &mut rng2);
+        let result2 =
+            futures_executor::block_on(mcts2.search(&board, &evaluator, &config, &mut rng2));
 
         assert_eq!(result1.best_move, result2.best_move);
         assert!(
@@ -1175,7 +1183,8 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::mixed(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
         assert!(result.best_move < 9);
         assert!((result.policy.iter().sum::<f32>() - 1.0).abs() < 0.01);
     }
@@ -1204,7 +1213,8 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(128);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         let win_move = board.pos_to_idx(0, 2);
         // 制胜走法应拥有最高 policy 概率
@@ -1246,7 +1256,12 @@ mod tests {
             if board.game_over {
                 break;
             }
-            let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+            let result = futures_executor::block_on(mcts.search(
+                &board,
+                &evaluator,
+                &config,
+                &mut rand::rng(),
+            ));
             if result.best_move >= 9 {
                 break;
             }
@@ -1298,7 +1313,8 @@ mod tests {
         let evaluator = MockEvaluator::new().with_value(board.encode(), 1.0);
         let config = GumbelConfig::pure_gumbel(1024);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
+        let result =
+            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
         // root_value 是 MCTS 根据模拟回传 + NN 估值综合算出，
         // 在 NN 估值 = 1.0 的情况下，root_value 应偏正。

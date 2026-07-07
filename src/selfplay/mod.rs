@@ -30,6 +30,7 @@ impl SelfPlayGame {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct SelfPlayConfig {
     pub num_simulations: usize,
     pub select_temperature: f32,
@@ -45,7 +46,7 @@ impl Default for SelfPlayConfig {
 }
 
 /// 运行一局自对弈。每一步都产生训练样本。
-pub fn self_play<E: Evaluator>(
+pub async fn self_play<E: Evaluator>(
     evaluator: &E,
     config: &SelfPlayConfig,
     rng: &mut impl RngExt,
@@ -58,7 +59,7 @@ pub fn self_play<E: Evaluator>(
         let mut search_config = GumbelConfig::pure_gumbel(config.num_simulations);
         search_config.select_temperature = config.select_temperature;
 
-        let result = mcts.search(&board, evaluator, &search_config, rng);
+        let result = mcts.search(&board, evaluator, &search_config, rng).await;
 
         let kl = compute_kl(&result.root_nn_prior, &result.policy);
         records.push(PlayRecord {

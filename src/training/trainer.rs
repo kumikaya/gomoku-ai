@@ -23,11 +23,13 @@ use burn::{
     optim::{AdamWConfig, GradientsParams},
     tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
 };
+use futures::task::SpawnExt;
+use futures_executor::ThreadPool;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // ── 配置 ──
 
@@ -100,17 +102,20 @@ pub struct Trainer {
     device: Device,
     buffer: RolloutBuffer<PlayRecord>,
     metrics_logger: TrainingLogger,
+    pool: ThreadPool,
 }
 
 impl Trainer {
     pub fn new(config: TrainConfig, device: Device) -> Self {
         let cap = config.buffer_capacity;
         let metrics_logger = TrainingLogger::new(&config.model_dir);
+        let pool = ThreadPool::new().expect("Failed to create thread pool");
         Self {
             config,
             device,
-            buffer: RolloutBuffer::<PlayRecord>::new(cap),
+            buffer: RolloutBuffer::new(cap),
             metrics_logger,
+            pool,
         }
     }
 
@@ -243,8 +248,9 @@ impl Trainer {
                     println!();
                     println!("  === Tournament Evaluation (iter {}) ===", epoch);
                     let result = runner.run_match(
+                        &self.pool,
                         &inference_server,
-                        bs.server(),
+                        &bs.server(),
                         master_rng.random::<u64>(),
                     );
                     result.print();
@@ -310,7 +316,7 @@ impl Trainer {
             println!("  Temperature: {:.2}", temp);
         }
 
-        let pb = ProgressBar::new(total as u64);
+        let pb = Arc::new(ProgressBar::new(total as u64));
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("  Self-play: {bar:40.cyan/blue} {pos}/{len} ({eta})")
@@ -325,16 +331,29 @@ impl Trainer {
 
         let base_seed = master_rng.random::<u64>();
 
-        let all_records: Vec<PlayRecord> = (0..total)
-            .into_par_iter()
-            .flat_map(|game_i| {
-                let seed = base_seed.wrapping_add(game_i as u64);
-                let mut game_rng = StdRng::seed_from_u64(seed);
-                let game = self_play(inference_server, &sp_config, &mut game_rng);
-                pb.inc(1);
-                game.records
-            })
-            .collect();
+        let mut handles = Vec::with_capacity(total);
+        for game_i in 0..total {
+            let seed = base_seed.wrapping_add(game_i as u64);
+            let pb = Arc::clone(&pb);
+            let sp_config = sp_config.clone();
+            let inf = inference_server.clone();
+
+            // 关键：spawn 到线程池，handle 可以并发等待
+            let handle = self
+                .pool
+                .spawn_with_handle(async move {
+                    let mut game_rng = StdRng::seed_from_u64(seed);
+                    let records = self_play(&inf, &sp_config, &mut game_rng).await.records;
+                    pb.inc(1);
+                    records
+                })
+                .expect("spawn selfplay task");
+
+            handles.push(handle);
+        }
+        let results: Vec<Vec<PlayRecord>> =
+            futures_executor::block_on(futures::future::join_all(handles));
+        let all_records: Vec<PlayRecord> = results.into_iter().flatten().collect();
 
         pb.finish_and_clear();
 

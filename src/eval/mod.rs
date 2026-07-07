@@ -12,10 +12,11 @@ use crate::network::transformer::GomokuNetwork;
 
 use burn::module::{AutodiffModule, Module};
 use burn::tensor::Device;
+use futures::task::SpawnExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::SeedableRng;
-use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // ============================================================
 //  Elo 评分系统
@@ -175,49 +176,62 @@ impl MatchRunner {
 
     pub fn run_match(
         &self,
+        pool: &futures_executor::ThreadPool,
         current_server: &InferenceServer,
         baseline_server: &InferenceServer,
         rng_seed: u64,
     ) -> MatchResult {
         let num_games = self.config.num_games;
         let half = num_games / 2;
+        let num_sim = self.config.num_simulations;
 
-        let pb = ProgressBar::new(num_games as u64);
+        let cur = current_server.clone();
+        let base = baseline_server.clone();
+
+        let pb = Arc::new(ProgressBar::new(num_games as u64));
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("  Eval match: {bar:40.yellow/blue} {pos}/{len} ({eta})")
                 .unwrap(),
         );
 
-        let outcomes_current_black: Vec<GameOutcome> = (0..half)
-            .into_par_iter()
-            .map(|game_i| {
-                let seed = rng_seed.wrapping_add(game_i as u64);
-                let result = play_eval_game(
-                    current_server,
-                    baseline_server,
-                    self.config.num_simulations,
-                    seed,
-                );
+        // 当前模型执黑
+        let mut handles = Vec::with_capacity(half);
+        for game_i in 0..half {
+            let seed = rng_seed.wrapping_add(game_i as u64);
+            let pb = Arc::clone(&pb);
+            let cur = cur.clone();
+            let base = base.clone();
+            let handle = pool
+                .spawn_with_handle(async move { play_eval_game(&cur, &base, num_sim, seed).await })
+                .expect("spawn eval task");
+            handles.push(async move {
+                let r = handle.await;
                 pb.inc(1);
-                result
-            })
-            .collect();
+                r
+            });
+        }
+        let outcomes_current_black: Vec<GameOutcome> =
+            futures_executor::block_on(futures::future::join_all(handles));
 
-        let outcomes_current_white: Vec<GameOutcome> = (0..num_games - half)
-            .into_par_iter()
-            .map(|game_i| {
-                let seed = rng_seed.wrapping_add((half + game_i) as u64);
-                let result = play_eval_game(
-                    baseline_server,
-                    current_server,
-                    self.config.num_simulations,
-                    seed,
-                );
+        // 当前模型执白
+        let mut handles = Vec::with_capacity(num_games - half);
+        for game_i in 0..num_games - half {
+            let seed = rng_seed.wrapping_add((half + game_i) as u64);
+            let pb = Arc::clone(&pb);
+            let cur = cur.clone();
+            let base = base.clone();
+            let handle = pool
+                .spawn_with_handle(async move { play_eval_game(&base, &cur, num_sim, seed).await })
+                .expect("spawn eval task");
+            handles.push(async move {
+                let r = handle.await;
                 pb.inc(1);
-                result
-            })
-            .collect();
+                r
+            });
+        }
+        let outcomes_current_white: Vec<GameOutcome> =
+            futures_executor::block_on(futures::future::join_all(handles));
 
         pb.finish_and_clear();
 
@@ -264,7 +278,7 @@ impl MatchRunner {
 //  评估对弈逻辑
 // ============================================================
 
-fn play_eval_game(
+async fn play_eval_game(
     black_server: &InferenceServer,
     white_server: &InferenceServer,
     num_simulations: usize,
@@ -286,14 +300,13 @@ fn play_eval_game(
     for _ in 0..max_moves {
         let is_black = board.current_player == Color::Black;
 
-        let eval: &InferenceServer = if is_black { black_server } else { white_server };
-        let mcts = if is_black {
-            &mut black_mcts
+        let (eval, mcts) = if is_black {
+            (black_server, &mut black_mcts)
         } else {
-            &mut white_mcts
+            (white_server, &mut white_mcts)
         };
 
-        let result = mcts.search(&mut board, eval, &config, &mut rng);
+        let result = mcts.search(&mut board, eval, &config, &mut rng).await;
 
         if result.best_move >= npos || !board.play_idx(result.best_move) {
             break;

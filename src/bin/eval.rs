@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use burn::module::Module;
 use burn::store::ModuleRecord;
 use clap::Parser;
+use futures_executor::ThreadPool;
 use gomoku_ai::eval::{EvalConfig, MatchRunner};
 use gomoku_ai::inference::InferenceServer;
 use gomoku_ai::network::transformer::GomokuNetwork;
@@ -64,9 +65,10 @@ fn main() {
         ..Default::default()
     };
     let runner = MatchRunner::new(config);
+    let pool = ThreadPool::new().expect("Failed to create thread pool");
     let server_c = InferenceServer::new(challenger_model, device.clone());
     let server_b = InferenceServer::new(baseline_model, device);
-    let result = runner.run_match(&server_c, &server_b, 0);
+    let result = runner.run_match(&pool, &server_c, &server_b, 0);
 
     println!();
     result.print();

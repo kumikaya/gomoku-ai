@@ -5,6 +5,7 @@
 
 use crate::network::transformer::{GomokuNetwork, policy_out_dim};
 use burn::tensor::{Device, FloatDType, Int, Tensor};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 批量评估上限（GPU 线程内部攒批的最大请求数）
@@ -24,7 +25,10 @@ const BATCH_TIMEOUT: Duration = Duration::from_micros(200);
 ///
 /// 返回结果与输入一一对应：`policies.len() == values.len() == states.len()`。
 pub trait Evaluator: Send + Sync {
-    fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>);
+    fn evaluate_batch(
+        &self,
+        states: &[Vec<i32>],
+    ) -> impl Future<Output = (Vec<Vec<f32>>, Vec<f32>)> + Send;
 }
 
 // ============================================================
@@ -33,7 +37,7 @@ pub trait Evaluator: Send + Sync {
 
 struct InferenceRequest {
     states: Vec<Vec<i32>>,
-    response_tx: crossbeam_channel::Sender<(Vec<Vec<f32>>, Vec<f32>)>,
+    response_tx: async_channel::Sender<(Vec<Vec<f32>>, Vec<f32>)>,
 }
 
 /// GPU 线程支持两类命令：
@@ -50,7 +54,7 @@ enum GpuCommand {
 
 struct InferenceServerInner {
     cmd_tx: crossbeam_channel::Sender<GpuCommand>,
-    gpu_handle: std::thread::JoinHandle<()>,
+    _gpu_handle: std::thread::JoinHandle<()>,
 }
 
 /// GPU 推理服务。
@@ -70,8 +74,9 @@ struct InferenceServerInner {
 ///
 /// 析构时关闭请求通道 → 等待 GPU 线程完成最后一批推理后退出。
 /// 如果在退出前有未完成的请求，`Drop` 会 join 线程确保安全。
+#[derive(Clone)]
 pub struct InferenceServer {
-    inner: Option<InferenceServerInner>,
+    inner: Arc<InferenceServerInner>,
 }
 
 impl InferenceServer {
@@ -87,7 +92,10 @@ impl InferenceServer {
         });
 
         Self {
-            inner: Some(InferenceServerInner { cmd_tx, gpu_handle }),
+            inner: Arc::new(InferenceServerInner {
+                cmd_tx,
+                _gpu_handle: gpu_handle,
+            }),
         }
     }
 
@@ -96,12 +104,8 @@ impl InferenceServer {
     /// 阻塞直到更新完成。调用方应在训练更新权重后调用此方法，
     /// 使下一轮自对弈使用最新模型。
     pub fn update_model(&self, model: GomokuNetwork) {
-        let inner = self
-            .inner
-            .as_ref()
-            .expect("InferenceServer already shut down");
         let (done_tx, done_rx) = crossbeam_channel::bounded(0);
-        inner
+        self.inner
             .cmd_tx
             .send(GpuCommand::UpdateModel { model, done_tx })
             .expect("GPU inference thread died");
@@ -161,7 +165,7 @@ impl InferenceServer {
             pol_offset += n * policy_out;
             val_offset += n;
 
-            let _ = req.response_tx.send((policies, values));
+            let _ = req.response_tx.send_blocking((policies, values));
         }
     }
 
@@ -220,30 +224,15 @@ impl InferenceServer {
 }
 
 impl Evaluator for InferenceServer {
-    fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>) {
-        let inner = self
-            .inner
-            .as_ref()
-            .expect("InferenceServer already shut down");
-        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
-        inner
+    async fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let (response_tx, response_rx) = async_channel::bounded(1);
+        self.inner
             .cmd_tx
             .send(GpuCommand::Evaluate(InferenceRequest {
                 states: states.to_vec(),
                 response_tx,
             }))
             .expect("GPU inference thread died");
-        response_rx.recv().expect("GPU inference thread died")
-    }
-}
-
-impl Drop for InferenceServer {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            // 关闭请求通道，通知 GPU 线程退出
-            drop(inner.cmd_tx);
-            // 等待 GPU 线程处理完最后一批
-            let _ = inner.gpu_handle.join();
-        }
+        response_rx.recv().await.expect("GPU inference thread died")
     }
 }
