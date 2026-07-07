@@ -225,6 +225,12 @@ pub struct SearchResult {
     pub root_value: f32,
     /// NN 原始先验概率
     pub root_nn_prior: Vec<f32>,
+    /// NN 对根节点的估值（未经 MCTS 修正）
+    pub root_nn_value: f32,
+    /// 每个动作的子节点 Q 值（未访问动作为 0）
+    pub children_q: Vec<f32>,
+    /// 每个动作的子节点访问次数
+    pub children_visits: Vec<u32>,
 }
 
 // 暂存本轮每个 walk 的上下文
@@ -407,6 +413,9 @@ impl<G: Game> MCTS<G> {
                 policy: vec![0.0; action_shape],
                 root_value: 0.0,
                 root_nn_prior: vec![0.0; action_shape],
+                root_nn_value: 0.0,
+                children_q: vec![0.0; action_shape],
+                children_visits: vec![0; action_shape],
             };
         }
 
@@ -567,6 +576,15 @@ impl<G: Game> MCTS<G> {
         // ── Phase 4: 构建 completed Q 策略（干净 logit） ──
         let (policy, root_value) = self.build_completed_q_policy(root_nn_value, num_sim, config);
 
+        // 收集每个动作的子节点 Q 值 & 访问次数
+        let mut children_q = vec![0.0f32; action_shape];
+        let mut children_visits = vec![0u32; action_shape];
+        for (action, &child_id) in self.root().children.occupied() {
+            let node = self.node(child_id);
+            children_q[action] = node.q();
+            children_visits[action] = node.visit_count;
+        }
+
         // ── Phase 5: 动作选择（softmax over visit counts） ──
         let best_move = self.select_by_softmax_count(config.select_temperature, rng);
 
@@ -575,6 +593,9 @@ impl<G: Game> MCTS<G> {
             policy,
             root_value,
             root_nn_prior: raw_policy_probs,
+            root_nn_value,
+            children_q,
+            children_visits,
         }
     }
 
@@ -614,11 +635,9 @@ impl<G: Game> MCTS<G> {
             + (config.sigma_visit_c + max_n) * config.sigma_scale_c * var_scale * node.q()
     }
 
-    /// Completed Q policy: clean logit + Q-term softmax.
+    /// Completed Q policy (minizero-style): clean logit + Q-term softmax.
     ///
-    /// Uses LightZero-style Q rescaling: min-max normalize Q to [0,1],
-    /// then scale by (maxvisit_init + max_n) * value_scale to keep
-    /// Q contribution similar in magnitude to logit (no single term dominates).
+    /// score = logit_without_noise + (sigma_visit_c + max_n) * sigma_scale_c * q
     fn build_completed_q_policy(
         &self,
         root_nn_value: f32,
@@ -641,15 +660,15 @@ impl<G: Game> MCTS<G> {
             })
             .collect();
 
-        // Mixed value for unvisited children (LightZero _compute_mixed_value)
-        let priors_q: f32 = entries.iter().filter_map(|&(_, _, q, _)| q).sum();
+        // minizero-style mixed value for unvisited children:
+        // non_visited_node_value = 1/(1+N) * (value_pi + (N / Σπ) * Σ(π·Q))
+        let pi_sum: f32 = entries.iter().map(|&(_, _, _, p)| p).sum();
         let prior_weighted_q: f32 = entries
             .iter()
             .filter_map(|&(_, _, q, p)| q.map(|v| p * v))
             .sum();
-        let mixed_value = if priors_q > 0.0 {
-            (root_nn_value + (num_sim as f32 / priors_q) * prior_weighted_q)
-                / (1.0 + num_sim as f32)
+        let mixed_value = if pi_sum > 0.0 {
+            (root_nn_value + (num_sim as f32 / pi_sum) * prior_weighted_q) / (1.0 + num_sim as f32)
         } else {
             root_nn_value
         };
@@ -660,16 +679,8 @@ impl<G: Game> MCTS<G> {
             .map(|&(a, ci, q, _)| (a, ci, q.unwrap_or(mixed_value)))
             .collect();
 
-        // LightZero Q rescale: min-max normalize to [0,1]
-        let (q_min, q_max) = completed.iter().fold(
-            (f32::INFINITY, f32::NEG_INFINITY),
-            |(min, max), &(_, _, v)| (min.min(v), max.max(v)),
-        );
-        let q_gap = (q_max - q_min).max(1e-8);
-
-        // Score = clean_logit + visit_scale * sigma_scale * rescaled_q
-        // LightZero: visit_scale = maxvisit_init + max_n,
-        // effective_scale = visit_scale * value_scale where value_scale << 1
+        // minizero-style: use raw Q directly, no min-max rescaling
+        // Score = clean_logit + (sigma_visit_c + max_n) * sigma_scale_c * q
         let max_n = completed
             .iter()
             .map(|&(_, ci, _)| self.node(ci).visit_count_f32())
@@ -679,9 +690,8 @@ impl<G: Game> MCTS<G> {
         let mut scores: Vec<(ActionId, f32)> = Vec::new();
         let mut max_score = f32::NEG_INFINITY;
         for &(action, child_id, q) in &completed {
-            let rescaled_q = (q - q_min) / q_gap;
             let clean_logit = self.node(child_id).logit_without_noise();
-            let score = clean_logit + effective_scale * rescaled_q;
+            let score = clean_logit + effective_scale * q;
             scores.push((action, score));
             if score > max_score {
                 max_score = score;
