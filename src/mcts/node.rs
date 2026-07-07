@@ -57,7 +57,11 @@ pub struct GumbelConfig {
     pub num_simulations: usize,
     pub sample_size: usize,
     pub sigma_visit_c: f32,
-    pub sigma_scale_c: f32,
+    /// halving 筛选时 Q 项缩放系数（与 minizero 的 actor_gumbel_sigma_scale_c 对齐）
+    pub sigma_scale_h: f32,
+    /// 最终策略 (completed Q policy) 的 Q 项缩放系数
+    /// 独立于 halving，允许分离调参
+    pub sigma_scale_p: f32,
     pub pure_gumbel_noise: bool,
     /// 最终动作选择的 softmax 温度（默认 1.0）
     pub select_temperature: f32,
@@ -77,11 +81,12 @@ impl Default for GumbelConfig {
             num_simulations: 64,
             sample_size: 16,
             sigma_visit_c: 50.0,
-            sigma_scale_c: 0.1,
+            sigma_scale_h: 0.3,
+            sigma_scale_p: 0.1,
             pure_gumbel_noise: true,
             select_temperature: 1.0,
             root_policy_temperature: 1.0,
-            dynamic_cpuct: true,
+            dynamic_cpuct: false,
             fpu_reduction: 0.0,
             dirichlet_alpha: 0.1,
             dirichlet_epsilon: 0.03,
@@ -633,6 +638,22 @@ impl<G: Game> MCTS<G> {
         (num_sim as f32 / d).floor() as u32
     }
 
+    /// effective_scale_h = (sigma_visit_c + max_n) * sigma_scale_h
+    ///
+    /// 线性增长让 halving 后期由 Q 主导，保证筛选稳定性。
+    #[inline]
+    fn effective_scale_h(max_n: f32, config: &GumbelConfig) -> f32 {
+        (config.sigma_visit_c + max_n) * config.sigma_scale_h
+    }
+
+    /// effective_scale_p = (sigma_visit_c + max_n) * sigma_scale_p
+    ///
+    /// completed Q policy 使用独立的缩放系数，通常小于 halving 的。
+    #[inline]
+    fn effective_scale_p(max_n: f32, config: &GumbelConfig) -> f32 {
+        (config.sigma_visit_c + max_n) * config.sigma_scale_p
+    }
+
     fn max_root_count(&self) -> f32 {
         self.root()
             .children
@@ -644,7 +665,7 @@ impl<G: Game> MCTS<G> {
     /// minizero getNormalizedMean: global min-max rescale self-perspective
     /// mean to [-1,1], then flip to parent perspective.
     #[inline]
-    fn normalized_q(&self, node: &Node<G>) -> f32 {
+    pub fn normalized_q(&self, node: &Node<G>) -> f32 {
         if node.visit_count == 0 {
             return 0.0;
         }
@@ -655,7 +676,7 @@ impl<G: Game> MCTS<G> {
     }
 
     /// σ-score：带噪声 logit + normalized Q 项。
-    fn sigma_score(&self, node: &Node<G>, max_n: f32, config: &GumbelConfig) -> f32 {
+    pub fn sigma_score(&self, node: &Node<G>, max_n: f32, config: &GumbelConfig) -> f32 {
         if node.visit_count == 0 {
             return f32::NEG_INFINITY;
         }
@@ -665,15 +686,12 @@ impl<G: Game> MCTS<G> {
             1.0
         };
         node.policy_logit
-            + (config.sigma_visit_c + max_n)
-                * config.sigma_scale_c
-                * var_scale
-                * self.normalized_q(node)
+            + Self::effective_scale_h(max_n, config) * var_scale * self.normalized_q(node)
     }
 
     /// Completed Q policy (minizero-style): clean logit + Q-term softmax.
     ///
-    /// score = logit_without_noise + (sigma_visit_c + max_n) * sigma_scale_c * q
+    /// score = logit_without_noise + sqrt(σ_visit_c + max_n) * σ_scale_c * q
     fn build_completed_q_policy(
         &self,
         root_nn_value: f32,
@@ -721,7 +739,7 @@ impl<G: Game> MCTS<G> {
             .iter()
             .map(|&(_, ci, _)| self.node(ci).visit_count_f32())
             .fold(0.0f32, f32::max);
-        let effective_scale = (config.sigma_visit_c + max_n) * config.sigma_scale_c;
+        let effective_scale = Self::effective_scale_p(max_n, config);
 
         let mut scores: Vec<(ActionId, f32)> = Vec::new();
         let mut max_score = f32::NEG_INFINITY;
