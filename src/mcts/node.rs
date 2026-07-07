@@ -27,6 +27,7 @@ use super::table::Table;
 use crate::inference::Evaluator;
 use itertools::Itertools;
 use rand::RngExt;
+use rand::distr::Distribution;
 
 /// 对数计算的最小概率下限，防止 ln(0) = -inf
 const MIN_PROB: f32 = 1e-15;
@@ -55,8 +56,6 @@ pub type NodeId = usize;
 pub struct GumbelConfig {
     pub num_simulations: usize,
     pub sample_size: usize,
-    /// 每次 GPU forward 攒批的叶子数（默认 8，对齐 minizero actor_mcts_think_batch_size）
-    pub think_batch_size: usize,
     pub sigma_visit_c: f32,
     pub sigma_scale_c: f32,
     pub pure_gumbel_noise: bool,
@@ -77,7 +76,6 @@ impl Default for GumbelConfig {
         Self {
             num_simulations: 64,
             sample_size: 16,
-            think_batch_size: 8,
             sigma_visit_c: 50.0,
             sigma_scale_c: 0.1,
             pure_gumbel_noise: true,
@@ -130,8 +128,6 @@ pub struct Node<G: Game> {
     pub expanded: bool,
     /// 该节点对应哪个玩家的回合
     pub player: G::Player,
-    /// Virtual loss：攒批 evaluate 期间让 PUCT walk 发散
-    pub virtual_loss: u32,
 }
 
 impl<G: Game> Node<G> {
@@ -152,7 +148,6 @@ impl<G: Game> Node<G> {
             children: Table::new(action_shape),
             expanded: false,
             player,
-            virtual_loss: 0,
         }
     }
 
@@ -209,12 +204,6 @@ impl<G: Game> Node<G> {
         self.total_value += value;
         self.value_sq_sum += value * value;
     }
-
-    /// visit_count 含 virtual loss（用于 PUCT walk 时让后续 walk 发散）
-    #[inline]
-    pub fn effective_visits(&self) -> u32 {
-        self.visit_count + self.virtual_loss
-    }
 }
 
 // ============================================================
@@ -239,13 +228,6 @@ pub struct SearchResult {
 }
 
 // 暂存本轮每个 walk 的上下文
-struct EvalCtx {
-    path: Vec<NodeId>,
-    legal: Vec<ActionId>,
-    /// game_over 时固化当前玩家的 terminal_value，消费阶段直接使用
-    terminal_value: Option<f32>,
-}
-
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
         Self { arena: Vec::new() }
@@ -339,8 +321,6 @@ impl<G: Game> MCTS<G> {
 
     /// PUCT walk，返回从 `start_node_idx`（含）到叶子节点（含）的路径。
     /// 对齐 minizero `selectFromNode`：起始节点始终在 path[0]。
-    /// PUCT 公式中 `n` 用 effective_visits（visit_count + virtual_loss），
-    /// 使攒批期间的连续 walk 自然分到不同叶子。
     ///
     /// 若 `dynamic_cpuct` 启用，则 bias 乘以 `sqrt(child_variance)`，
     /// 使效用波动大的局面多探索（对齐 KataGo Dynamic Variance-Scaled cPUCT）。
@@ -368,19 +348,17 @@ impl<G: Game> MCTS<G> {
                 }
 
                 let node = self.node(node_idx);
-                let total_simulation = node.effective_visits().max(1) as f32;
+                let total_simulation = (node.visit_count).max(1) as f32;
                 let bias = Self::puct_bias(total_simulation);
                 let sqrt_total = total_simulation.sqrt();
                 let init_q = self.init_q_value(node_idx);
-                // FPU Reduction (KataGo): 未访问子节点悲观估计，避免在明显差走法上浪费模拟
                 let fpu_q = init_q - fpu_reduction;
 
                 let children = &node.children;
                 let mut best: Option<(ActionId, NodeId, f32, f32)> = None;
                 for (action, &child_id) in children.occupied() {
                     let child = self.node(child_id);
-                    let n = child.effective_visits() as f32;
-                    // q() 已返回父节点视角，fpu_q 也是父节点视角，直接使用
+                    let n = child.visit_count as f32;
                     let q = if child.visit_count > 0 {
                         child.q()
                     } else {
@@ -495,130 +473,73 @@ impl<G: Game> MCTS<G> {
             .take(sample_n)
             .collect();
 
-        // ── Phase 3: 模拟循环（攒批 evaluate）──
-        // 对标 minizero ZeroActor::step()：
-        //   连续做 batch_size 次 PUCT walk → 攒特征 → 一次 GPU forward → 消费结果。
-        //   virtual loss 让连续 walk 自然发散到不同叶子。
-        let batch_size = (sample_n.min(config.think_batch_size)).max(1);
-
+        // ── Phase 3: 模拟循环（每次一个 walk → evaluate → backprop）──
+        // 对齐 minizero think_batch_size = 1，
+        // 确保 Sequential Halving 的访问计数始终准确。
         let mut cur_sample = sample_n;
         let mut sim_budget = Self::gumbel_budget(num_sim, cur_sample);
-        let mut sim_i = 0;
 
-        loop {
-            if sim_i >= num_sim {
-                break;
-            }
+        for _ in 0..num_sim {
+            // ── selection ──
+            let mut sim_game = game.clone();
 
-            // ── 一轮批量：连续 walk 攒 batch_size 个叶子 ──
-            let round = (num_sim - sim_i).min(batch_size);
-            let mut contexts: Vec<EvalCtx> = Vec::with_capacity(round);
-            let mut encodings: Vec<Vec<i32>> = Vec::with_capacity(round);
-
-            for _ in 0..round {
-                // ── selection ──
-                let mut sim_game = game.clone();
-
-                // Sequential Halving: 选 effective_visits 最少的 candidate，
-                // tie-break 选 policy_logit 最大的（首次模拟时所有 candidate
-                // effective_visits == 0，等价于选 Phase 2 排序后的 top-1）。
-                let (action, start_ci) = candidates
-                    .iter()
-                    .copied()
-                    .min_by(|&(_, a), &(_, b)| {
-                        self.node(a)
-                            .effective_visits()
-                            .cmp(&self.node(b).effective_visits())
-                            .then_with(|| {
-                                self.node(b)
-                                    .policy_logit
-                                    .partial_cmp(&self.node(a).policy_logit)
-                                    .unwrap()
-                            })
-                    })
-                    .unwrap();
-                sim_game.play(action);
-
-                let p_from = self.puct_walk(
-                    start_ci,
-                    &mut sim_game,
-                    config.dynamic_cpuct,
-                    config.fpu_reduction,
-                );
-                let mut path_vec = vec![0];
-                path_vec.extend(p_from);
-                let path = path_vec;
-
-                // add virtual loss 到这条路径上
-                for &ni in &path {
-                    self.node_mut(ni).virtual_loss += 1;
-                }
-
-                let leaf_idx = *path.last().unwrap();
-
-                let terminal_value = sim_game.terminal_value();
-                let mut legal_leaf = Vec::new();
-                if !sim_game.is_terminal() {
-                    debug_assert!(!self.node(leaf_idx).expanded);
-                    let encoding = sim_game.encode();
-                    encodings.push(encoding);
-                    legal_leaf = sim_game.legal_actions();
-                }
-                contexts.push(EvalCtx {
-                    path,
-                    legal: legal_leaf,
-                    terminal_value,
-                });
-
-                sim_i += 1;
-            }
-
-            // ── 批量 GPU forward ──
-            let eval_result = if !encodings.is_empty() {
-                Some(evaluator.evaluate_batch(&encodings))
-            } else {
-                None
-            };
-
-            // ── 消费结果：expand + backprop，清除 virtual loss ──
-            let mut batch_result_idx = 0;
-            for ctx in contexts.into_iter() {
-                // 一次性清除 virtual loss（walks 已完成，不再需要发散）
-                for &ni in &ctx.path {
-                    self.node_mut(ni).virtual_loss = 0;
-                }
-
-                if let Some(terminal_value) = ctx.terminal_value {
-                    self.backprop_path(&ctx.path, terminal_value);
-                } else {
-                    let (policies_batch, values_batch) = eval_result.as_ref().unwrap();
-                    let probs = Self::softmax_legal(&policies_batch[batch_result_idx], &ctx.legal);
-
-                    let leaf_idx = *ctx.path.last().unwrap();
-                    let gumbel_noises_leaf = vec![0.0f32; ctx.legal.len()];
-                    let child_data_leaf: Vec<(f32, f32)> = ctx
-                        .legal
-                        .iter()
-                        .map(|&action| {
-                            let p = probs[action];
-                            (p, p.max(MIN_PROB).ln())
+            // Sequential Halving: 选 effective_visits 最少的 candidate
+            let (action, start_ci) = candidates
+                .iter()
+                .copied()
+                .min_by(|&(_, a), &(_, b)| {
+                    self.node(a)
+                        .visit_count
+                        .cmp(&self.node(b).visit_count)
+                        .then_with(|| {
+                            self.node(b)
+                                .policy_logit
+                                .partial_cmp(&self.node(a).policy_logit)
+                                .unwrap()
                         })
-                        .collect();
-                    self.expand_children(
-                        leaf_idx,
-                        &ctx.legal,
-                        &gumbel_noises_leaf,
-                        &child_data_leaf,
-                        action_shape,
-                    );
-                    self.node_mut(leaf_idx).expanded = true;
-                    // values_batch 已经是叶子玩家视角（encode 使用 leaf player 视角编码）
-                    self.backprop_path(&ctx.path, values_batch[batch_result_idx]);
-                    batch_result_idx += 1;
-                }
+                })
+                .unwrap();
+            sim_game.play(action);
+
+            let p_from = self.puct_walk(
+                start_ci,
+                &mut sim_game,
+                config.dynamic_cpuct,
+                config.fpu_reduction,
+            );
+            let mut path = vec![0];
+            path.extend(p_from);
+
+            let leaf_idx = *path.last().unwrap();
+
+            if let Some(terminal_value) = sim_game.terminal_value() {
+                self.backprop_path(&path, terminal_value);
+            } else {
+                let encoding = sim_game.encode();
+                let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]);
+                let legal_leaf = sim_game.legal_actions();
+                let probs = Self::softmax_legal(&policies_batch[0], &legal_leaf);
+
+                let gumbel_noises_leaf = vec![0.0f32; legal_leaf.len()];
+                let child_data_leaf: Vec<(f32, f32)> = legal_leaf
+                    .iter()
+                    .map(|&action| {
+                        let p = probs[action];
+                        (p, p.max(MIN_PROB).ln())
+                    })
+                    .collect();
+                self.expand_children(
+                    leaf_idx,
+                    &legal_leaf,
+                    &gumbel_noises_leaf,
+                    &child_data_leaf,
+                    action_shape,
+                );
+                self.node_mut(leaf_idx).expanded = true;
+                self.backprop_path(&path, values_batch[0]);
             }
 
-            // ── sequentialHalving（每轮结束后检查一次）──
+            // ── sequentialHalving ──
             let all_reached = candidates
                 .iter()
                 .all(|&(_, ci)| self.node(ci).visit_count_f32() >= sim_budget as f32);
@@ -721,11 +642,7 @@ impl<G: Game> MCTS<G> {
             .collect();
 
         // Mixed value for unvisited children (LightZero _compute_mixed_value)
-        let priors_q: f32 = entries
-            .iter()
-            .filter(|&&(_, _, q, _)| q.is_some())
-            .map(|&(_, _, _, p)| p)
-            .sum();
+        let priors_q: f32 = entries.iter().filter_map(|&(_, _, q, _)| q).sum();
         let prior_weighted_q: f32 = entries
             .iter()
             .filter_map(|&(_, _, q, p)| q.map(|v| p * v))
@@ -909,7 +826,6 @@ impl<G: Game> MCTS<G> {
     }
 
     fn dirichlet_noise(n: usize, alpha: f32, rng: &mut impl RngExt) -> Vec<f32> {
-        use rand::distr::Distribution;
         let gamma = rand_distr::Gamma::new(alpha, 1.0).unwrap();
         let mut v: Vec<f32> = (0..n).map(|_| gamma.sample(rng)).collect();
         let s: f32 = v.iter().sum();
@@ -920,10 +836,9 @@ impl<G: Game> MCTS<G> {
     }
 
     fn gumbel_noise(n: usize, rng: &mut impl RngExt) -> Vec<f32> {
-        use rand::distr::Distribution;
-        let gumbel = rand_distr::Gumbel::new(0.0, 1.0).unwrap();
+        let gumbel = rand_distr::Gumbel::new(0.0f32, 1.0).unwrap();
         (0..n)
-            .map(|_| (gumbel.sample(rng) as f32).clamp(-5.0_f32, 5.0_f32))
+            .map(|_| gumbel.sample(rng).clamp(-12.0, 12.0))
             .collect()
     }
 }

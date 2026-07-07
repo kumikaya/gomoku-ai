@@ -65,7 +65,7 @@ pub fn self_play<E: Evaluator>(
             state: board.encode_state(),
             policy: result.policy,
             // 先写入 MCTS root value 作为占位，游戏结束后用最终结果修正
-            value: 0.0,
+            value: result.root_value,
             sample_weight: kl,
             player: board.current_player,
         });
