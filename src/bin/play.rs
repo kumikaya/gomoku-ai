@@ -12,7 +12,7 @@ use gomoku_ai::network::transformer::GomokuNetwork;
 #[command(about = "五子棋 AI — 人机对弈")]
 struct Cli {
     /// MCTS 模拟次数（Gumbel Zero 只需 32~64）
-    #[arg(short = 's', long, default_value = "512")]
+    #[arg(short = 's', long, default_value = "128")]
     simulations: usize,
 
     /// 模型文件路径（.bpk）

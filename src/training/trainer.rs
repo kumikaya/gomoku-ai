@@ -20,7 +20,7 @@ use burn::store::ModuleRecord;
 use burn::{
     grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
-    optim::{AdamWConfig, GradientsParams},
+    optim::{AdamConfig, GradientsParams},
     tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
 };
 use futures::task::SpawnExt;
@@ -48,9 +48,6 @@ pub struct TrainConfig {
     /// 从指定 checkpoint 路径恢复训练（None 则创建新模型）
     pub checkpoint: Option<PathBuf>,
 
-    /// LR warmup 比例：前 `lr_warmup_ratio` 比例迭代内线性 warmup，之后 cosine 衰减到 `lr_final_ratio`。
-    /// 0.05 = 前 5% 迭代 warmup。设为 0 表示仅 cosine 衰减（无 warmup）。
-    pub lr_warmup_ratio: f32,
     /// 最终学习率比例（相对于 `learning_rate`），cosine 衰减的底值。
     pub lr_final_ratio: f32,
     // ── 评估配置 ──
@@ -83,7 +80,6 @@ impl Default for TrainConfig {
             buffer_capacity: 80000,
             max_grad_norm: 1.0,
             checkpoint: None,
-            lr_warmup_ratio: 0.05,
             lr_final_ratio: 0.1,
             eval_enabled: true,
             eval_num_games: 100,
@@ -161,7 +157,7 @@ impl Trainer {
         let train_device = self.device.clone().autodiff();
         let mut model = self.load_model(&train_device);
 
-        let mut optim = AdamWConfig::new().init();
+        let mut optim = AdamConfig::new().init();
         if self.config.max_grad_norm > 0.0 {
             optim = optim
                 .with_grad_clipping(GradientClippingConfig::Norm(self.config.max_grad_norm).init());
@@ -198,14 +194,10 @@ impl Trainer {
         let mut master_rng = StdRng::seed_from_u64(self.config.random_seed);
         println!("  Random seed: {}", self.config.random_seed);
 
-        let lr_sched = LrSchedule::new(
-            self.config.num_iterations,
-            self.config.lr_warmup_ratio,
-            self.config.lr_final_ratio,
-        );
+        let lr_sched = LrSchedule::new(self.config.num_iterations, self.config.lr_final_ratio);
         println!(
-            "  LR schedule: warmup_ratio={:.2}, final_ratio={:.2}, base_lr={:.6}",
-            self.config.lr_warmup_ratio, self.config.lr_final_ratio, self.config.learning_rate,
+            "  LR schedule: final_ratio={:.2}, base_lr={:.6}",
+            self.config.lr_final_ratio, self.config.learning_rate,
         );
 
         for iteration in 0..self.config.num_iterations {

@@ -16,7 +16,7 @@ struct Cli {
     games: usize,
 
     /// 每次 MCTS 模拟次数
-    #[arg(short = 's', long, default_value = "64")]
+    #[arg(short = 's', long, default_value = "32")]
     simulations: usize,
 
     /// 学习率
