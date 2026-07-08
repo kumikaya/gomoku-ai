@@ -77,6 +77,16 @@ impl GumbelConfig {
         }
     }
 
+    /// 推理模式：纯 Gumbel + 低温度（更贪心的选择），用于人机对弈和分析。
+    pub fn inference(num_simulations: usize) -> Self {
+        Self {
+            num_simulations,
+            add_dirichlet_noise: false,
+            select_temperature: 0.1,
+            ..Default::default()
+        }
+    }
+
     /// 混合噪声模式：叠加 Dirichlet 噪声到根子节点 prior。
     pub fn mixed(num_simulations: usize) -> Self {
         Self {

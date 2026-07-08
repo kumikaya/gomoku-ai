@@ -288,8 +288,7 @@ async fn play_eval_game(
     let mut black_mcts = MCTS::new();
     let mut white_mcts = MCTS::new();
 
-    let mut config = GumbelConfig::pure_gumbel(num_simulations);
-    config.select_temperature = 0.1;
+    let config = GumbelConfig::inference(num_simulations);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 

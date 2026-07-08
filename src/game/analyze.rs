@@ -255,7 +255,7 @@ async fn run_analyze_loop<E: Evaluator>(
 }
 
 async fn run_analysis<E: Evaluator>(state: &mut AnalyzeState, evaluator: &E) {
-    let config = GumbelConfig::pure_gumbel(state.num_simulations);
+    let config = GumbelConfig::inference(state.num_simulations);
     state.mcts.reset();
     let result = state
         .mcts

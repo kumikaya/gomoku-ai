@@ -128,7 +128,7 @@ async fn run_game_loop<E: Evaluator>(
 }
 
 async fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
-    let config = GumbelConfig::pure_gumbel(num_simulations);
+    let config = GumbelConfig::inference(num_simulations);
     state.mcts.reset();
     let result = state
         .mcts

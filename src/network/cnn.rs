@@ -15,7 +15,8 @@
 use burn::{
     module::Module,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig2d, conv::Conv2dConfig,
+        BatchNorm, Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig2d,
+        conv::{Conv2d, Conv2dConfig},
         norm::BatchNormConfig,
     },
     tensor::{
@@ -30,10 +31,10 @@ use burn::{
 
 #[derive(Module, Debug)]
 pub struct ResidualBlock {
-    conv1: burn::nn::conv::Conv2d,
-    bn1: burn::nn::norm::BatchNorm,
-    conv2: burn::nn::conv::Conv2d,
-    bn2: burn::nn::norm::BatchNorm,
+    conv1: Conv2d,
+    bn1: BatchNorm,
+    conv2: Conv2d,
+    bn2: BatchNorm,
     dropout: Dropout,
 }
 
@@ -73,18 +74,18 @@ pub struct GomokuCNN {
     #[module(skip)]
     board_size: usize,
     // Initial conv
-    conv: burn::nn::conv::Conv2d,
-    bn: burn::nn::norm::BatchNorm,
+    conv: Conv2d,
+    bn: BatchNorm,
     dropout_initial: Dropout,
     // Residual blocks
     blocks: Vec<ResidualBlock>,
     // Policy head
-    policy_conv: burn::nn::conv::Conv2d,
-    policy_bn: burn::nn::norm::BatchNorm,
+    policy_conv: Conv2d,
+    policy_bn: BatchNorm,
     policy_fc: Linear,
     // Value head
-    value_conv: burn::nn::conv::Conv2d,
-    value_bn: burn::nn::norm::BatchNorm,
+    value_conv: Conv2d,
+    value_bn: BatchNorm,
     value_fc1: Linear,
     value_fc2: Linear,
 }
