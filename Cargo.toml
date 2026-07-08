@@ -13,7 +13,6 @@ burn = { git = "https://github.com/tracel-ai/burn.git", features = [
     "fusion",
 ], default-features = false }
 clap = { version = "4.6.1", features = ["derive"] }
-async-channel = "2"
 crossbeam-channel = "0.5.15"
 futures = "0.3"
 futures-executor = { version = "0.3", features = ["thread-pool"] }

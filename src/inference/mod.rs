@@ -4,7 +4,8 @@
 //! 实现：单 CUDA 上下文，多 MCTS 实例共享，跨请求自动攒批。
 
 use crate::network::transformer::{GomokuNetwork, policy_out_dim};
-use burn::tensor::{Device, FloatDType, Int, Tensor};
+use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
+use futures::channel::oneshot;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,19 +17,14 @@ const BATCH_TIMEOUT: Duration = Duration::from_micros(200);
 //  Evaluator trait：MCTS 只依赖这个接口，不感知 GPU/CPU
 // ============================================================
 
-/// 批量评估接口。
+/// 评估单个局面的推理接口。
 ///
-/// 输入 `states`：每个元素是 board_size² 长度的 i32 编码棋盘。
-/// 返回 `(policies, values)`：
-/// - `policies[i]`：长度 `POLICY_OUT` 的原始 logits
-/// - `values[i]`：单个 f32 标量，范围 [-1, 1]
-///
-/// 返回结果与输入一一对应：`policies.len() == values.len() == states.len()`。
+/// `state`：board_size² 长度的 i32 编码棋盘。
+/// 返回 `(logits, value)`：
+/// - `logits`：长度 `POLICY_OUT` 的原始 logits
+/// - `value`：单个 f32 标量，范围 [-1, 1]
 pub trait Evaluator: Send + Sync {
-    fn evaluate_batch(
-        &self,
-        states: &[Vec<i32>],
-    ) -> impl Future<Output = (Vec<Vec<f32>>, Vec<f32>)> + Send;
+    fn evaluate(&self, state: Vec<i32>) -> impl Future<Output = (Vec<f32>, f32)> + Send;
 }
 
 // ============================================================
@@ -36,8 +32,8 @@ pub trait Evaluator: Send + Sync {
 // ============================================================
 
 struct InferenceRequest {
-    states: Vec<Vec<i32>>,
-    response_tx: async_channel::Sender<(Vec<Vec<f32>>, Vec<f32>)>,
+    state: Vec<i32>,
+    response_tx: oneshot::Sender<(Vec<f32>, f32)>,
 }
 
 /// GPU 线程支持两类命令：
@@ -60,7 +56,7 @@ struct InferenceServerInner {
 /// GPU 推理服务。
 ///
 /// 内部维护一个专用 GPU 线程（唯一持有 `Device` 和 `GomokuNetwork`），
-/// 所有并发的 `evaluate_batch` 调用汇入同一个 channel，
+/// 所有并发的 `evaluate` 调用汇入同一个 channel，
 /// GPU 线程自动将多个请求的状态合并为更大的 batch 后做一次 `forward`，
 /// 再将结果按请求拆分返回。
 ///
@@ -119,23 +115,19 @@ impl InferenceServer {
         }
 
         // 计算总状态数
-        let total_states: usize = batch.iter().map(|r| r.states.len()).sum();
-        let state_size = batch[0].states[0].len(); // ENCODE_LEN
+        let total_states: usize = batch.len();
+        let state_size = batch[0].state.len();
+        let policy_out = policy_out_dim(model.board_size);
 
-        // 扁平化所有状态
         let mut flat = Vec::with_capacity(total_states * state_size);
         for req in batch.iter() {
-            for state in &req.states {
-                flat.extend_from_slice(state);
-            }
+            flat.extend_from_slice(&req.state);
         }
-
         // GPU 批量前向：i32 输入 → [batch, ENCODE_LEN]
         let state_tensor = Tensor::<2, Int>::from_data(
-            burn::tensor::TensorData::new(flat, [total_states as i32, state_size as i32]),
+            TensorData::new(flat, [total_states as i32, state_size as i32]),
             device,
         );
-        let policy_out = policy_out_dim(model.board_size);
         let (logits, values) = model.forward(state_tensor);
         // 若 device 配置为 f16，cast 回 f32 才能 to_vec::<f32>()
         let policy_flat: Vec<f32> = logits
@@ -153,19 +145,13 @@ impl InferenceServer {
         let mut pol_offset = 0;
         let mut val_offset = 0;
         for req in batch.drain(..) {
-            let n = req.states.len();
-            let policies: Vec<Vec<f32>> = (0..n)
-                .map(|i| {
-                    let start = pol_offset + i * policy_out;
-                    policy_flat[start..start + policy_out].to_vec()
-                })
-                .collect();
-            let values: Vec<f32> = values_flat[val_offset..val_offset + n].to_vec();
+            let logits = policy_flat[pol_offset..pol_offset + policy_out].to_vec();
+            let value = values_flat[val_offset];
 
-            pol_offset += n * policy_out;
-            val_offset += n;
+            pol_offset += policy_out;
+            val_offset += 1;
 
-            let _ = req.response_tx.send_blocking((policies, values));
+            let _ = req.response_tx.send((logits, value));
         }
     }
 
@@ -224,15 +210,15 @@ impl InferenceServer {
 }
 
 impl Evaluator for InferenceServer {
-    async fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>) {
-        let (response_tx, response_rx) = async_channel::bounded(1);
+    async fn evaluate(&self, state: Vec<i32>) -> (Vec<f32>, f32) {
+        let (response_tx, response_rx) = oneshot::channel();
         self.inner
             .cmd_tx
             .send(GpuCommand::Evaluate(InferenceRequest {
-                states: states.to_vec(),
+                state,
                 response_tx,
             }))
             .expect("GPU inference thread died");
-        response_rx.recv().await.expect("GPU inference thread died")
+        response_rx.await.expect("GPU inference thread died")
     }
 }

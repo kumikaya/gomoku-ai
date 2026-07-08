@@ -467,7 +467,7 @@ impl Trainer {
             // 反向传播 + 参数更新
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, model);
-            *model = optim.step(lr, model.clone(), grads);
+            *model = optim.step(lr.into(), model.clone(), grads);
 
             pb.inc(1);
         }

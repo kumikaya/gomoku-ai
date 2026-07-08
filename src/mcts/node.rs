@@ -3,7 +3,7 @@
 //! 算法对齐 LightZero `ctree_gumbel_alphazero`（C++ 参考实现）：
 //! - 根节点选择：Gumbel 噪声 + Sequential Halving (`_select_root_child`)
 //! - 内部节点选择：`priors + completed_Q - visit_penalty` (`_select_interior_child`)
-//! - Completed Q：`_qtransform_completed_by_mix_value` → rescale → visit_scale * value_scale
+//! - Completed Q：`_qtransform_completed_by_mix_value` → rescale → visit_scale * q_scale
 //! - 反向传播沿 parent 链自行翻转视角，不再依赖 PUCT walk 构建 path
 //!
 //! ## 游戏解耦
@@ -35,11 +35,11 @@ pub struct GumbelConfig {
     pub num_simulations: usize,
     /// Sequential Halving 初始考虑的动作数（对齐 LightZero `max_num_considered_actions`）
     pub max_num_considered_actions: usize,
-    /// 访问数基础偏移（对齐 `maxvisit_init`，用于 visit_scale）
-    pub max_visit_init: usize,
-    /// Q 值缩放系数（对齐 `value_scale`）
-    pub value_scale: f32,
-    /// Gumbel 噪声幅度（对齐 `gumbel_scale`）
+    /// visit 偏移量，对齐 C++ `sigma_visit_c`：评分公式 `(visit_offset + max_visit) * q_scale * q`
+    pub visit_offset: usize,
+    /// Q 值缩放系数，对齐 C++ `sigma_scale_c`
+    pub q_scale: f32,
+    /// Gumbel 噪声缩放系数，> 1 增强探索，< 1 更依赖策略网络
     pub gumbel_scale: f32,
     /// 是否对根子节点叠加 Dirichlet 探索噪声
     pub add_dirichlet_noise: bool,
@@ -56,8 +56,8 @@ impl Default for GumbelConfig {
         Self {
             num_simulations: 64,
             max_num_considered_actions: 16,
-            max_visit_init: 50,
-            value_scale: 0.1,
+            visit_offset: 50,
+            q_scale: 0.1,
             gumbel_scale: 1.0,
             add_dirichlet_noise: true,
             select_temperature: 1.0,
@@ -197,17 +197,6 @@ const LOW_LOGIT: f32 = -1e9;
 
 /// 初始根节点索引（arena 的第一个元素）。
 const INITIAL_ROOT: NodeId = 0;
-
-/// 返回切片中最大值的索引（平局时返回第一个）。
-#[inline]
-fn argmax(values: &[f32]) -> usize {
-    values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
 
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
@@ -352,7 +341,7 @@ impl<G: Game> MCTS<G> {
 
     /// 计算 completed Q 值（对齐 `_qtransform_completed_by_mix_value`）。
     ///
-    /// 返回 `rescaled_q * (maxvisit_init + max_visit_count) * value_scale`。
+    /// 返回 `rescaled_q * (visit_offset + max_visit_count) * q_scale`。
     fn completed_q_values(
         &self,
         parent_idx: NodeId,
@@ -387,9 +376,9 @@ impl<G: Game> MCTS<G> {
         let min_q = completed.iter().fold(f32::INFINITY, |a, &b| a.min(b));
         let gap = (max_q - min_q).max(1e-8);
         let max_visit = visit_counts.iter().copied().max().unwrap_or(0);
-        let visit_scale = (config.max_visit_init + max_visit) as f32;
+        let visit_scale = (config.visit_offset + max_visit) as f32;
         for q in &mut completed {
-            *q = visit_scale * config.value_scale * (*q - min_q) / gap;
+            *q = visit_scale * config.q_scale * (*q - min_q) / gap;
         }
         completed
     }
@@ -429,43 +418,54 @@ impl<G: Game> MCTS<G> {
             .min(halving_table.nrows().saturating_sub(1));
         let considered_visit = halving_table[(num_considered, simulation_index)];
 
-        // score_considered
-        let scores =
-            self.score_considered(considered_visit, &children, &completed_q, gumbel_noises);
-
-        let best_idx = argmax(&scores);
+        let best_idx = self.select_considered_child(
+            considered_visit,
+            &children,
+            &completed_q,
+            gumbel_noises,
+            config.gumbel_scale,
+        );
         let (action, child_id) = children[best_idx];
         (action, child_id)
     }
 
-    /// 计算 `_score_considered`：
+    /// 子节点的综合得分（对齐 MiniZero logit 空间得分公式）。
+    #[inline]
+    fn child_logit(&self, child_id: NodeId, completed_q: f32) -> f32 {
+        self.arena[child_id].policy_logit + completed_q
+    }
+
+    /// 在满足 `visit_count == considered_visit` 的候选中选最优，返回索引。
     ///
     /// ```text
     /// penalty = 0 (if visit_count == considered_visit) else -inf
     /// score = max(LOW_LOGIT, gumbel[i] + policy_logit_i + penalty + completed_q[i])
     /// ```
-    /// 对齐 MiniZero：score 基于 logit 空间而非概率空间。
-    fn score_considered(
+    /// 对齐 MiniZero `_score_considered`：score 基于 logit 空间而非概率空间。
+    fn select_considered_child(
         &self,
         considered_visit: usize,
         children: &[(ActionId, NodeId)],
         completed_q: &[f32],
         gumbel_noises: &[f32],
-    ) -> Vec<f32> {
+        gumbel_scale: f32,
+    ) -> usize {
         children
             .iter()
             .enumerate()
             .map(|(i, &(_, id))| {
-                let penalty = if self.arena[id].visit_count as usize == considered_visit {
-                    0.0
+                if self.arena[id].visit_count as usize == considered_visit {
+                    let score = (gumbel_noises[i] * gumbel_scale
+                        + self.child_logit(id, completed_q[i]))
+                    .max(LOW_LOGIT);
+                    (i, score)
                 } else {
-                    f32::NEG_INFINITY
-                };
-                let noise = gumbel_noises.get(i).copied().unwrap_or(0.0);
-                let raw = noise + self.arena[id].policy_logit + penalty + completed_q[i];
-                raw.max(LOW_LOGIT)
+                    (i, f32::NEG_INFINITY)
+                }
             })
-            .collect()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     /// 内部节点选择（对齐 `_select_interior_child`）：
@@ -484,28 +484,25 @@ impl<G: Game> MCTS<G> {
 
         let completed_q = self.completed_q_values(node_idx, &children, config);
 
-        let visit_counts: Vec<usize> = children
+        let sum_visits: usize = children
             .iter()
             .map(|&(_, id)| self.arena[id].visit_count as usize)
-            .collect();
+            .sum();
+        let denom = (1 + sum_visits) as f32;
 
-        let sum_visits: usize = visit_counts.iter().sum();
-
-        // probs = policy_logit + completed_q（对齐 MiniZero logit 空间得分）
-        let probs: Vec<f32> = children
+        // 单次迭代直接选最优，零分配
+        let best_idx = children
             .iter()
             .enumerate()
-            .map(|(i, &(_, id))| self.arena[id].policy_logit + completed_q[i])
-            .collect();
+            .map(|(i, &(_, id))| {
+                let score = self.child_logit(id, completed_q[i]);
+                let penalty = self.arena[id].visit_count as f32 / denom;
+                (i, score - penalty)
+            })
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
 
-        // to_argmax = probs - visit_count / (1 + sum_visits)
-        let to_argmax: Vec<f32> = children
-            .iter()
-            .enumerate()
-            .map(|(i, _)| probs[i] - visit_counts[i] as f32 / (1 + sum_visits) as f32)
-            .collect();
-
-        let best_idx = argmax(&to_argmax);
         let (action, child_id) = children[best_idx];
         (action, child_id)
     }
@@ -530,10 +527,8 @@ impl<G: Game> MCTS<G> {
         }
 
         let encoding = game.encode();
-        let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]).await;
-        let leaf_value = values_batch[0];
-        let raw_logits = &policies_batch[0];
-        let probs = softmax_legal(raw_logits, &legal);
+        let (raw_logits, leaf_value) = evaluator.evaluate(encoding).await;
+        let probs = softmax_legal(&raw_logits, &legal);
 
         // 记录 raw_value
         self.arena[node_idx].raw_value = Some(leaf_value);
@@ -650,16 +645,15 @@ impl<G: Game> MCTS<G> {
             raw_policy_probs = probs;
         } else {
             let root_encoding = game.encode();
-            let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]).await;
-            root_nn_value = root_values[0];
-            let raw_logit_slice = &root_logits[0];
-            raw_policy_probs = softmax_legal(raw_logit_slice, &legal_moves);
+            let (raw_logits, value) = evaluator.evaluate(root_encoding).await;
+            root_nn_value = value;
+            raw_policy_probs = softmax_legal(&raw_logits, &legal_moves);
 
             self.root_mut().raw_value = Some(root_nn_value);
             for &action in &legal_moves {
                 let child = Node::new(
                     raw_policy_probs[action],
-                    raw_logit_slice[action],
+                    raw_logits[action],
                     Some(self.root_id),
                 );
                 let child_id = self.push_node(child);
@@ -676,7 +670,7 @@ impl<G: Game> MCTS<G> {
         let halving_table =
             Self::halving_table(config.max_num_considered_actions, config.num_simulations);
         let num_legal = legal_moves.len();
-        let gumbel_noises = Self::gumbel_noise(num_legal, config.gumbel_scale, rng);
+        let gumbel_noises = Self::gumbel_noise(num_legal, rng);
 
         // ── Phase 4: 模拟循环 ──
         for sim_i in 0..config.num_simulations {
@@ -745,12 +739,12 @@ impl<G: Game> MCTS<G> {
 
         let completed_q = self.completed_q_values(self.root_id, &children_vec, config);
 
-        let mut probs = vec![f32::NEG_INFINITY; action_shape];
+        let mut logits = vec![f32::NEG_INFINITY; action_shape];
         for (i, &(action, id)) in children_vec.iter().enumerate() {
-            probs[action] = self.arena[id].policy_logit + completed_q[i];
+            logits[action] = self.child_logit(id, completed_q[i]);
         }
 
-        softmax_full(&probs, 1.0)
+        softmax_full(&logits, 1.0)
     }
 
     // ================================================================
@@ -803,11 +797,11 @@ impl<G: Game> MCTS<G> {
         }
     }
 
-    /// 生成 Gumbel 噪声（对齐 `_generate_gumbel`，带 scale）。
-    fn gumbel_noise(n: usize, scale: f32, rng: &mut impl RngExt) -> Vec<f32> {
+    /// 生成 Gumbel 噪声
+    fn gumbel_noise(n: usize, rng: &mut impl RngExt) -> Vec<f32> {
         let gumbel = rand_distr::Gumbel::new(0.0f32, 1.0).unwrap();
         (0..n)
-            .map(|_| scale * gumbel.sample(rng).clamp(-12.0, 12.0))
+            .map(|_| gumbel.sample(rng).clamp(-12.0, 12.0))
             .collect()
     }
 }
@@ -937,26 +931,15 @@ mod tests {
     }
 
     impl Evaluator for MockEvaluator {
-        async fn evaluate_batch(&self, states: &[Vec<i32>]) -> (Vec<Vec<f32>>, Vec<f32>) {
-            let action_dim = states.first().map_or(0, |s| s.len());
-            let policies: Vec<Vec<f32>> = states
-                .iter()
-                .map(|s| {
-                    let key = Self::encode_key(s);
-                    self.policy_map
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0f32; action_dim])
-                })
-                .collect();
-            let values: Vec<f32> = states
-                .iter()
-                .map(|s| {
-                    let key = Self::encode_key(s);
-                    self.value_map.get(&key).copied().unwrap_or(0.0)
-                })
-                .collect();
-            (policies, values)
+        async fn evaluate(&self, state: Vec<i32>) -> (Vec<f32>, f32) {
+            let key = Self::encode_key(&state);
+            let logits = self
+                .policy_map
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| vec![0.0f32; state.len()]);
+            let value = self.value_map.get(&key).copied().unwrap_or(0.0);
+            (logits, value)
         }
     }
 
