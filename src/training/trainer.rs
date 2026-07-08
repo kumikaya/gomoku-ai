@@ -81,7 +81,7 @@ impl Default for TrainConfig {
             save_every: 5,
             model_dir: PathBuf::from("checkpoints"),
             buffer_capacity: 80000,
-            max_grad_norm: 2.0,
+            max_grad_norm: 1.0,
             checkpoint: None,
             lr_warmup_ratio: 0.05,
             lr_final_ratio: 0.1,

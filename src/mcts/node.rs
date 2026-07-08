@@ -103,13 +103,11 @@ pub struct Node {
     /// 先验概率（来自 NN softmax 输出）
     pub prior: f32,
     /// NN 对该节点局面的原始估值（expand 时填入，用于 `_compute_mixed_value`）
-    pub raw_value: f32,
+    pub raw_value: Option<f32>,
     /// 父节点索引，根节点为 None
     pub parent: Option<NodeId>,
     /// 子节点表（action → node_id），与 LightZero `std::map<int, Node*>` 对齐
     pub children: HashMap<ActionId, NodeId>,
-    /// 是否已展开（已调用 NN 并创建子节点）
-    pub expanded: bool,
 }
 
 impl Node {
@@ -118,10 +116,9 @@ impl Node {
             visit_count: 0,
             total_value: 0.0,
             prior,
-            raw_value: 0.0,
+            raw_value: None,
             parent,
             children: HashMap::new(),
-            expanded: false,
         }
     }
 
@@ -139,7 +136,7 @@ impl Node {
     /// 对齐 LightZero：未展开的节点应当被视作叶子，停止 selection 并展开。
     #[inline]
     pub fn is_leaf(&self) -> bool {
-        !self.expanded || self.children.is_empty()
+        self.raw_value.is_none() || self.children.is_empty()
     }
 
     #[inline]
@@ -160,8 +157,6 @@ impl Node {
 
 pub struct MCTS<G: Game> {
     pub arena: Vec<Node>,
-    /// 预生成的 Gumbel 噪声（对齐 LightZero `std::vector<float> gumbel`）
-    gumbel_noises: Vec<f32>,
     _phantom: PhantomData<G>,
 }
 
@@ -189,11 +184,27 @@ pub struct SearchResult {
 /// `_score_considered` 的 logit 下限
 const LOW_LOGIT: f32 = -1e9;
 
+/// `_compute_mixed_value` 中 prior 的裁剪下限（防止下溢，对齐 C++）
+const MIN_LOGIT: f32 = -1e8;
+
+/// 根节点索引（arena 的第一个元素）。
+const ROOT_ID: NodeId = 0;
+
+/// 返回切片中最大值的索引（平局时返回第一个）。
+#[inline]
+fn argmax(values: &[f32]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
         Self {
             arena: Vec::new(),
-            gumbel_noises: Vec::new(),
             _phantom: PhantomData,
         }
     }
@@ -212,6 +223,15 @@ impl<G: Game> MCTS<G> {
     fn push_node(&mut self, node: Node) -> NodeId {
         self.arena.push(node);
         self.arena.len() - 1
+    }
+
+    /// 收集某个节点的所有子节点 `(action, child_id)`。
+    fn children_vec(&self, node_idx: NodeId) -> Vec<(ActionId, NodeId)> {
+        self.arena[node_idx]
+            .children
+            .iter()
+            .map(|(&a, &id)| (a, id))
+            .collect()
     }
 
     // ================================================================
@@ -275,31 +295,34 @@ impl<G: Game> MCTS<G> {
         raw_value: f32,
         qvalues: &[f32],
         visit_counts: &[usize],
-        priors: &[f64],
+        priors: &[f32],
     ) -> f32 {
         let sum_visits: usize = visit_counts.iter().sum();
         if sum_visits == 0 {
             return raw_value;
         }
 
+        // 裁剪 prior 防止下溢，对齐 C++ 的 max(prior, -1e8)
+        let clipped: Vec<f32> = priors.iter().map(|&p| p.max(MIN_LOGIT)).collect();
+
         // sum_prior over visited children
-        let sum_prior: f64 = visit_counts
+        let sum_prior: f32 = clipped
             .iter()
-            .zip(priors.iter())
-            .filter(|(v, _)| **v > 0)
-            .map(|(_, p)| p.max(0.0))
+            .zip(visit_counts.iter())
+            .filter(|(_, v)| **v > 0)
+            .map(|(p, _)| *p)
             .sum();
 
         if sum_prior <= 1e-12 {
             return raw_value;
         }
 
-        let weighted_q: f32 = visit_counts
+        let weighted_q: f32 = clipped
             .iter()
-            .zip(priors.iter())
+            .zip(visit_counts.iter())
             .zip(qvalues.iter())
-            .filter(|((v, _), _)| **v > 0)
-            .map(|((_, p), q)| q * (*p as f32) / (sum_prior as f32))
+            .filter(|((_, v), _)| **v > 0)
+            .map(|((p, _), q)| q * p / sum_prior)
             .sum();
 
         (raw_value + sum_visits as f32 * weighted_q) / (1.0 + sum_visits as f32)
@@ -328,7 +351,7 @@ impl<G: Game> MCTS<G> {
         let parent = &self.arena[parent_idx];
         let n = children.len();
         let mut qvalues = Vec::with_capacity(n);
-        let mut priors_f64 = Vec::with_capacity(n);
+        let mut priors = Vec::with_capacity(n);
         let mut visit_counts = Vec::with_capacity(n);
 
         for &(_, id) in children {
@@ -338,12 +361,12 @@ impl<G: Game> MCTS<G> {
             } else {
                 0.0
             });
-            priors_f64.push(child.prior as f64);
+            priors.push(child.prior);
             visit_counts.push(child.visit_count as usize);
         }
 
         let mixed =
-            Self::compute_mixed_value(parent.raw_value, &qvalues, &visit_counts, &priors_f64);
+            Self::compute_mixed_value(parent.raw_value.unwrap(), &qvalues, &visit_counts, &priors);
 
         // completed: visited → raw Q, unvisited → mixed
         let completed: Vec<f32> = visit_counts
@@ -372,23 +395,18 @@ impl<G: Game> MCTS<G> {
     /// 然后在这些孩子中选 `max(gumbel + prior + completed_q)`。
     fn select_root_child(
         &self,
-        _sim_idx: usize,
         halving_table: &Array2<usize>,
         config: &GumbelConfig,
+        gumbel_noises: &[f32],
     ) -> (ActionId, NodeId) {
-        let root = &self.arena[0];
-
-        // 收集所有子节点
-        let children: Vec<(ActionId, NodeId)> =
-            root.children.iter().map(|(&a, &id)| (a, id)).collect();
+        let children = self.children_vec(ROOT_ID);
 
         if children.is_empty() {
-            // 不应发生：root 总是已展开的
             return (0, 0);
         }
 
         // completed Q
-        let completed_q = self.completed_q_values(0, &children, config);
+        let completed_q = self.completed_q_values(ROOT_ID, &children, config);
 
         // simulation index = 当前已完成的模拟次数
         let simulation_index: usize = children
@@ -403,16 +421,10 @@ impl<G: Game> MCTS<G> {
         let considered_visit = halving_table[(num_considered, simulation_index)];
 
         // score_considered
-        let scores = self.score_considered(considered_visit, &children, &completed_q);
+        let scores =
+            self.score_considered(considered_visit, &children, &completed_q, gumbel_noises);
 
-        // 选最佳
-        let best_idx = scores
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
+        let best_idx = argmax(&scores);
         let (action, child_id) = children[best_idx];
         (action, child_id)
     }
@@ -428,6 +440,7 @@ impl<G: Game> MCTS<G> {
         considered_visit: usize,
         children: &[(ActionId, NodeId)],
         completed_q: &[f32],
+        gumbel_noises: &[f32],
     ) -> Vec<f32> {
         let max_prior = children
             .iter()
@@ -444,7 +457,7 @@ impl<G: Game> MCTS<G> {
                     f32::NEG_INFINITY
                 };
                 let adjusted_prior = self.arena[id].prior - max_prior;
-                let noise = self.gumbel_noises.get(i).copied().unwrap_or(0.0);
+                let noise = gumbel_noises.get(i).copied().unwrap_or(0.0);
                 let raw = noise + adjusted_prior + penalty + completed_q[i];
                 raw.max(LOW_LOGIT)
             })
@@ -459,9 +472,7 @@ impl<G: Game> MCTS<G> {
     /// choose max(to_argmax)
     /// ```
     fn select_interior_child(&self, node_idx: NodeId, config: &GumbelConfig) -> (ActionId, NodeId) {
-        let node = &self.arena[node_idx];
-        let children: Vec<(ActionId, NodeId)> =
-            node.children.iter().map(|(&a, &id)| (a, id)).collect();
+        let children = self.children_vec(node_idx);
 
         if children.is_empty() {
             return (0, node_idx); // 回退
@@ -490,13 +501,7 @@ impl<G: Game> MCTS<G> {
             .map(|(i, _)| probs[i] - visit_counts[i] as f32 / (1 + sum_visits) as f32)
             .collect();
 
-        let best_idx = to_argmax
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
+        let best_idx = argmax(&to_argmax);
         let (action, child_id) = children[best_idx];
         (action, child_id)
     }
@@ -526,7 +531,7 @@ impl<G: Game> MCTS<G> {
         let probs = softmax_legal(&policies_batch[0], &legal);
 
         // 记录 raw_value
-        self.arena[node_idx].raw_value = leaf_value;
+        self.arena[node_idx].raw_value = Some(leaf_value);
 
         // 创建子节点
         for &action in &legal {
@@ -534,7 +539,6 @@ impl<G: Game> MCTS<G> {
             let child_id = self.push_node(child);
             self.arena[node_idx].children.insert(action, child_id);
         }
-        self.arena[node_idx].expanded = true;
 
         leaf_value
     }
@@ -561,13 +565,13 @@ impl<G: Game> MCTS<G> {
     /// 到达叶节点后展开并反向传播。
     async fn simulate<E: Evaluator>(
         &mut self,
-        sim_idx: usize,
         game: &mut G,
         evaluator: &E,
         config: &GumbelConfig,
         halving_table: &Array2<usize>,
+        gumbel_noises: &[f32],
     ) {
-        let mut node_idx: NodeId = 0;
+        let mut node_idx: NodeId = ROOT_ID;
 
         // ── selection: 向下走到叶节点 ──
         loop {
@@ -576,8 +580,8 @@ impl<G: Game> MCTS<G> {
                 break;
             }
 
-            let (action, child_idx) = if node_idx == 0 {
-                self.select_root_child(sim_idx, halving_table, config)
+            let (action, child_idx) = if node.is_root() {
+                self.select_root_child(halving_table, config, gumbel_noises)
             } else {
                 self.select_interior_child(node_idx, config)
             };
@@ -636,15 +640,14 @@ impl<G: Game> MCTS<G> {
         let raw_policy_probs = softmax_legal(&root_logits[0], &legal_moves);
 
         // 设置 root raw_value（用于 completed_q 的 mixed_value 计算）
-        self.root_mut().raw_value = root_nn_value;
+        self.root_mut().raw_value = Some(root_nn_value);
 
         // 展开根节点：为每个合法动作创建子节点
         for &action in &legal_moves {
-            let child = Node::new(raw_policy_probs[action], Some(0));
+            let child = Node::new(raw_policy_probs[action], Some(ROOT_ID));
             let child_id = self.push_node(child);
             self.root_mut().children.insert(action, child_id);
         }
-        self.root_mut().expanded = true;
 
         // ── Phase 2: 可选 Dirichlet 噪声 ──
         if config.add_dirichlet_noise {
@@ -655,13 +658,19 @@ impl<G: Game> MCTS<G> {
         let halving_table =
             Self::halving_table(config.max_num_considered_actions, config.num_simulations);
         let num_legal = legal_moves.len();
-        self.gumbel_noises = Self::gumbel_noise(num_legal, config.gumbel_scale, rng);
+        let gumbel_noises = Self::gumbel_noise(num_legal, config.gumbel_scale, rng);
 
         // ── Phase 4: 模拟循环 ──
-        for sim_idx in 0..config.num_simulations {
+        for _ in 0..config.num_simulations {
             let mut sim_game = game.clone();
-            self.simulate(sim_idx, &mut sim_game, evaluator, config, &halving_table)
-                .await;
+            self.simulate(
+                &mut sim_game,
+                evaluator,
+                config,
+                &halving_table,
+                &gumbel_noises,
+            )
+            .await;
         }
 
         // ── Phase 5: 构建 improved policy（对齐 `_get_improved_policy`）──
@@ -713,15 +722,13 @@ impl<G: Game> MCTS<G> {
 
     /// 构建 improved policy：`softmax(prior + completed_q)`。
     fn improved_policy(&self, config: &GumbelConfig, action_shape: usize) -> Vec<f32> {
-        let root = &self.arena[0];
-        let children_vec: Vec<(ActionId, NodeId)> =
-            root.children.iter().map(|(&a, &id)| (a, id)).collect();
+        let children_vec = self.children_vec(ROOT_ID);
 
         if children_vec.is_empty() {
             return vec![0.0; action_shape];
         }
 
-        let completed_q = self.completed_q_values(0, &children_vec, config);
+        let completed_q = self.completed_q_values(ROOT_ID, &children_vec, config);
 
         let mut probs = vec![f32::NEG_INFINITY; action_shape];
         for (i, &(action, id)) in children_vec.iter().enumerate() {
@@ -737,7 +744,7 @@ impl<G: Game> MCTS<G> {
 
     /// 基于访问次数的动作分布（对齐 `visit_count_to_action_distribution`）。
     fn visit_count_distribution(&self, temperature: f32, action_shape: usize) -> Vec<f64> {
-        let root = &self.arena[0];
+        let root = self.root();
         let visits: Vec<f64> = (0..action_shape)
             .map(|a| {
                 root.children
@@ -749,15 +756,14 @@ impl<G: Game> MCTS<G> {
 
         let sum: f64 = visits.iter().sum();
         if sum == 0.0 || temperature == 0.0 {
-            // 回退到均匀分布
             let n = action_shape as f64;
             return vec![1.0 / n; action_shape];
         }
 
-        visits
-            .iter()
-            .map(|&v| (v / temperature as f64) / (sum / temperature as f64))
-            .collect()
+        // 先除以温度再归一化
+        let scaled: Vec<f64> = visits.iter().map(|&v| v / temperature as f64).collect();
+        let scaled_sum: f64 = scaled.iter().sum();
+        scaled.iter().map(|&v| v / scaled_sum).collect()
     }
 
     // ================================================================
@@ -766,7 +772,7 @@ impl<G: Game> MCTS<G> {
 
     /// 对根节点的直接子节点叠加 Dirichlet 噪声（对齐 `_add_exploration_noise`）。
     fn add_dirichlet_noise(&mut self, config: &GumbelConfig, rng: &mut impl RngExt) {
-        let children: Vec<_> = self.arena[0].children.values().copied().collect();
+        let children: Vec<_> = self.root().children.values().copied().collect();
 
         let n = children.len();
         if n == 0 {
@@ -1265,7 +1271,7 @@ mod tests {
         let raw = 0.7;
         let qvalues: [f32; 0] = [];
         let visit_counts: [usize; 0] = [];
-        let priors: [f64; 0] = [];
+        let priors: [f32; 0] = [];
         let result = MCTS::<Board>::compute_mixed_value(raw, &qvalues, &visit_counts, &priors);
         assert!((result - raw).abs() < 1e-6);
     }
