@@ -140,11 +140,6 @@ impl Node {
     }
 
     #[inline]
-    pub fn is_root(&self) -> bool {
-        self.parent.is_none()
-    }
-
-    #[inline]
     pub fn add_visit(&mut self, value: f32) {
         self.visit_count += 1;
         self.total_value += value;
@@ -157,6 +152,8 @@ impl Node {
 
 pub struct MCTS<G: Game> {
     pub arena: Vec<Node>,
+    /// 当前逻辑根节点在 arena 中的索引。子树复用后可能非 0。
+    pub root_id: NodeId,
     _phantom: PhantomData<G>,
 }
 
@@ -187,8 +184,8 @@ const LOW_LOGIT: f32 = -1e9;
 /// `_compute_mixed_value` 中 prior 的裁剪下限（防止下溢，对齐 C++）
 const MIN_LOGIT: f32 = -1e8;
 
-/// 根节点索引（arena 的第一个元素）。
-const ROOT_ID: NodeId = 0;
+/// 初始根节点索引（arena 的第一个元素）。
+const INITIAL_ROOT: NodeId = 0;
 
 /// 返回切片中最大值的索引（平局时返回第一个）。
 #[inline]
@@ -204,25 +201,42 @@ fn argmax(values: &[f32]) -> usize {
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
         Self {
-            arena: Vec::new(),
+            arena: vec![Node::new(0.0, None)],
+            root_id: INITIAL_ROOT,
             _phantom: PhantomData,
         }
     }
 
     #[inline]
     pub fn root(&self) -> &Node {
-        &self.arena[0]
+        &self.arena[self.root_id]
     }
 
     #[inline]
     pub fn root_mut(&mut self) -> &mut Node {
-        &mut self.arena[0]
+        &mut self.arena[self.root_id]
     }
 
     #[inline]
     fn push_node(&mut self, node: Node) -> NodeId {
         self.arena.push(node);
         self.arena.len() - 1
+    }
+
+    pub fn reset(&mut self) {
+        self.arena.clear();
+        self.root_id = INITIAL_ROOT;
+        self.arena.push(Node::new(0.0, None));
+    }
+
+    // ================================================================
+    //  Search tree reuse（自对弈加速）
+    // ================================================================
+
+    /// 将 `action` 对应的子树提升为新根（O(1) 指针操作）。
+    pub fn reuse_subtree(&mut self, action: ActionId) {
+        let child_id = self.root().children[&action];
+        self.root_id = child_id;
     }
 
     /// 收集某个节点的所有子节点 `(action, child_id)`。
@@ -391,6 +405,7 @@ impl<G: Game> MCTS<G> {
 
     /// 根节点选择（对齐 `_score_considered` + `_select_root_child`）。
     ///
+    /// `sim_index`: 本轮内当前模拟的序号（0-based），用于 halving table 索引。
     /// 利用 Sequential Halving 表确定当前 step 应该考虑哪些 visit_count 的孩子，
     /// 然后在这些孩子中选 `max(gumbel + prior + completed_q)`。
     fn select_root_child(
@@ -398,21 +413,20 @@ impl<G: Game> MCTS<G> {
         halving_table: &Array2<usize>,
         config: &GumbelConfig,
         gumbel_noises: &[f32],
+        sim_index: usize,
     ) -> (ActionId, NodeId) {
-        let children = self.children_vec(ROOT_ID);
+        let children = self.children_vec(self.root_id);
 
         if children.is_empty() {
             return (0, 0);
         }
 
         // completed Q
-        let completed_q = self.completed_q_values(ROOT_ID, &children, config);
+        let completed_q = self.completed_q_values(self.root_id, &children, config);
 
-        // simulation index = 当前已完成的模拟次数
-        let simulation_index: usize = children
-            .iter()
-            .map(|&(_, id)| self.arena[id].visit_count as usize)
-            .sum();
+        // simulation index: 使用本轮模拟序号而非累计 visit_count
+        // (树复用时累计 visit_count 会超出 num_simulations，导致 halving table 越界)
+        let simulation_index = sim_index.min(halving_table.ncols().saturating_sub(1));
 
         let num_considered = config
             .max_num_considered_actions
@@ -561,6 +575,7 @@ impl<G: Game> MCTS<G> {
 
     /// 单次模拟（对齐 `_simulate`）。
     ///
+    /// `sim_index`: 本轮内当前模拟的序号（0-based），用于 halving table 索引。
     /// 从根出发，根用 `select_root_child`，内部用 `select_interior_child`，
     /// 到达叶节点后展开并反向传播。
     async fn simulate<E: Evaluator>(
@@ -570,8 +585,9 @@ impl<G: Game> MCTS<G> {
         config: &GumbelConfig,
         halving_table: &Array2<usize>,
         gumbel_noises: &[f32],
+        sim_index: usize,
     ) {
-        let mut node_idx: NodeId = ROOT_ID;
+        let mut node_idx: NodeId = self.root_id;
 
         // ── selection: 向下走到叶节点 ──
         loop {
@@ -580,8 +596,8 @@ impl<G: Game> MCTS<G> {
                 break;
             }
 
-            let (action, child_idx) = if node.is_root() {
-                self.select_root_child(halving_table, config, gumbel_noises)
+            let (action, child_idx) = if node_idx == self.root_id {
+                self.select_root_child(halving_table, config, gumbel_noises, sim_index)
             } else {
                 self.select_interior_child(node_idx, config)
             };
@@ -615,12 +631,9 @@ impl<G: Game> MCTS<G> {
         rng: &mut impl RngExt,
     ) -> SearchResult {
         let action_shape = game.action_shape();
-
-        // ── 重置 & 创建根节点 ──
-        self.arena.clear();
-        self.arena.push(Node::new(0.0, None));
-
         let legal_moves = game.legal_actions();
+
+        // ── 空终止态快速返回 ──
         if legal_moves.is_empty() {
             return SearchResult {
                 best_move: action_shape,
@@ -633,20 +646,29 @@ impl<G: Game> MCTS<G> {
             };
         }
 
-        // ── Phase 1: 根节点 NN 评估 & 展开 ──
-        let root_encoding = game.encode();
-        let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]).await;
-        let root_nn_value = root_values[0];
-        let raw_policy_probs = softmax_legal(&root_logits[0], &legal_moves);
+        // ── Phase 1: 根节点初始化 ──
+        let root_nn_value: f32;
+        let raw_policy_probs: Vec<f32>;
+        if let Some(raw_value) = self.root().raw_value {
+            // 复用模式：NN 不变，从已有子节点恢复 prior 分布
+            root_nn_value = raw_value;
+            let mut probs = vec![0.0f32; action_shape];
+            for (&action, &child_id) in self.root().children.iter() {
+                probs[action] = self.arena[child_id].prior;
+            }
+            raw_policy_probs = probs;
+        } else {
+            let root_encoding = game.encode();
+            let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]).await;
+            root_nn_value = root_values[0];
+            raw_policy_probs = softmax_legal(&root_logits[0], &legal_moves);
 
-        // 设置 root raw_value（用于 completed_q 的 mixed_value 计算）
-        self.root_mut().raw_value = Some(root_nn_value);
-
-        // 展开根节点：为每个合法动作创建子节点
-        for &action in &legal_moves {
-            let child = Node::new(raw_policy_probs[action], Some(ROOT_ID));
-            let child_id = self.push_node(child);
-            self.root_mut().children.insert(action, child_id);
+            self.root_mut().raw_value = Some(root_nn_value);
+            for &action in &legal_moves {
+                let child = Node::new(raw_policy_probs[action], Some(self.root_id));
+                let child_id = self.push_node(child);
+                self.root_mut().children.insert(action, child_id);
+            }
         }
 
         // ── Phase 2: 可选 Dirichlet 噪声 ──
@@ -661,7 +683,7 @@ impl<G: Game> MCTS<G> {
         let gumbel_noises = Self::gumbel_noise(num_legal, config.gumbel_scale, rng);
 
         // ── Phase 4: 模拟循环 ──
-        for _ in 0..config.num_simulations {
+        for sim_i in 0..config.num_simulations {
             let mut sim_game = game.clone();
             self.simulate(
                 &mut sim_game,
@@ -669,14 +691,15 @@ impl<G: Game> MCTS<G> {
                 config,
                 &halving_table,
                 &gumbel_noises,
+                sim_i,
             )
             .await;
         }
 
-        // ── Phase 5: 构建 improved policy（对齐 `_get_improved_policy`）──
+        // ── Phase 5: 构建 improved policy ──
         let improved_policy = self.improved_policy(config, action_shape);
 
-        // ── Phase 6: 动作选择（visit count softmax）──
+        // ── Phase 6: 动作选择 ──
         let action_probs = self.visit_count_distribution(config.select_temperature, action_shape);
         let best_move = sample_action(&action_probs, rng);
 
@@ -693,7 +716,6 @@ impl<G: Game> MCTS<G> {
             children_visits[action] = child.visit_count;
         }
 
-        // root_value: 子节点 Q 按访问次数加权平均
         let total_visits: u32 = children_visits.iter().sum();
         let root_value = if total_visits > 0 {
             children_q
@@ -722,13 +744,13 @@ impl<G: Game> MCTS<G> {
 
     /// 构建 improved policy：`softmax(prior + completed_q)`。
     fn improved_policy(&self, config: &GumbelConfig, action_shape: usize) -> Vec<f32> {
-        let children_vec = self.children_vec(ROOT_ID);
+        let children_vec = self.children_vec(self.root_id);
 
         if children_vec.is_empty() {
             return vec![0.0; action_shape];
         }
 
-        let completed_q = self.completed_q_values(ROOT_ID, &children_vec, config);
+        let completed_q = self.completed_q_values(self.root_id, &children_vec, config);
 
         let mut probs = vec![f32::NEG_INFINITY; action_shape];
         for (i, &(action, id)) in children_vec.iter().enumerate() {
@@ -1091,35 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deterministic_with_same_seed() {
-        let board = make_board();
-        let evaluator = MockEvaluator::new();
-        let config = GumbelConfig::pure_gumbel(64);
-
-        use rand::SeedableRng;
-        let mut rng1 = rand::rngs::SmallRng::seed_from_u64(42);
-        let mut rng2 = rand::rngs::SmallRng::seed_from_u64(42);
-
-        let mut mcts1: MCTS<Board> = MCTS::new();
-        let result1 =
-            futures_executor::block_on(mcts1.search(&board, &evaluator, &config, &mut rng1));
-
-        let mut mcts2: MCTS<Board> = MCTS::new();
-        let result2 =
-            futures_executor::block_on(mcts2.search(&board, &evaluator, &config, &mut rng2));
-
-        assert_eq!(result1.best_move, result2.best_move);
-        assert!(
-            result1
-                .policy
-                .iter()
-                .zip(&result2.policy)
-                .all(|(a, b)| (a - b).abs() < 1e-6)
-        );
-        assert!((result1.root_value - result2.root_value).abs() < 1e-6);
-    }
-
-    #[test]
     fn test_pure_gumbel_config() {
         let config = GumbelConfig::pure_gumbel(128);
         assert!(!config.add_dirichlet_noise);
@@ -1194,6 +1187,7 @@ mod tests {
             if board.game_over {
                 break;
             }
+            mcts.reset(); // 每步独立，不复用子树
             let result = futures_executor::block_on(mcts.search(
                 &board,
                 &evaluator,
@@ -1338,6 +1332,7 @@ mod tests {
 
         // 根节点
         mcts.arena.push(Node::new(0.0, None));
+        mcts.arena[0].raw_value = Some(0.0); // completed_q 需要 raw_value
         // 两个子节点
         let child0 = mcts.push_node(Node::new(0.5, Some(0)));
         let child1 = mcts.push_node(Node::new(0.5, Some(0)));

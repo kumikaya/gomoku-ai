@@ -129,6 +129,7 @@ async fn run_game_loop<E: Evaluator>(
 
 async fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
     let config = GumbelConfig::pure_gumbel(num_simulations);
+    state.mcts.reset();
     let result = state
         .mcts
         .search(&mut state.board, evaluator, &config, &mut rand::rng())

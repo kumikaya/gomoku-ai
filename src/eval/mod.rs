@@ -306,6 +306,7 @@ async fn play_eval_game(
             (white_server, &mut white_mcts)
         };
 
+        mcts.reset();
         let result = mcts.search(&mut board, eval, &config, &mut rng).await;
 
         if result.best_move >= npos || !board.play_idx(result.best_move) {

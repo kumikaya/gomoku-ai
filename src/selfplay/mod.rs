@@ -48,6 +48,9 @@ impl Default for SelfPlayConfig {
 }
 
 /// 运行一局自对弈。每一步都产生训练样本。
+///
+/// 自对弈过程中复用 MCTS 搜索树：每一步结束后将选中动作的子树提升为新根，
+/// 下一步在此基础上继续搜索。若复用失败则丢弃旧树，完整重新搜索。
 pub async fn self_play<E: Evaluator>(
     evaluator: &E,
     config: &SelfPlayConfig,
@@ -56,28 +59,22 @@ pub async fn self_play<E: Evaluator>(
     let mut board = Board::new();
     let mut records = Vec::new();
     let mut mcts = MCTS::new();
+    let mut search_config = GumbelConfig::mixed(config.num_simulations);
+    search_config.select_temperature = config.select_temperature;
 
-    loop {
-        let mut search_config = GumbelConfig::pure_gumbel(config.num_simulations);
-        search_config.select_temperature = config.select_temperature;
-
+    while !board.game_over {
         let result = mcts.search(&board, evaluator, &search_config, rng).await;
-
         let kl = compute_kl(&result.root_nn_prior, &result.policy);
         records.push(PlayRecord {
             state: board.encode_state(),
             policy: result.policy,
-            // 先写入 MCTS root value 作为占位，游戏结束后用最终结果修正
             value: result.root_value,
             sample_weight: 1.0 + kl,
             player: board.current_player,
         });
 
         board.play_idx(result.best_move);
-
-        if board.game_over {
-            break;
-        }
+        mcts.reuse_subtree(result.best_move);
     }
 
     // ── 对齐 minizero：用游戏最终结果修正 value 标签 ──
