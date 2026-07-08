@@ -58,8 +58,8 @@ impl Default for GumbelConfig {
             max_num_considered_actions: 16,
             max_visit_init: 50,
             value_scale: 0.1,
-            gumbel_scale: 10.0,
-            add_dirichlet_noise: false,
+            gumbel_scale: 1.0,
+            add_dirichlet_noise: true,
             select_temperature: 1.0,
             dirichlet_alpha: 0.3,
             dirichlet_epsilon: 0.25,
@@ -100,8 +100,11 @@ pub struct Node {
     pub visit_count: u32,
     /// Σ(value)：每次反向传播累加的值（子节点自身视角）
     pub total_value: f32,
-    /// 先验概率（来自 NN softmax 输出）
+    /// 先验概率（来自 NN softmax 输出，用于 `compute_mixed_value`、Dirichlet 噪声）
     pub prior: f32,
+    /// NN 原始 logit（softmax 之前的值，用于 Gumbel 得分计算）
+    /// 对齐 MiniZero `MCTSNode::policy_logit_`
+    pub policy_logit: f32,
     /// NN 对该节点局面的原始估值（expand 时填入，用于 `_compute_mixed_value`）
     pub raw_value: Option<f32>,
     /// 父节点索引，根节点为 None
@@ -111,11 +114,12 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(prior: f32, parent: Option<NodeId>) -> Self {
+    pub fn new(prior: f32, policy_logit: f32, parent: Option<NodeId>) -> Self {
         Self {
             visit_count: 0,
             total_value: 0.0,
             prior,
+            policy_logit,
             raw_value: None,
             parent,
             children: HashMap::new(),
@@ -124,7 +128,7 @@ impl Node {
 
     /// 节点自身视角的均值。
     #[inline]
-    pub fn mean(&self) -> f32 {
+    pub fn q(&self) -> f32 {
         if self.visit_count > 0 {
             self.total_value / self.visit_count as f32
         } else {
@@ -166,7 +170,7 @@ pub struct SearchResult {
     pub policy: Vec<f32>,
     /// MCTS 根节点价值（子节点 Q 按访问次数加权平均）
     pub root_value: f32,
-    /// NN 原始先验概率
+    /// NN 原始先验概率（softmax 后的概率值，用于 KL 散度和分析界面）
     pub root_nn_prior: Vec<f32>,
     /// NN 对根节点的估值（未经 MCTS 修正）
     pub root_nn_value: f32,
@@ -180,9 +184,6 @@ pub struct SearchResult {
 
 /// `_score_considered` 的 logit 下限
 const LOW_LOGIT: f32 = -1e9;
-
-/// `_compute_mixed_value` 中 prior 的裁剪下限（防止下溢，对齐 C++）
-const MIN_LOGIT: f32 = -1e8;
 
 /// 初始根节点索引（arena 的第一个元素）。
 const INITIAL_ROOT: NodeId = 0;
@@ -201,7 +202,7 @@ fn argmax(values: &[f32]) -> usize {
 impl<G: Game> MCTS<G> {
     pub fn new() -> Self {
         Self {
-            arena: vec![Node::new(0.0, None)],
+            arena: vec![Node::new(0.0, 0.0, None)],
             root_id: INITIAL_ROOT,
             _phantom: PhantomData,
         }
@@ -226,7 +227,7 @@ impl<G: Game> MCTS<G> {
     pub fn reset(&mut self) {
         self.arena.clear();
         self.root_id = INITIAL_ROOT;
-        self.arena.push(Node::new(0.0, None));
+        self.arena.push(Node::new(0.0, 0.0, None));
     }
 
     // ================================================================
@@ -316,11 +317,8 @@ impl<G: Game> MCTS<G> {
             return raw_value;
         }
 
-        // 裁剪 prior 防止下溢，对齐 C++ 的 max(prior, -1e8)
-        let clipped: Vec<f32> = priors.iter().map(|&p| p.max(MIN_LOGIT)).collect();
-
         // sum_prior over visited children
-        let sum_prior: f32 = clipped
+        let sum_prior: f32 = priors
             .iter()
             .zip(visit_counts.iter())
             .filter(|(_, v)| **v > 0)
@@ -331,7 +329,7 @@ impl<G: Game> MCTS<G> {
             return raw_value;
         }
 
-        let weighted_q: f32 = clipped
+        let weighted_q: f32 = priors
             .iter()
             .zip(visit_counts.iter())
             .zip(qvalues.iter())
@@ -340,17 +338,6 @@ impl<G: Game> MCTS<G> {
             .sum();
 
         (raw_value + sum_visits as f32 * weighted_q) / (1.0 + sum_visits as f32)
-    }
-
-    /// max-min 归一化 Q 值（对齐 `_rescale_qvalue`）。
-    fn rescale_q(qvalues: &[f32]) -> Vec<f32> {
-        if qvalues.is_empty() {
-            return vec![];
-        }
-        let max_q = qvalues.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let min_q = qvalues.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let gap = (max_q - min_q).max(1e-8);
-        qvalues.iter().map(|&q| (q - min_q) / gap).collect()
     }
 
     /// 计算 completed Q 值（对齐 `_qtransform_completed_by_mix_value`）。
@@ -370,33 +357,31 @@ impl<G: Game> MCTS<G> {
 
         for &(_, id) in children {
             let child = &self.arena[id];
-            qvalues.push(if child.visit_count > 0 {
-                child.mean()
-            } else {
-                0.0
-            });
+            // child.q() 是子节点自身视角，翻转为父节点视角
+            qvalues.push(G::flip_perspective(child.q()));
             priors.push(child.prior);
             visit_counts.push(child.visit_count as usize);
         }
 
-        let mixed =
-            Self::compute_mixed_value(parent.raw_value.unwrap(), &qvalues, &visit_counts, &priors);
+        let raw_value = parent.raw_value.unwrap();
+        let mixed = Self::compute_mixed_value(raw_value, &qvalues, &visit_counts, &priors);
 
         // completed: visited → raw Q, unvisited → mixed
-        let completed: Vec<f32> = visit_counts
+        let mut completed: Vec<f32> = visit_counts
             .iter()
             .zip(qvalues.iter())
             .map(|(&vc, &q)| if vc > 0 { q } else { mixed })
             .collect();
 
-        let rescaled = Self::rescale_q(&completed);
+        let max_q = completed.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let min_q = completed.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let gap = (max_q - min_q).max(1e-8);
         let max_visit = visit_counts.iter().copied().max().unwrap_or(0);
         let visit_scale = (config.max_visit_init + max_visit) as f32;
-
-        rescaled
-            .iter()
-            .map(|&q| q * visit_scale * config.value_scale)
-            .collect()
+        for q in &mut completed {
+            *q = visit_scale * config.value_scale * (*q - min_q) / gap;
+        }
+        completed
     }
 
     // ================================================================
@@ -407,7 +392,7 @@ impl<G: Game> MCTS<G> {
     ///
     /// `sim_index`: 本轮内当前模拟的序号（0-based），用于 halving table 索引。
     /// 利用 Sequential Halving 表确定当前 step 应该考虑哪些 visit_count 的孩子，
-    /// 然后在这些孩子中选 `max(gumbel + prior + completed_q)`。
+    /// 然后在这些孩子中选 `max(gumbel + policy_logit + completed_q)`。
     fn select_root_child(
         &self,
         halving_table: &Array2<usize>,
@@ -447,8 +432,9 @@ impl<G: Game> MCTS<G> {
     ///
     /// ```text
     /// penalty = 0 (if visit_count == considered_visit) else -inf
-    /// score = max(LOW_LOGIT, gumbel[i] + (prior_i - max_prior) + penalty + completed_q[i])
+    /// score = max(LOW_LOGIT, gumbel[i] + policy_logit_i + penalty + completed_q[i])
     /// ```
+    /// 对齐 MiniZero：score 基于 logit 空间而非概率空间。
     fn score_considered(
         &self,
         considered_visit: usize,
@@ -456,11 +442,6 @@ impl<G: Game> MCTS<G> {
         completed_q: &[f32],
         gumbel_noises: &[f32],
     ) -> Vec<f32> {
-        let max_prior = children
-            .iter()
-            .map(|&(_, id)| self.arena[id].prior)
-            .fold(f32::NEG_INFINITY, f32::max);
-
         children
             .iter()
             .enumerate()
@@ -470,9 +451,8 @@ impl<G: Game> MCTS<G> {
                 } else {
                     f32::NEG_INFINITY
                 };
-                let adjusted_prior = self.arena[id].prior - max_prior;
                 let noise = gumbel_noises.get(i).copied().unwrap_or(0.0);
-                let raw = noise + adjusted_prior + penalty + completed_q[i];
+                let raw = noise + self.arena[id].policy_logit + penalty + completed_q[i];
                 raw.max(LOW_LOGIT)
             })
             .collect()
@@ -501,11 +481,11 @@ impl<G: Game> MCTS<G> {
 
         let sum_visits: usize = visit_counts.iter().sum();
 
-        // probs = prior + completed_q
+        // probs = policy_logit + completed_q（对齐 MiniZero logit 空间得分）
         let probs: Vec<f32> = children
             .iter()
             .enumerate()
-            .map(|(i, &(_, id))| self.arena[id].prior + completed_q[i])
+            .map(|(i, &(_, id))| self.arena[id].policy_logit + completed_q[i])
             .collect();
 
         // to_argmax = probs - visit_count / (1 + sum_visits)
@@ -542,14 +522,15 @@ impl<G: Game> MCTS<G> {
         let encoding = game.encode();
         let (policies_batch, values_batch) = evaluator.evaluate_batch(&[encoding]).await;
         let leaf_value = values_batch[0];
-        let probs = softmax_legal(&policies_batch[0], &legal);
+        let raw_logits = &policies_batch[0];
+        let probs = softmax_legal(raw_logits, &legal);
 
         // 记录 raw_value
         self.arena[node_idx].raw_value = Some(leaf_value);
 
         // 创建子节点
         for &action in &legal {
-            let child = Node::new(probs[action], Some(node_idx));
+            let child = Node::new(probs[action], raw_logits[action], Some(node_idx));
             let child_id = self.push_node(child);
             self.arena[node_idx].children.insert(action, child_id);
         }
@@ -614,9 +595,9 @@ impl<G: Game> MCTS<G> {
         };
 
         // ── backprop ──
-        // LightZero self_play_mode: node->update_recursive(-leaf_value, ...)
-        // 等价于从叶子传入 G::flip_perspective(leaf_value)
-        self.backprop_from(node_idx, G::flip_perspective(leaf_value));
+        // leaf_value 已是当前玩家（叶节点）视角，直接传入 backprop_from。
+        // backprop_from 内部会在每往上一层时 flip_perspective。
+        self.backprop_from(node_idx, leaf_value);
     }
 
     // ================================================================
@@ -661,11 +642,16 @@ impl<G: Game> MCTS<G> {
             let root_encoding = game.encode();
             let (root_logits, root_values) = evaluator.evaluate_batch(&[root_encoding]).await;
             root_nn_value = root_values[0];
-            raw_policy_probs = softmax_legal(&root_logits[0], &legal_moves);
+            let raw_logit_slice = &root_logits[0];
+            raw_policy_probs = softmax_legal(raw_logit_slice, &legal_moves);
 
             self.root_mut().raw_value = Some(root_nn_value);
             for &action in &legal_moves {
-                let child = Node::new(raw_policy_probs[action], Some(self.root_id));
+                let child = Node::new(
+                    raw_policy_probs[action],
+                    raw_logit_slice[action],
+                    Some(self.root_id),
+                );
                 let child_id = self.push_node(child);
                 self.root_mut().children.insert(action, child_id);
             }
@@ -708,15 +694,11 @@ impl<G: Game> MCTS<G> {
         let mut children_visits = vec![0u32; action_shape];
         for (&action, &child_id) in self.root().children.iter() {
             let child = &self.arena[child_id];
-            children_q[action] = if child.visit_count > 0 {
-                child.mean()
-            } else {
-                0.0
-            };
+            children_q[action] = G::flip_perspective(child.q());
             children_visits[action] = child.visit_count;
         }
 
-        let total_visits: u32 = children_visits.iter().sum();
+        let total_visits: u32 = self.root().visit_count;
         let root_value = if total_visits > 0 {
             children_q
                 .iter()
@@ -742,7 +724,8 @@ impl<G: Game> MCTS<G> {
     //  Improved policy（对齐 `_get_improved_policy`）
     // ================================================================
 
-    /// 构建 improved policy：`softmax(prior + completed_q)`。
+    /// 构建 improved policy：`softmax(policy_logit + completed_q)`。
+    /// 对齐 MiniZero `getMCTSPolicy`：使用 logit 空间的得分经 temperature-scaled softmax。
     fn improved_policy(&self, config: &GumbelConfig, action_shape: usize) -> Vec<f32> {
         let children_vec = self.children_vec(self.root_id);
 
@@ -754,7 +737,7 @@ impl<G: Game> MCTS<G> {
 
         let mut probs = vec![f32::NEG_INFINITY; action_shape];
         for (i, &(action, id)) in children_vec.iter().enumerate() {
-            probs[action] = self.arena[id].prior + completed_q[i];
+            probs[action] = self.arena[id].policy_logit + completed_q[i];
         }
 
         softmax_full(&probs, 1.0)
@@ -1149,11 +1132,17 @@ mod tests {
 
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(256);
+        let win_move = board.pos_to_idx(0, 2);
         let mut mcts: MCTS<Board> = MCTS::new();
         let result =
             futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
 
-        let win_move = board.pos_to_idx(0, 2);
+        println!("policy: {:?}", result.policy);
+        println!("children_q: {:?}", result.children_q);
+        println!("children_visits: {:?}", result.children_visits);
+        println!("root_value: {}", result.root_value);
+        println!("root_nn_value: {}", result.root_nn_value);
+
         let max_idx = result
             .policy
             .iter()
@@ -1253,14 +1242,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rescale_q_normalizes_to_01() {
-        let q = vec![-0.5, 0.0, 0.3, 0.8];
-        let r = MCTS::<Board>::rescale_q(&q);
-        assert!((r[0] - 0.0).abs() < 1e-6, "min should be ~0, got {}", r[0]);
-        assert!((r[3] - 1.0).abs() < 1e-6, "max should be ~1, got {}", r[3]);
-    }
-
-    #[test]
     fn test_compute_mixed_value_no_visits_returns_raw() {
         let raw = 0.7;
         let qvalues: [f32; 0] = [];
@@ -1326,33 +1307,38 @@ mod tests {
 
     #[test]
     fn test_select_interior_child_prefers_visited_high_q() {
-        // 构建一个简单的人工树来验证 interior 选择偏好高 Q
+        // 构建一个简单的人工树来验证 interior 选择偏好对父节点有利的 Q
+        // child.q() 是子节点自身视角；父视角 = flip_perspective(child.q())
+        // 父节点应选择父视角下 Q 更高的子节点（即子视角 Q 更低的）
         let mut mcts: MCTS<Board> = MCTS::new();
         let config = GumbelConfig::default();
 
         // 根节点
-        mcts.arena.push(Node::new(0.0, None));
+        mcts.arena.push(Node::new(0.0, 0.0, None));
         mcts.arena[0].raw_value = Some(0.0); // completed_q 需要 raw_value
         // 两个子节点
-        let child0 = mcts.push_node(Node::new(0.5, Some(0)));
-        let child1 = mcts.push_node(Node::new(0.5, Some(0)));
+        let child0 = mcts.push_node(Node::new(0.5, 0.5, Some(0)));
+        let child1 = mcts.push_node(Node::new(0.5, 0.5, Some(0)));
         mcts.arena[0].children.insert(0, child0);
         mcts.arena[0].children.insert(1, child1);
 
-        // child0: 高 Q (多次正回报)
+        // child0: 子视角高 Q（对父不利，父视角 = -0.8）
         for _ in 0..10 {
             mcts.arena[child0].add_visit(0.8);
         }
-        // child1: 低 Q (多次负回报)
+        // child1: 子视角低 Q（对父有利，父视角 = +0.5）
         for _ in 0..10 {
             mcts.arena[child1].add_visit(-0.5);
         }
 
         // 两个孙子节点挂在 child0 下（使 child0 不是叶子）
-        let gc = mcts.push_node(Node::new(0.5, Some(child0)));
+        let gc = mcts.push_node(Node::new(0.5, 0.5, Some(child0)));
         mcts.arena[child0].children.insert(0, gc);
 
         let (action, _) = mcts.select_interior_child(0, &config);
-        assert_eq!(action, 0, "should prefer high-Q child");
+        assert_eq!(
+            action, 1,
+            "should prefer child with higher Q from parent's perspective"
+        );
     }
 }
