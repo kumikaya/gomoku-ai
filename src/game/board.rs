@@ -51,7 +51,7 @@ pub struct Board {
 
 impl Board {
     /// 默认棋盘边长
-    pub const DEFAULT_BOARD_SIZE: usize = 8;
+    pub const DEFAULT_BOARD_SIZE: usize = 16;
     /// 默认获胜所需连子数
     pub const DEFAULT_WIN_LENGTH: usize = 5;
 

@@ -77,16 +77,6 @@ pub async fn self_play<E: Evaluator>(
         mcts.reuse_subtree(result.best_move);
     }
 
-    // ── 对齐 minizero：用游戏最终结果修正 value 标签 ──
-    // 从当前玩家视角：赢=+1.0, 输=-1.0, 平=0.0
-    for record in &mut records {
-        record.value = match board.winner {
-            Some(w) if w == record.player => 1.0,
-            Some(_) => -1.0,
-            None => 0.0,
-        };
-    }
-
     SelfPlayGame {
         winner: board.winner,
         records,
