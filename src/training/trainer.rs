@@ -63,6 +63,11 @@ pub struct TrainConfig {
     pub eval_every: usize,
     /// 随机种子（固定可复现实验结果）
     pub random_seed: u64,
+    /// 样本时效性线性衰减系数。
+    ///
+    /// 缓冲区中最新的样本权重放大 `1.0 + recency_bonus` 倍，最旧的不变。
+    /// 中间样本按位置线性插值。设为 0.0 则关闭衰减。
+    pub recency_bonus: f32,
 }
 
 impl Default for TrainConfig {
@@ -87,6 +92,7 @@ impl Default for TrainConfig {
             eval_promotion_threshold: 0.55,
             eval_every: 5,
             random_seed: 42,
+            recency_bonus: 0.5,
         }
     }
 }
@@ -379,8 +385,19 @@ impl Trainer {
                 .template("  Training: {bar:40.green/dim} {pos}/{len} batches ({eta})")
                 .unwrap(),
         );
-        // 加权有放回采样，每 batch 独立采样一次
-        let weights: Vec<_> = self.buffer.iter().map(|i| i.sample_weight).collect();
+        // 加权有放回采样，每 batch 独立采样一次。
+        // sample_weight 再乘上线性衰减因子：越新的样本（VecDeque 末尾）权重越高。
+        let n = self.buffer.len() as f32;
+        let bonus = self.config.recency_bonus;
+        let weights: Vec<_> = self
+            .buffer
+            .iter()
+            .enumerate()
+            .map(|(i, record)| {
+                let recency = i as f32 / n; // 0..1, newest=1
+                record.sample_weight * (bonus + (1.0 - bonus) * recency)
+            })
+            .collect();
 
         for _ in 0..num_batches {
             let chunk: Vec<_> = self
