@@ -17,7 +17,7 @@ struct Cli {
     games: usize,
 
     /// 每次 MCTS 模拟次数
-    #[arg(short = 's', long, default_value = "16")]
+    #[arg(short = 's', long, default_value = "32")]
     simulations: usize,
 
     /// 学习率
@@ -25,7 +25,7 @@ struct Cli {
     learning_rate: f64,
 
     /// 批大小
-    #[arg(short = 'b', long, default_value = "256")]
+    #[arg(short = 'b', long, default_value = "512")]
     batch_size: usize,
 
     /// 模型保存目录
@@ -49,7 +49,7 @@ struct Cli {
     eval_games: usize,
 
     /// 评估模拟次数
-    #[arg(long, default_value = "32")]
+    #[arg(long, default_value = "64")]
     eval_simulations: usize,
 
     /// 晋升阈值（默认 0.55）

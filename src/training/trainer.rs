@@ -81,8 +81,8 @@ impl Default for TrainConfig {
         Self {
             num_simulations: 64,
             games_per_iteration: 64,
-            batch_size: 256,
-            mini_batches_per_iteration: 256,
+            batch_size: 512,
+            mini_batches_per_iteration: 128,
             num_iterations: 100,
             learning_rate: 1e-3,
             value_loss_weight: 1.0,

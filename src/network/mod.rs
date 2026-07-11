@@ -13,4 +13,5 @@
 
 pub mod cnn;
 pub mod pos_embed;
+pub mod rope;
 pub mod transformer;

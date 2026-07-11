@@ -30,7 +30,7 @@ fn main() {
         eprintln!("Error: failed to load model: {}", e);
         std::process::exit(1);
     });
-    let model = GomokuNetwork::new(&device).load_record(record);
+    let model = GomokuNetwork::new(&device).load_record(record.cast_to_module_dtype());
 
     let server = InferenceServer::new(model, device.clone());
     println!("Model loaded. Starting analyze mode...");

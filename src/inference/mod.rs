@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// 批量评估上限（GPU 线程内部攒批的最大请求数）
-const SERVER_BATCH_CAP: usize = 256;
+const SERVER_BATCH_CAP: usize = 512;
 const BATCH_TIMEOUT: Duration = Duration::from_micros(200);
 
 // ============================================================
