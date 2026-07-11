@@ -68,6 +68,12 @@ pub struct TrainConfig {
     /// 缓冲区中最新的样本权重放大 `1.0 + recency_bonus` 倍，最旧的不变。
     /// 中间样本按位置线性插值。设为 0.0 则关闭衰减。
     pub recency_bonus: f32,
+
+    /// 熵惩罚系数。
+    ///
+    /// 在损失函数中加入 `-entropy_weight * entropy`，鼓励策略网络保持多样性，
+    /// 防止过早收敛到确定性策略。设为 0.0 则关闭熵惩罚。
+    pub entropy_weight: f32,
 }
 
 impl Default for TrainConfig {
@@ -93,6 +99,7 @@ impl Default for TrainConfig {
             eval_every: 5,
             random_seed: 42,
             recency_bonus: 0.5,
+            entropy_weight: 0.03,
         }
     }
 }
@@ -132,7 +139,8 @@ impl Trainer {
             match ModuleRecord::load(ckpt_path) {
                 Ok(record) => {
                     println!("Loaded checkpoint from {:?}", ckpt_path);
-                    return GomokuNetwork::new(autodiff_device).load_record(record);
+                    return GomokuNetwork::new(autodiff_device)
+                        .load_record(record.cast_to_module_dtype());
                 }
                 Err(e) => {
                     eprintln!(
@@ -432,17 +440,19 @@ impl Trainer {
 
             let log_probs = log_softmax(policy_logits, 1);
 
-            // ── 损失计算（纯 tensor 操作，不触发 device sync）──
+            // 带梯度的熵（用于 loss 反传，不加 detach）
             let entropy_tensor = {
-                let lp = log_probs.clone().detach();
-                let probs = lp.clone().exp();
-                -(probs * lp).sum_dim(1).mean()
+                let probs = log_probs.clone().exp();
+                -(probs * log_probs.clone()).sum_dim(1).mean()
             };
             let policy_loss = -(log_probs * policy_target).sum_dim(1).mean();
             let mse = MseLoss::new();
             let value_loss = mse.forward(value_pred.clone(), value_target_tensor, Reduction::Mean);
-            let total_loss =
-                value_loss.clone() * self.config.value_loss_weight + policy_loss.clone();
+            let total_loss = value_loss.clone() * self.config.value_loss_weight
+                + policy_loss.clone()
+                - entropy_tensor.clone() * self.config.entropy_weight;
+            // detach 后的熵，仅用于日志记录
+            let entropy_tensor = entropy_tensor.detach();
 
             // ── 用一次 Transaction 批量读取所有统计量（1 次 device sync 替代 5 次）──
             let val_pred_flat = value_pred.reshape([batch_size]).cast(FloatDType::F32);
