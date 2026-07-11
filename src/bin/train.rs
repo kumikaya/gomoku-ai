@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use burn::tensor::{Device, FloatDType, IntDType};
 use clap::Parser;
 use gomoku_ai::training::trainer::{TrainConfig, Trainer};
 
@@ -54,6 +55,10 @@ struct Cli {
     /// 晋升阈值（默认 0.55）
     #[arg(long, default_value = "0.55")]
     eval_threshold: f64,
+
+    /// 数据类型精度：f32 或 bf16（默认 f32）
+    #[arg(long, default_value = "f32")]
+    dtype: String,
 }
 
 fn main() {
@@ -61,7 +66,21 @@ fn main() {
 
     println!("=== Gomoku AI (AlphaZero) - Training ===\n");
 
-    let device = burn::tensor::Device::default();
+    let mut device = Device::default();
+    match cli.dtype.as_str() {
+        "bf16" | "b" => {
+            if let Err(e) = device.configure((FloatDType::BF16, IntDType::I32)) {
+                eprintln!("BF16 不受支持 ({e})，降级为 F32。\n");
+                device.configure((FloatDType::F32, IntDType::I32)).ok();
+            }
+        }
+        _ => {
+            device.configure((FloatDType::F32, IntDType::I32)).ok();
+        }
+    }
+    let dtype_info = format!("{:?}", device.settings().float_dtype);
+    println!("精度: {dtype_info}");
+
     let config = TrainConfig {
         num_simulations: cli.simulations,
         games_per_iteration: cli.games,
