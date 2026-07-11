@@ -21,7 +21,7 @@ use burn::{
     grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
     optim::{AdamConfig, GradientsParams},
-    tensor::{Device, FloatDType, Int, Tensor, activation::log_softmax},
+    tensor::{Device, FloatDType, Int, Tensor, TensorData, Transaction, activation::log_softmax},
 };
 use futures::task::SpawnExt;
 use futures_executor::ThreadPool;
@@ -430,39 +430,41 @@ impl Trainer {
                     .reshape([batch_size, 1]);
             let (policy_logits, value_pred) = model.forward(state_tensor);
 
-            let log_probs = log_softmax(policy_logits.clone(), 1);
+            let log_probs = log_softmax(policy_logits, 1);
 
-            // ── 统计（detached） ──
-            let entropy = {
-                let log_probs = log_probs.clone().detach();
-                let probs = log_probs.clone().exp();
-                -(probs * log_probs).sum_dim(1).mean().into_scalar::<f32>()
+            // ── 损失计算（纯 tensor 操作，不触发 device sync）──
+            let entropy_tensor = {
+                let lp = log_probs.clone().detach();
+                let probs = lp.clone().exp();
+                -(probs * lp).sum_dim(1).mean()
             };
+            let policy_loss = -(log_probs * policy_target).sum_dim(1).mean();
+            let mse = MseLoss::new();
+            let value_loss = mse.forward(value_pred.clone(), value_target_tensor, Reduction::Mean);
+            let total_loss =
+                value_loss.clone() * self.config.value_loss_weight + policy_loss.clone();
 
-            let val_pred: Vec<f32> = value_pred
-                .clone()
-                .reshape([batch_size])
-                .cast(FloatDType::F32)
-                .into_data()
-                .to_vec()
-                .unwrap();
+            // ── 用一次 Transaction 批量读取所有统计量（1 次 device sync 替代 5 次）──
+            let val_pred_flat = value_pred.reshape([batch_size]).cast(FloatDType::F32);
+            let [entropy_data, vpred_data, ploss_data, vloss_data, tloss_data]: [TensorData; 5] =
+                Transaction::default()
+                    .register(entropy_tensor.reshape([1]).cast(FloatDType::F32))
+                    .register(val_pred_flat)
+                    .register(policy_loss.reshape([1]).cast(FloatDType::F32))
+                    .register(value_loss.reshape([1]).cast(FloatDType::F32))
+                    .register(total_loss.clone().reshape([1]).cast(FloatDType::F32))
+                    .execute()
+                    .try_into()
+                    .expect("Transaction read failed");
+
+            let entropy: f32 = entropy_data.to_vec::<f32>().unwrap()[0];
+            let val_pred: Vec<f32> = vpred_data.to_vec().unwrap();
+            let policy_loss_scalar: f32 = ploss_data.to_vec::<f32>().unwrap()[0];
+            let value_loss_scalar: f32 = vloss_data.to_vec::<f32>().unwrap()[0];
+            let total_loss_scalar: f32 = tloss_data.to_vec::<f32>().unwrap()[0];
+
             stats.all_value_preds.extend(val_pred);
             stats.all_value_targets.extend(flat_values.iter());
-
-            // ── 损失 ──
-            let policy_loss = -(log_probs * policy_target.clone()).sum_dim(1).mean();
-            let policy_loss_scalar: f32 = policy_loss.clone().into_scalar();
-
-            let mse = MseLoss::new();
-            let value_loss = mse.forward(
-                value_pred.clone(),
-                value_target_tensor.clone(),
-                Reduction::Mean,
-            );
-            let value_loss_scalar: f32 = value_loss.clone().into_scalar();
-
-            let loss = value_loss * self.config.value_loss_weight + policy_loss;
-            let total_loss_scalar: f32 = loss.clone().into_scalar();
 
             // ── 记录每个 batch 的指标到日志文件 ──
             self.metrics_logger.log_batch(
@@ -482,7 +484,7 @@ impl Trainer {
             });
 
             // 反向传播 + 参数更新
-            let grads = loss.backward();
+            let grads = total_loss.backward();
             let grads = GradientsParams::from_grads(grads, model);
             *model = optim.step(lr.into(), model.clone(), grads);
 

@@ -4,6 +4,7 @@
 //! 实现：单 CUDA 上下文，多 MCTS 实例共享，跨请求自动攒批。
 
 use crate::network::transformer::{GomokuNetwork, policy_out_dim};
+use burn::tensor::Transaction;
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use futures::channel::oneshot;
 use std::sync::Arc;
@@ -130,16 +131,15 @@ impl InferenceServer {
         );
         let (logits, values) = model.forward(state_tensor);
         // 若 device 配置为 f16，cast 回 f32 才能 to_vec::<f32>()
-        let policy_flat: Vec<f32> = logits
-            .cast(FloatDType::F32)
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-        let values_flat: Vec<f32> = values
-            .cast(FloatDType::F32)
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
+        // 使用 Transaction 将两次读合并为一次 device sync，提升异步执行效率
+        let [policy_data, values_data]: [TensorData; 2] = Transaction::default()
+            .register(logits.cast(FloatDType::F32))
+            .register(values.cast(FloatDType::F32))
+            .execute()
+            .try_into()
+            .expect("Transaction read failed");
+        let policy_flat: Vec<f32> = policy_data.to_vec().unwrap();
+        let values_flat: Vec<f32> = values_data.to_vec().unwrap();
 
         // 按请求拆分结果
         let mut pol_offset = 0;
