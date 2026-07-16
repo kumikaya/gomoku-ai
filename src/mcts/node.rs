@@ -168,6 +168,8 @@ pub struct MCTS<G: Game> {
     pub arena: Vec<Node>,
     /// 当前逻辑根节点在 arena 中的索引。子树复用后可能非 0。
     pub root_id: NodeId,
+    /// 根节点是否已叠加过 Dirichlet 噪声（防止复用后重复叠加）
+    dirichlet_noise_applied: bool,
     _phantom: PhantomData<G>,
 }
 
@@ -203,6 +205,7 @@ impl<G: Game> MCTS<G> {
         Self {
             arena: vec![Node::new(0.0, 0.0, None)],
             root_id: INITIAL_ROOT,
+            dirichlet_noise_applied: false,
             _phantom: PhantomData,
         }
     }
@@ -226,6 +229,7 @@ impl<G: Game> MCTS<G> {
     pub fn reset(&mut self) {
         self.arena.clear();
         self.root_id = INITIAL_ROOT;
+        self.dirichlet_noise_applied = false;
         self.arena.push(Node::new(0.0, 0.0, None));
     }
 
@@ -235,8 +239,11 @@ impl<G: Game> MCTS<G> {
 
     /// 将 `action` 对应的子树提升为新根（O(1) 指针操作）。
     pub fn reuse_subtree(&mut self, action: ActionId) {
-        let child_id = self.root().children[&action];
-        self.root_id = child_id;
+        if let Some(&child_id) = self.root().children.get(&action) {
+            self.arena[child_id].parent = None;
+            self.root_id = child_id;
+            self.dirichlet_noise_applied = false;
+        }
     }
 
     /// 收集某个节点的所有子节点 `(action, child_id)`。
@@ -414,6 +421,7 @@ impl<G: Game> MCTS<G> {
 
         let num_considered = config
             .max_num_considered_actions
+            .min(children.len())
             .min(config.num_simulations)
             .min(halving_table.nrows().saturating_sub(1));
         let considered_visit = halving_table[(num_considered, simulation_index)];
@@ -490,14 +498,20 @@ impl<G: Game> MCTS<G> {
             .sum();
         let denom = (1 + sum_visits) as f32;
 
-        // 单次迭代直接选最优，零分配
+        // 对齐 LightZero：prior + completed_q → softmax → 减 visit 惩罚项
+        let logits: Vec<f32> = children
+            .iter()
+            .zip(completed_q.iter())
+            .map(|(&(_, id), &q)| self.arena[id].prior + q)
+            .collect();
+        let probs = softmax_full(&logits, 1.0);
+
         let best_idx = children
             .iter()
             .enumerate()
             .map(|(i, &(_, id))| {
-                let score = self.child_logit(id, completed_q[i]);
-                let penalty = self.arena[id].visit_count as f32 / denom;
-                (i, score - penalty)
+                let score = probs[i] - self.arena[id].visit_count as f32 / denom;
+                (i, score)
             })
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i)
@@ -661,8 +675,9 @@ impl<G: Game> MCTS<G> {
             }
         }
 
-        // ── Phase 2: 可选 Dirichlet 噪声 ──
-        if config.add_dirichlet_noise {
+        // ── Phase 2: 可选 Dirichlet 噪声（仅首次展开时叠加，防止复用后重复叠加）──
+        if config.add_dirichlet_noise && !self.dirichlet_noise_applied {
+            self.dirichlet_noise_applied = true;
             self.add_dirichlet_noise(config, rng);
         }
 
@@ -729,7 +744,7 @@ impl<G: Game> MCTS<G> {
     // ================================================================
 
     /// 构建 improved policy：`softmax(policy_logit + completed_q)`。
-    /// 对齐 MiniZero `getMCTSPolicy`：使用 logit 空间的得分经 temperature-scaled softmax。
+    /// 对齐 MiniZero `getMCTSPolicy`：使用 logit 空间的得分经 softmax（温度 = 1.0）。
     fn improved_policy(&self, config: &GumbelConfig, action_shape: usize) -> Vec<f32> {
         let children_vec = self.children_vec(self.root_id);
 
@@ -764,13 +779,33 @@ impl<G: Game> MCTS<G> {
             .collect();
 
         let sum: f64 = visits.iter().sum();
-        if sum == 0.0 || temperature == 0.0 {
+        if sum == 0.0 {
             let n = action_shape as f64;
             return vec![1.0 / n; action_shape];
         }
 
-        // 先除以温度再归一化
-        let scaled: Vec<f64> = visits.iter().map(|&v| v / temperature as f64).collect();
+        // τ → 0 的极限是 argmax（确定性贪心），用于推理模式
+        if temperature == 0.0 {
+            let max: f64 = visits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut probs = vec![0.0_f64; action_shape];
+            let mut count = 0_usize;
+            for (i, &v) in visits.iter().enumerate() {
+                if v == max {
+                    probs[i] = 1.0;
+                    count += 1;
+                }
+            }
+            if count > 1 {
+                for p in &mut probs {
+                    *p /= count as f64;
+                }
+            }
+            return probs;
+        }
+
+        // π(a) ∝ N(a)^(1/τ) —— 标准 AlphaZero 温度公式
+        let inv_temp = 1.0 / temperature as f64;
+        let scaled: Vec<f64> = visits.iter().map(|&v| v.powf(inv_temp)).collect();
         let scaled_sum: f64 = scaled.iter().sum();
         scaled.iter().map(|&v| v / scaled_sum).collect()
     }
