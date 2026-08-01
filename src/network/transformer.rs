@@ -73,7 +73,7 @@ pub struct TransformerBlock {
 impl TransformerBlock {
     pub fn new(d_model: usize, d_ff: usize, n_heads: usize, device: &Device) -> Self {
         assert!(
-            d_model % n_heads == 0,
+            d_model.is_multiple_of(n_heads),
             "d_model ({d_model}) must be divisible by n_heads ({n_heads})"
         );
         let d_head = d_model / n_heads;
@@ -212,7 +212,7 @@ impl GomokuNetwork {
     /// 输入 [batch, board_size²] i32 → 策略 [batch, board_size²] + 价值 [batch, 1]
     pub fn forward(&self, input: Tensor<2, Int>) -> (Tensor<2>, Tensor<2>) {
         let batch = input.dims()[0];
-        let seq = input.dims()[1] as usize;
+        let seq = input.dims()[1];
         let board = self.board_size;
 
         // ── Embedding ──

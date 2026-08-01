@@ -10,7 +10,7 @@ use crate::inference::InferenceServer;
 use crate::mcts::node::{GumbelConfig, MCTS};
 use crate::network::transformer::GomokuNetwork;
 
-use burn::module::{AutodiffModule, Module};
+use burn::module::Module;
 use burn::tensor::Device;
 use futures::task::SpawnExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -53,6 +53,12 @@ impl EloTracker {
             let sign = if delta >= 0.0 { "+" } else { "" };
             println!("    iter {:>4}: {:.1} ({}{:.1})", iter, elo, sign, delta);
         }
+    }
+}
+
+impl Default for EloTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -235,8 +241,10 @@ impl MatchRunner {
 
         pb.finish_and_clear();
 
-        let mut result = MatchResult::default();
-        result.total_games = num_games;
+        let mut result = MatchResult {
+            total_games: num_games,
+            ..Default::default()
+        };
 
         for outcome in &outcomes_current_black {
             match outcome {
@@ -306,7 +314,7 @@ async fn play_eval_game(
         };
 
         mcts.reset();
-        let result = mcts.search(&mut board, eval, &config, &mut rng).await;
+        let result = mcts.search(&board, eval, &config, &mut rng).await;
 
         if result.best_move >= npos || !board.play_idx(result.best_move) {
             break;

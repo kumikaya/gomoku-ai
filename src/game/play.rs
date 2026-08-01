@@ -79,49 +79,50 @@ async fn run_game_loop<E: Evaluator>(
 
         if state.game_over {
             // 等待 Q 退出
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                    return Ok(());
-                }
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Char('q')
+            {
+                return Ok(());
             }
             continue;
         }
 
         // 人类回合
-        if state.board.current_player == state.player_color {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char(' ') | KeyCode::Enter => {
-                        if state.board.play(state.cursor_row, state.cursor_col) {
-                            state.message =
-                                format!("你落了 ({},{})...", state.cursor_row, state.cursor_col);
-                            // 如果人类落子后游戏未结束，轮到 AI
-                            if !state.board.game_over {
-                                terminal.draw(|f| render(f, &state))?;
-                                ai_move(&mut state, evaluator, num_simulations).await;
-                            }
-                        } else {
-                            state.message = "该位置已有棋子！".into();
+        if state.board.current_player == state.player_color
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    if state.board.play(state.cursor_row, state.cursor_col) {
+                        state.message =
+                            format!("你落了 ({},{})...", state.cursor_row, state.cursor_col);
+                        // 如果人类落子后游戏未结束，轮到 AI
+                        if !state.board.game_over {
+                            terminal.draw(|f| render(f, &state))?;
+                            ai_move(&mut state, evaluator, num_simulations).await;
                         }
+                    } else {
+                        state.message = "该位置已有棋子！".into();
                     }
-                    KeyCode::Up => {
-                        state.cursor_row = state.cursor_row.saturating_sub(1);
-                    }
-                    KeyCode::Down => {
-                        state.cursor_row = (state.cursor_row + 1).min(state.board.board_size - 1);
-                    }
-                    KeyCode::Left => {
-                        state.cursor_col = state.cursor_col.saturating_sub(1);
-                    }
-                    KeyCode::Right => {
-                        state.cursor_col = (state.cursor_col + 1).min(state.board.board_size - 1);
-                    }
-                    _ => {}
                 }
+                KeyCode::Up => {
+                    state.cursor_row = state.cursor_row.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    state.cursor_row = (state.cursor_row + 1).min(state.board.board_size - 1);
+                }
+                KeyCode::Left => {
+                    state.cursor_col = state.cursor_col.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    state.cursor_col = (state.cursor_col + 1).min(state.board.board_size - 1);
+                }
+                _ => {}
             }
         }
     }
@@ -132,7 +133,7 @@ async fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulat
     state.mcts.reset();
     let result = state
         .mcts
-        .search(&mut state.board, evaluator, &config, &mut rand::rng())
+        .search(&state.board, evaluator, &config, &mut rand::rng())
         .await;
 
     let npos = state.board.num_positions();

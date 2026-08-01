@@ -43,7 +43,7 @@ struct InferenceRequest {
 enum GpuCommand {
     Evaluate(InferenceRequest),
     UpdateModel {
-        model: GomokuNetwork,
+        model: Box<GomokuNetwork>,
         // 发回确认，确保调用方在模型更新完成前不进行下一轮自对弈
         done_tx: crossbeam_channel::Sender<()>,
     },
@@ -104,7 +104,10 @@ impl InferenceServer {
         let (done_tx, done_rx) = crossbeam_channel::bounded(0);
         self.inner
             .cmd_tx
-            .send(GpuCommand::UpdateModel { model, done_tx })
+            .send(GpuCommand::UpdateModel {
+                model: Box::new(model),
+                done_tx,
+            })
             .expect("GPU inference thread died");
         done_rx.recv().expect("GPU inference thread died");
     }
@@ -138,19 +141,13 @@ impl InferenceServer {
             .execute()
             .try_into()
             .expect("Transaction read failed");
-        let policy_flat: Vec<f32> = policy_data.to_vec().unwrap();
-        let values_flat: Vec<f32> = values_data.to_vec().unwrap();
+        let policy_flat: Vec<f32> = policy_data.try_to_vec::<f32>().unwrap();
+        let values_flat: Vec<f32> = values_data.try_to_vec::<f32>().unwrap();
 
         // 按请求拆分结果
-        let mut pol_offset = 0;
-        let mut val_offset = 0;
-        for req in batch.drain(..) {
-            let logits = policy_flat[pol_offset..pol_offset + policy_out].to_vec();
-            let value = values_flat[val_offset];
-
-            pol_offset += policy_out;
-            val_offset += 1;
-
+        for (i, req) in batch.drain(..).enumerate() {
+            let logits = policy_flat[i * policy_out..(i + 1) * policy_out].to_vec();
+            let value = values_flat[i];
             let _ = req.response_tx.send((logits, value));
         }
     }
@@ -177,7 +174,7 @@ impl InferenceServer {
                     model: new_model,
                     done_tx,
                 } => {
-                    model = new_model;
+                    model = *new_model;
                     let _ = done_tx.send(());
                     continue;
                 }
@@ -196,7 +193,7 @@ impl InferenceServer {
                     }) => {
                         // 先处理当前 batch，再更新模型
                         Self::forward_batch(&model, &device, &mut batch);
-                        model = new_model;
+                        model = *new_model;
                         let _ = done_tx.send(());
                         continue 'outer;
                     }

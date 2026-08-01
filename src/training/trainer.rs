@@ -19,7 +19,6 @@ use burn::optim::ModuleOptimizer;
 use burn::store::ModuleRecord;
 use burn::{
     grad_clipping::GradientClippingConfig,
-    module::AutodiffModule,
     optim::{AdamConfig, GradientsParams},
     tensor::{Device, FloatDType, Int, Tensor, TensorData, Transaction, activation::log_softmax},
 };
@@ -249,36 +248,37 @@ impl Trainer {
             inference_server.update_model(model.clone().valid());
 
             // ── 对抗评估 ──
-            if self.config.eval_enabled && epoch % self.config.eval_every == 0 {
-                if let (Some(runner), Some(bs)) = (&match_runner, &baseline_server) {
-                    println!();
-                    println!("  === Tournament Evaluation (iter {}) ===", epoch);
-                    let result = runner.run_match(
-                        &self.pool,
-                        &inference_server,
-                        &bs.server(),
-                        master_rng.random::<u64>(),
+            if self.config.eval_enabled
+                && epoch % self.config.eval_every == 0
+                && let (Some(runner), Some(bs)) = (&match_runner, &baseline_server)
+            {
+                println!();
+                println!("  === Tournament Evaluation (iter {}) ===", epoch);
+                let result = runner.run_match(
+                    &self.pool,
+                    &inference_server,
+                    bs.server(),
+                    master_rng.random::<u64>(),
+                );
+                result.print();
+
+                let wr = result.win_rate_current();
+                let new_elo = elo.update(epoch, wr);
+                println!("  Elo: {:.1} (baseline=1500)", new_elo);
+
+                if wr > self.config.eval_promotion_threshold {
+                    println!(
+                        "  >>> Model promoted! Win rate {:.1}% > threshold {:.0}%",
+                        wr * 100.0,
+                        self.config.eval_promotion_threshold * 100.0,
                     );
-                    result.print();
-
-                    let wr = result.win_rate_current();
-                    let new_elo = elo.update(epoch, wr);
-                    println!("  Elo: {:.1} (baseline=1500)", new_elo);
-
-                    if wr > self.config.eval_promotion_threshold {
-                        println!(
-                            "  >>> Model promoted! Win rate {:.1}% > threshold {:.0}%",
-                            wr * 100.0,
-                            self.config.eval_promotion_threshold * 100.0,
-                        );
-                        bs.promote(&model);
-                    } else {
-                        println!(
-                            "  Win rate {:.1}% <= threshold {:.0}%, baseline unchanged",
-                            wr * 100.0,
-                            self.config.eval_promotion_threshold * 100.0,
-                        );
-                    }
+                    bs.promote(&model);
+                } else {
+                    println!(
+                        "  Win rate {:.1}% <= threshold {:.0}%, baseline unchanged",
+                        wr * 100.0,
+                        self.config.eval_promotion_threshold * 100.0,
+                    );
                 }
             }
 
@@ -332,7 +332,6 @@ impl Trainer {
         let sp_config = SelfPlayConfig {
             num_simulations: self.config.num_simulations,
             select_temperature: temp,
-            ..Default::default()
         };
 
         let base_seed = master_rng.random::<u64>();
@@ -395,7 +394,8 @@ impl Trainer {
         );
         // 加权有放回采样，每 batch 独立采样一次。
         // sample_weight 再乘上线性衰减因子：越新的样本（VecDeque 末尾）权重越高。
-        let n = self.buffer.len() as f32;
+        let train_size = self.buffer.len();
+        let n = train_size as f32;
         let bonus = self.config.recency_bonus;
         let weights: Vec<_> = self
             .buffer
@@ -407,7 +407,7 @@ impl Trainer {
             })
             .collect();
 
-        for _ in 0..num_batches {
+        for step in 0..num_batches {
             let chunk: Vec<_> = self
                 .buffer
                 .sample_batch(batch_size, &weights, rng)
@@ -467,11 +467,11 @@ impl Trainer {
                     .try_into()
                     .expect("Transaction read failed");
 
-            let entropy: f32 = entropy_data.to_vec::<f32>().unwrap()[0];
-            let val_pred: Vec<f32> = vpred_data.to_vec().unwrap();
-            let policy_loss_scalar: f32 = ploss_data.to_vec::<f32>().unwrap()[0];
-            let value_loss_scalar: f32 = vloss_data.to_vec::<f32>().unwrap()[0];
-            let total_loss_scalar: f32 = tloss_data.to_vec::<f32>().unwrap()[0];
+            let entropy: f32 = entropy_data.try_to_vec::<f32>().unwrap()[0];
+            let val_pred: Vec<f32> = vpred_data.try_to_vec::<f32>().unwrap();
+            let policy_loss_scalar: f32 = ploss_data.try_to_vec::<f32>().unwrap()[0];
+            let value_loss_scalar: f32 = vloss_data.try_to_vec::<f32>().unwrap()[0];
+            let total_loss_scalar: f32 = tloss_data.try_to_vec::<f32>().unwrap()[0];
 
             stats.all_value_preds.extend(val_pred);
             stats.all_value_targets.extend(flat_values.iter());
@@ -479,6 +479,10 @@ impl Trainer {
             // ── 记录每个 batch 的指标到日志文件 ──
             self.metrics_logger.log_batch(
                 epoch,
+                step,
+                batch_size,
+                train_size,
+                lr,
                 total_loss_scalar,
                 policy_loss_scalar,
                 value_loss_scalar,
@@ -496,7 +500,7 @@ impl Trainer {
             // 反向传播 + 参数更新
             let grads = total_loss.backward();
             let grads = GradientsParams::from_grads(grads, model);
-            *model = optim.step(lr.into(), model.clone(), grads);
+            *model = optim.step(lr, model.clone(), grads);
 
             pb.inc(1);
         }

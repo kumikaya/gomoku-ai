@@ -49,6 +49,12 @@ pub struct Board {
     encode_shape_storage: [usize; 1],
 }
 
+impl Default for Board {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Board {
     /// 默认棋盘边长
     pub const DEFAULT_BOARD_SIZE: usize = 8;

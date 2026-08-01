@@ -27,6 +27,12 @@ impl<T> Table<T> {
         self.slots.len()
     }
 
+    /// 返回表是否为空（长度为 0）。
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// 设置 `idx` 位置的值为 `value`。
     #[inline]
     pub fn set(&mut self, idx: usize, value: T) {

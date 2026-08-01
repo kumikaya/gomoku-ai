@@ -3,6 +3,7 @@
 //! 将棋盘上每个坐标 (row, col) 编码为两个独立的嵌入向量：
 //!   - 行位置嵌入：max_board_size 个 d_model 维向量
 //!   - 列位置嵌入：max_board_size 个 d_model 维向量
+//!
 //! 两者相加得到最终 2D 位置编码。
 //!
 //! forward 时直接从 embedding 权重切片 + 广播，无需构建索引张量。
@@ -53,7 +54,7 @@ impl Pos2DEmbed {
     ///
     /// 返回 `x + pos_encoding` [batch, seq, d_model]。
     pub fn forward(&self, x: Tensor<3>, h: usize, w: usize) -> Tensor<3> {
-        let d = x.dims()[2] as usize;
+        let d = x.dims()[2];
 
         // 行嵌入: [h, d_model] → [h, 1, d]
         let row = self
@@ -148,8 +149,8 @@ mod tests {
         let raw = out.as_slice::<f32>().unwrap();
 
         // 不同位置 (0,0) 和 (1,2) 不应该完全相同
-        let pos_a = 0 * d; // seq=0: row=0, col=0
-        let pos_b = (1 * w + 2) * d; // seq=1*3+2=5: row=1, col=2
+        let pos_a = 0; // seq=0: row=0, col=0
+        let pos_b = (w + 2) * d; // seq=1*3+2=5: row=1, col=2
         let same = (0..d).all(|k| raw[pos_a + k] == raw[pos_b + k]);
         assert!(!same, "positions (0,0) and (1,2) should differ");
     }

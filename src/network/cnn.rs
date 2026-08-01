@@ -2,6 +2,7 @@
 //!
 //! 输入：[batch, num_input_channels, board_size, board_size]
 //!   - 3 通道：0=空, 1=黑, 2=白（one-hot 由上层编码）
+//!
 //! 输出：
 //!   - 策略 logits：[batch, board_size²]  各落子点未归一化分数
 //!   - 局势价值：  [batch, 1]  范围 [-1, 1]（Tanh）

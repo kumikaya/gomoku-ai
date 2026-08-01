@@ -23,7 +23,7 @@ pub struct RoPE2D {
 impl RoPE2D {
     pub fn new(board_size: usize, d_head: usize, device: &Device) -> Self {
         assert!(
-            d_head >= 4 && d_head % 4 == 0,
+            d_head >= 4 && d_head.is_multiple_of(4),
             "d_head ({d_head}) must be >= 4 and divisible by 4"
         );
         let quarter = d_head / 4;
@@ -139,8 +139,8 @@ mod tests {
         let data: Vec<f32> = (0..256).map(|i| i as f32 + 1.0).collect();
         let x = Tensor::<4>::from_data(TensorData::new(data, [1, 1, 16, 16]), &device);
         let out = rope.apply(x.clone(), 4);
-        let in_s = x.to_data().to_vec::<f32>().unwrap();
-        let out_s = out.to_data().to_vec::<f32>().unwrap();
+        let in_s = x.to_data().try_to_vec::<f32>().unwrap();
+        let out_s = out.to_data().try_to_vec::<f32>().unwrap();
         for j in 0..16 {
             assert!(
                 (in_s[j] - out_s[j]).abs() < 1e-5,
@@ -166,8 +166,8 @@ mod tests {
         let x = Tensor::<4>::from_data(TensorData::new(data, [2, 3, seq, d_head]), &device);
         let out = rope.apply(x.clone(), bs);
 
-        let in_s = x.to_data().to_vec::<f32>().unwrap();
-        let out_s = out.to_data().to_vec::<f32>().unwrap();
+        let in_s = x.to_data().try_to_vec::<f32>().unwrap();
+        let out_s = out.to_data().try_to_vec::<f32>().unwrap();
 
         let total = 2 * 3 * seq;
         for t in 0..total {

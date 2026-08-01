@@ -144,11 +144,11 @@ async fn run_analyze_loop<E: Evaluator>(
                 }
                 match key.code {
                     KeyCode::Enter => {
-                        if let Ok(n) = sim_overlay.input_buffer.parse::<usize>() {
-                            if n > 0 {
-                                state.num_simulations = n;
-                                state.message = format!("模拟次数已设置为 {}", n);
-                            }
+                        if let Ok(n) = sim_overlay.input_buffer.parse::<usize>()
+                            && n > 0
+                        {
+                            state.num_simulations = n;
+                            state.message = format!("模拟次数已设置为 {}", n);
                         }
                         sim_overlay.deactivate();
                     }
@@ -259,7 +259,7 @@ async fn run_analysis<E: Evaluator>(state: &mut AnalyzeState, evaluator: &E) {
     state.mcts.reset();
     let result = state
         .mcts
-        .search(&mut state.board, evaluator, &config, &mut rand::rng())
+        .search(&state.board, evaluator, &config, &mut rand::rng())
         .await;
 
     let mut total_visits: u32 = result.children_visits.iter().sum();
@@ -313,42 +313,42 @@ fn render(frame: &mut Frame, state: &AnalyzeState, sim_overlay: &SimInputOverlay
     frame.render_widget(msg, chunks[1]);
 
     // 如果计算中且无结果，不渲染侧边栏
-    if !state.computing {
-        if let Some(ref result) = state.current_result {
-            // 在右侧区域打印当前光标指向格子的数值
-            let idx = state.board.pos_to_idx(state.cursor_row, state.cursor_col);
-            let info = format!(
-                " 位置 ({},{}) [{}]\n NN 价值: {:+.3}\n 先验概率: {:.3}%\n MCTS Q: {:+.3}\n MCTS 概率: {:.3}%\n 访问次数: {}",
-                state.cursor_row,
-                state.cursor_col,
-                if state.board.is_empty(state.cursor_row, state.cursor_col) {
-                    "空"
-                } else {
-                    "落子"
-                },
-                result.nn_value,
-                result.nn_prior.get(idx).copied().unwrap_or(0.0) * 100.0,
-                result.mcts_q.get(idx).copied().unwrap_or(0.0),
-                result.mcts_policy.get(idx).copied().unwrap_or(0.0) * 100.0,
-                result.mcts_visits.get(idx).copied().unwrap_or(0),
-            );
+    if !state.computing
+        && let Some(ref result) = state.current_result
+    {
+        // 在右侧区域打印当前光标指向格子的数值
+        let idx = state.board.pos_to_idx(state.cursor_row, state.cursor_col);
+        let info = format!(
+            " 位置 ({},{}) [{}]\n NN 价值: {:+.3}\n 先验概率: {:.3}%\n MCTS Q: {:+.3}\n MCTS 概率: {:.3}%\n 访问次数: {}",
+            state.cursor_row,
+            state.cursor_col,
+            if state.board.is_empty(state.cursor_row, state.cursor_col) {
+                "空"
+            } else {
+                "落子"
+            },
+            result.nn_value,
+            result.nn_prior.get(idx).copied().unwrap_or(0.0) * 100.0,
+            result.mcts_q.get(idx).copied().unwrap_or(0.0),
+            result.mcts_policy.get(idx).copied().unwrap_or(0.0) * 100.0,
+            result.mcts_visits.get(idx).copied().unwrap_or(0),
+        );
 
-            let info_panel = Paragraph::new(info)
-                .block(Block::default().borders(Borders::ALL).title(" 分析 "))
-                .style(Style::default().fg(TuiColor::Cyan));
+        let info_panel = Paragraph::new(info)
+            .block(Block::default().borders(Borders::ALL).title(" 分析 "))
+            .style(Style::default().fg(TuiColor::Cyan));
 
-            // 放在棋盘区域的右下角或右侧
-            let board_width = (state.board_size * 3 + 1) as u16;
-            let x_rem = area.width.saturating_sub(board_width);
-            let info_rect = Rect {
-                x: area.x + board_width + 1,
-                y: chunks[0].y,
-                width: (x_rem.saturating_sub(2)).min(28),
-                height: 9,
-            };
-            if info_rect.width > 0 {
-                frame.render_widget(info_panel, info_rect);
-            }
+        // 放在棋盘区域的右下角或右侧
+        let board_width = (state.board_size * 3 + 1) as u16;
+        let x_rem = area.width.saturating_sub(board_width);
+        let info_rect = Rect {
+            x: area.x + board_width + 1,
+            y: chunks[0].y,
+            width: (x_rem.saturating_sub(2)).min(28),
+            height: 9,
+        };
+        if info_rect.width > 0 {
+            frame.render_widget(info_panel, info_rect);
         }
     }
 
@@ -486,7 +486,7 @@ impl Widget for AnalyzeBoardWidget<'_> {
                 .and_then(|d| d.get(half_size * bs + half_size))
                 .copied();
             // 只有概率很低或没有数据时才画星位
-            let should_draw = star_prob.map_or(true, |p| p <= 0.001);
+            let should_draw = star_prob.is_none_or(|p| p <= 0.001);
             if should_draw {
                 let star_x = x_offset + half_size as u16 * 3 + 2;
                 let star_y = y_offset + half_size as u16 + 1;
