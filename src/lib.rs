@@ -9,11 +9,13 @@
 //!   - `loss_scaler`: 混合精度 Loss Scaling
 //!   - `trainer`:     训练器
 //! - `eval`:     神经网络棋力评估（对抗对弈 + Elo 追踪）
+//! - `pool`:     阻塞式工作队列线程池（自对弈 / 评估并发）
 
 pub mod eval;
 pub mod game;
 pub mod inference;
 pub mod mcts;
 pub mod network;
+pub mod pool;
 pub mod selfplay;
 pub mod training;

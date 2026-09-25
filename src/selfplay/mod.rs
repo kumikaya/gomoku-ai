@@ -2,11 +2,14 @@
 //!
 //! 使用 MCTS (Gumbel Zero) 指导双方走棋，生成 (状态, 策略, 价值) 训练样本。
 
-use crate::game::board::{Board, Color};
-use crate::inference::Evaluator;
-use crate::mcts::node::{GumbelConfig, MCTS};
 use rand::RngExt;
 use smart_default::SmartDefault;
+
+use crate::{
+    game::board::{Board, Color},
+    inference::Evaluator,
+    mcts::node::{GumbelConfig, MCTS},
+};
 
 #[derive(Clone, Debug, SmartDefault)]
 pub struct PlayRecord {
@@ -51,7 +54,7 @@ impl Default for SelfPlayConfig {
 ///
 /// 自对弈过程中复用 MCTS 搜索树：每一步结束后将选中动作的子树提升为新根，
 /// 下一步在此基础上继续搜索。若复用失败则丢弃旧树，完整重新搜索。
-pub async fn self_play<E: Evaluator>(
+pub fn self_play<E: Evaluator>(
     evaluator: &E,
     config: &SelfPlayConfig,
     rng: &mut impl RngExt,
@@ -63,7 +66,7 @@ pub async fn self_play<E: Evaluator>(
     search_config.select_temperature = config.select_temperature;
 
     while !board.game_over {
-        let result = mcts.search(&board, evaluator, &search_config, rng).await;
+        let result = mcts.search(&board, evaluator, &search_config, rng);
         let kl = compute_kl(&result.root_nn_prior, &result.policy);
         records.push(PlayRecord {
             state: board.encode_state(),

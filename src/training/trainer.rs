@@ -2,33 +2,32 @@
 //!
 //! `TrainConfig` 配置训练超参数，`Trainer` 执行完整的 AlphaZero 训练循环。
 
-use crate::game::board::D4Symmetry;
-use crate::inference::InferenceServer;
-use crate::network::transformer::GomokuNetwork;
-use crate::network::transformer::policy_out_dim;
-use crate::selfplay::{PlayRecord, SelfPlayConfig, self_play};
-use crate::training::buffer::RolloutBuffer;
-use crate::training::lr_schedule::LrSchedule;
-use crate::training::metrics::{BatchStats, EpochStats, TrainingLogger};
+use std::{path::PathBuf, sync::Arc};
 
-use crate::eval::{BaselineServer, EloTracker, EvalConfig, MatchRunner};
-
-use burn::module::Module;
-use burn::nn::loss::{MseLoss, Reduction};
-use burn::optim::ModuleOptimizer;
-use burn::store::ModuleRecord;
 use burn::{
     grad_clipping::GradientClippingConfig,
-    optim::{AdamConfig, GradientsParams},
+    module::Module,
+    nn::loss::{MseLoss, Reduction},
+    optim::{AdamConfig, GradientsParams, ModuleOptimizer},
+    store::ModuleRecord,
     tensor::{Device, FloatDType, Int, Tensor, TensorData, Transaction, activation::log_softmax},
 };
-use futures::task::SpawnExt;
-use futures_executor::ThreadPool;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
-use std::path::PathBuf;
-use std::sync::Arc;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+use crate::{
+    eval::{BaselineServer, EloTracker, EvalConfig, MatchRunner},
+    game::board::D4Symmetry,
+    inference::InferenceServer,
+    network::transformer::{GomokuNetwork, policy_out_dim},
+    pool::BlockingPool,
+    selfplay::{PlayRecord, SelfPlayConfig, self_play},
+    training::{
+        buffer::RolloutBuffer,
+        lr_schedule::LrSchedule,
+        metrics::{BatchStats, EpochStats, TrainingLogger},
+    },
+};
 
 // ── 配置 ──
 
@@ -73,6 +72,13 @@ pub struct TrainConfig {
     /// 在损失函数中加入 `-entropy_weight * entropy`，鼓励策略网络保持多样性，
     /// 防止过早收敛到确定性策略。设为 0.0 则关闭熵惩罚。
     pub entropy_weight: f32,
+
+    /// 自对弈 / 评估使用的工作线程数。
+    ///
+    /// 每条工作线程在处理一局棋时，会在等推理回包时阻塞，因此该值就是
+    /// 「同时在途的 GPU 推理请求数」的上限，也就是 GPU 线程一次能凑出的
+    /// batch 上限。设 0 则自动（`available_parallelism * 4`，夹在 [8,128]）。
+    pub pool_threads: usize,
 }
 
 impl Default for TrainConfig {
@@ -99,6 +105,7 @@ impl Default for TrainConfig {
             random_seed: 42,
             recency_bonus: 0.5,
             entropy_weight: 0.03,
+            pool_threads: 0,
         }
     }
 }
@@ -110,14 +117,15 @@ pub struct Trainer {
     device: Device,
     buffer: RolloutBuffer<PlayRecord>,
     metrics_logger: TrainingLogger,
-    pool: ThreadPool,
+    pool: BlockingPool,
 }
 
 impl Trainer {
     pub fn new(config: TrainConfig, device: Device) -> Self {
         let cap = config.buffer_capacity;
         let metrics_logger = TrainingLogger::new(&config.model_dir);
-        let pool = ThreadPool::new().expect("Failed to create thread pool");
+        let pool = BlockingPool::new(config.pool_threads);
+        println!("  Worker threads: {}", pool.num_threads());
         Self {
             config,
             device,
@@ -329,35 +337,29 @@ impl Trainer {
                 .unwrap(),
         );
 
-        let sp_config = SelfPlayConfig {
+        let sp_config = Arc::new(SelfPlayConfig {
             num_simulations: self.config.num_simulations,
             select_temperature: temp,
-        };
+        });
 
         let base_seed = master_rng.random::<u64>();
 
-        let mut handles = Vec::with_capacity(total);
-        for game_i in 0..total {
+        // 每局一个任务，最多 pool_threads 局同时在跑；线程在 evaluate 上阻塞时
+        // 其余局面照常推进，GPU 线程因此能看到多个在途请求。
+        let jobs = (0..total).map(|game_i| {
             let seed = base_seed.wrapping_add(game_i as u64);
             let pb = Arc::clone(&pb);
-            let sp_config = sp_config.clone();
+            let sp_config = Arc::clone(&sp_config);
             let inf = inference_server.clone();
+            move || {
+                let mut game_rng = StdRng::seed_from_u64(seed);
+                let records = self_play(&inf, &sp_config, &mut game_rng).records;
+                pb.inc(1);
+                records
+            }
+        });
 
-            // 关键：spawn 到线程池，handle 可以并发等待
-            let handle = self
-                .pool
-                .spawn_with_handle(async move {
-                    let mut game_rng = StdRng::seed_from_u64(seed);
-                    let records = self_play(&inf, &sp_config, &mut game_rng).await.records;
-                    pb.inc(1);
-                    records
-                })
-                .expect("spawn selfplay task");
-
-            handles.push(handle);
-        }
-        let results: Vec<Vec<PlayRecord>> =
-            futures_executor::block_on(futures::future::join_all(handles));
+        let results: Vec<Vec<PlayRecord>> = self.pool.run_all(jobs);
         let all_records: Vec<PlayRecord> = results.into_iter().flatten().collect();
 
         pb.finish_and_clear();

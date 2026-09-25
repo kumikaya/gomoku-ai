@@ -10,15 +10,21 @@
 //!   → N × TransformerBlock (post-LN, self-attn with RoPE 2D on Q/K + FFN)
 //!   → Policy head (per-position Linear) + Value head (mean pool + MLP → Tanh)
 
-use crate::game::board::Board;
-use crate::network::pos_embed::{Pos2DEmbed, Pos2DEmbedConfig};
-use crate::network::rope::RoPE2D;
-
-use burn::tensor::activation::{relu, softmax, tanh};
 use burn::{
     module::Module,
     nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig},
-    tensor::{Device, Int, Tensor},
+    tensor::{
+        Device, Int, Tensor,
+        activation::{relu, softmax, tanh},
+    },
+};
+
+use crate::{
+    game::board::Board,
+    network::{
+        pos_embed::{Pos2DEmbed, Pos2DEmbedConfig},
+        rope::RoPE2D,
+    },
 };
 
 /// Token 种类数（0=空, 1=黑, 2=白）

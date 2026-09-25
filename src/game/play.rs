@@ -5,10 +5,6 @@
 
 use std::io;
 
-use crate::game::board::{Board, Color};
-use crate::inference::Evaluator;
-use crate::mcts::node::{GumbelConfig, MCTS};
-
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -21,6 +17,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
+use crate::{
+    game::board::{Board, Color},
+    inference::Evaluator,
+    mcts::node::{GumbelConfig, MCTS},
+};
+
 pub fn play_game<E: Evaluator>(evaluator: &E, num_simulations: usize) {
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
@@ -28,8 +30,7 @@ pub fn play_game<E: Evaluator>(evaluator: &E, num_simulations: usize) {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let result =
-        futures_executor::block_on(run_game_loop(&mut terminal, evaluator, num_simulations));
+    let result = run_game_loop(&mut terminal, evaluator, num_simulations);
 
     disable_raw_mode().unwrap();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
@@ -51,7 +52,7 @@ struct GameState {
     game_over: bool,
 }
 
-async fn run_game_loop<E: Evaluator>(
+fn run_game_loop<E: Evaluator>(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     evaluator: &E,
     num_simulations: usize,
@@ -104,7 +105,7 @@ async fn run_game_loop<E: Evaluator>(
                         // 如果人类落子后游戏未结束，轮到 AI
                         if !state.board.game_over {
                             terminal.draw(|f| render(f, &state))?;
-                            ai_move(&mut state, evaluator, num_simulations).await;
+                            ai_move(&mut state, evaluator, num_simulations);
                         }
                     } else {
                         state.message = "该位置已有棋子！".into();
@@ -128,13 +129,12 @@ async fn run_game_loop<E: Evaluator>(
     }
 }
 
-async fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
+fn ai_move<E: Evaluator>(state: &mut GameState, evaluator: &E, num_simulations: usize) {
     let config = GumbelConfig::inference(num_simulations);
     state.mcts.reset();
     let result = state
         .mcts
-        .search(&state.board, evaluator, &config, &mut rand::rng())
-        .await;
+        .search(&state.board, evaluator, &config, &mut rand::rng());
 
     let npos = state.board.num_positions();
     if result.best_move < npos {

@@ -14,10 +14,6 @@
 
 use std::io;
 
-use crate::game::board::{Board, Color};
-use crate::inference::Evaluator;
-use crate::mcts::node::{GumbelConfig, MCTS};
-
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -30,6 +26,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
+use crate::{
+    game::board::{Board, Color},
+    inference::Evaluator,
+    mcts::node::{GumbelConfig, MCTS},
+};
+
 pub fn analyze_game<E: Evaluator>(evaluator: &E, num_simulations: usize) {
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
@@ -37,8 +39,7 @@ pub fn analyze_game<E: Evaluator>(evaluator: &E, num_simulations: usize) {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let result =
-        futures_executor::block_on(run_analyze_loop(&mut terminal, evaluator, num_simulations));
+    let result = run_analyze_loop(&mut terminal, evaluator, num_simulations);
 
     disable_raw_mode().unwrap();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap();
@@ -102,7 +103,7 @@ impl SimInputOverlay {
     }
 }
 
-async fn run_analyze_loop<E: Evaluator>(
+fn run_analyze_loop<E: Evaluator>(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     evaluator: &E,
     num_simulations: usize,
@@ -130,7 +131,7 @@ async fn run_analyze_loop<E: Evaluator>(
     // 初始分析一次空棋盘
     state.computing = true;
     terminal.draw(|f| render(f, &state, &sim_overlay))?;
-    run_analysis(&mut state, evaluator).await;
+    run_analysis(&mut state, evaluator);
     state.computing = false;
 
     loop {
@@ -182,7 +183,7 @@ async fn run_analyze_loop<E: Evaluator>(
                     state.computing = true;
                     state.message = "MCTS 搜索中...".into();
                     terminal.draw(|f| render(f, &state, &sim_overlay))?;
-                    run_analysis(&mut state, evaluator).await;
+                    run_analysis(&mut state, evaluator);
                     state.computing = false;
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -197,7 +198,7 @@ async fn run_analyze_loop<E: Evaluator>(
                         // 悔棋后自动分析
                         state.computing = true;
                         terminal.draw(|f| render(f, &state, &sim_overlay))?;
-                        run_analysis(&mut state, evaluator).await;
+                        run_analysis(&mut state, evaluator);
                         state.computing = false;
                     } else {
                         state.message = "无法悔棋（已到棋盘初始状态）".into();
@@ -217,7 +218,7 @@ async fn run_analyze_loop<E: Evaluator>(
                         );
                         state.computing = true;
                         terminal.draw(|f| render(f, &state, &sim_overlay))?;
-                        run_analysis(&mut state, evaluator).await;
+                        run_analysis(&mut state, evaluator);
                         state.computing = false;
 
                         if state.board.game_over {
@@ -254,13 +255,12 @@ async fn run_analyze_loop<E: Evaluator>(
     }
 }
 
-async fn run_analysis<E: Evaluator>(state: &mut AnalyzeState, evaluator: &E) {
+fn run_analysis<E: Evaluator>(state: &mut AnalyzeState, evaluator: &E) {
     let config = GumbelConfig::inference(state.num_simulations);
     state.mcts.reset();
     let result = state
         .mcts
-        .search(&state.board, evaluator, &config, &mut rand::rng())
-        .await;
+        .search(&state.board, evaluator, &config, &mut rand::rng());
 
     let mut total_visits: u32 = result.children_visits.iter().sum();
     state.current_result = Some(AnalyzeResultData {

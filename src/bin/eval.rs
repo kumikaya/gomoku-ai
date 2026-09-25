@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-use burn::module::Module;
-use burn::store::ModuleRecord;
+use burn::{module::Module, store::ModuleRecord};
 use clap::Parser;
-use futures_executor::ThreadPool;
-use gomoku_ai::eval::{EvalConfig, MatchRunner};
-use gomoku_ai::inference::InferenceServer;
-use gomoku_ai::network::transformer::GomokuNetwork;
+use gomoku_ai::{
+    eval::{EvalConfig, MatchRunner},
+    inference::InferenceServer,
+    network::transformer::GomokuNetwork,
+    pool::BlockingPool,
+};
 
 #[derive(Parser)]
 #[command(name = "gomoku-eval")]
@@ -27,6 +28,10 @@ struct Cli {
     /// MCTS 模拟次数
     #[arg(short = 's', long, default_value = "64")]
     simulations: usize,
+
+    /// 工作线程数（= 在途推理请求上限）。0 表示自动
+    #[arg(short = 't', long, default_value = "0")]
+    threads: usize,
 }
 
 fn main() {
@@ -65,7 +70,7 @@ fn main() {
         ..Default::default()
     };
     let runner = MatchRunner::new(config);
-    let pool = ThreadPool::new().expect("Failed to create thread pool");
+    let pool = BlockingPool::new(cli.threads);
     let server_c = InferenceServer::new(challenger_model, device.clone());
     let server_b = InferenceServer::new(baseline_model, device);
     let result = runner.run_match(&pool, &server_c, &server_b, 0);

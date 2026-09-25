@@ -5,8 +5,10 @@
 //!   - 预计算 [1,1,seq,d_head] cos/sin（含符号折叠），forward 零 gather/cat
 //!   - 中间张量 ~15→3，kernel launch ~20→5
 
-use burn::module::Module;
-use burn::tensor::{Device, Tensor, TensorData};
+use burn::{
+    module::Module,
+    tensor::{Device, Tensor, TensorData},
+};
 
 /// RoPE 2D 旋转位置编码（仅作用于 Q 和 K）。
 ///

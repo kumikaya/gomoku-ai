@@ -2,13 +2,16 @@
 //!
 //! 将 GPU 推理从 MCTS 中解耦，通过 `Evaluator` trait + `InferenceServer`
 //! 实现：单 CUDA 上下文，多 MCTS 实例共享，跨请求自动攒批。
+//!
+//! `Evaluator::evaluate` 是阻塞接口：一次调用占用一条调用线程直到回包。
+//! 并发来自 `crate::pool::BlockingPool` 的工作线程，GPU 线程则在
+//! `BATCH_TIMEOUT` 窗口内把这些在途请求合并成一个 batch。
+
+use std::{sync::Arc, time::Duration};
+
+use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData, Transaction};
 
 use crate::network::transformer::{GomokuNetwork, policy_out_dim};
-use burn::tensor::Transaction;
-use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
-use futures::channel::oneshot;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// 批量评估上限（GPU 线程内部攒批的最大请求数）
 const SERVER_BATCH_CAP: usize = 512;
@@ -24,8 +27,12 @@ const BATCH_TIMEOUT: Duration = Duration::from_micros(200);
 /// 返回 `(logits, value)`：
 /// - `logits`：长度 `POLICY_OUT` 的原始 logits
 /// - `value`：单个 f32 标量，范围 [-1, 1]
+///
+/// 这是**阻塞**接口：实现方在 GPU/CPU 推理完成前一直占用调用线程。
+/// 并发由 `crate::pool::BlockingPool` 提供的工作线程承担，因此调用方
+/// 不需要（也不应该）在同一个线程里发起多个在途请求。
 pub trait Evaluator: Send + Sync {
-    fn evaluate(&self, state: Vec<i32>) -> impl Future<Output = (Vec<f32>, f32)> + Send;
+    fn evaluate(&self, state: Vec<i32>) -> (Vec<f32>, f32);
 }
 
 // ============================================================
@@ -34,7 +41,7 @@ pub trait Evaluator: Send + Sync {
 
 struct InferenceRequest {
     state: Vec<i32>,
-    response_tx: oneshot::Sender<(Vec<f32>, f32)>,
+    response_tx: crossbeam_channel::Sender<(Vec<f32>, f32)>,
 }
 
 /// GPU 线程支持两类命令：
@@ -207,8 +214,8 @@ impl InferenceServer {
 }
 
 impl Evaluator for InferenceServer {
-    async fn evaluate(&self, state: Vec<i32>) -> (Vec<f32>, f32) {
-        let (response_tx, response_rx) = oneshot::channel();
+    fn evaluate(&self, state: Vec<i32>) -> (Vec<f32>, f32) {
+        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
         self.inner
             .cmd_tx
             .send(GpuCommand::Evaluate(InferenceRequest {
@@ -216,6 +223,7 @@ impl Evaluator for InferenceServer {
                 response_tx,
             }))
             .expect("GPU inference thread died");
-        response_rx.await.expect("GPU inference thread died")
+        // 阻塞期间只是让出一条工作线程，GPU 线程仍可继续攒批其他请求
+        response_rx.recv().expect("GPU inference thread died")
     }
 }

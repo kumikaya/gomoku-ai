@@ -59,6 +59,10 @@ struct Cli {
     /// 数据类型精度：f32 或 bf16（默认 f32）
     #[arg(long, default_value = "f32")]
     dtype: String,
+
+    /// 自对弈/评估的工作线程数（= 在途推理请求上限）。0 表示自动
+    #[arg(long, default_value = "0")]
+    pool_threads: usize,
 }
 
 fn main() {
@@ -94,6 +98,7 @@ fn main() {
         eval_num_games: cli.eval_games,
         eval_num_simulations: cli.eval_simulations,
         eval_promotion_threshold: cli.eval_threshold,
+        pool_threads: cli.pool_threads,
         ..Default::default()
     };
     let mut trainer = Trainer::new(config, device);

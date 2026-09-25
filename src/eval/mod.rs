@@ -5,18 +5,19 @@
 //! - `EloTracker`: Elo 评分追踪（1500 基准）
 //! - `BaselineServer`: 长期缓存 baseline 的 InferenceServer，避免重复创建 GPU 线程
 
-use crate::game::board::{Board, Color};
-use crate::inference::InferenceServer;
-use crate::mcts::node::{GumbelConfig, MCTS};
-use crate::network::transformer::GomokuNetwork;
+use std::{path::PathBuf, sync::Arc};
 
-use burn::module::Module;
-use burn::tensor::Device;
-use futures::task::SpawnExt;
+use burn::{module::Module, tensor::Device};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::SeedableRng;
-use std::path::PathBuf;
-use std::sync::Arc;
+
+use crate::{
+    game::board::{Board, Color},
+    inference::InferenceServer,
+    mcts::node::{GumbelConfig, MCTS},
+    network::transformer::GomokuNetwork,
+    pool::BlockingPool,
+};
 
 // ============================================================
 //  Elo 评分系统
@@ -182,7 +183,7 @@ impl MatchRunner {
 
     pub fn run_match(
         &self,
-        pool: &futures_executor::ThreadPool,
+        pool: &BlockingPool,
         current_server: &InferenceServer,
         baseline_server: &InferenceServer,
         rng_seed: u64,
@@ -202,42 +203,31 @@ impl MatchRunner {
         );
 
         // 当前模型执黑
-        let mut handles = Vec::with_capacity(half);
-        for game_i in 0..half {
+        let outcomes_current_black: Vec<GameOutcome> = pool.run_all((0..half).map(|game_i| {
             let seed = rng_seed.wrapping_add(game_i as u64);
             let pb = Arc::clone(&pb);
             let cur = cur.clone();
             let base = base.clone();
-            let handle = pool
-                .spawn_with_handle(async move { play_eval_game(&cur, &base, num_sim, seed).await })
-                .expect("spawn eval task");
-            handles.push(async move {
-                let r = handle.await;
+            move || {
+                let outcome = play_eval_game(&cur, &base, num_sim, seed);
                 pb.inc(1);
-                r
-            });
-        }
-        let outcomes_current_black: Vec<GameOutcome> =
-            futures_executor::block_on(futures::future::join_all(handles));
+                outcome
+            }
+        }));
 
         // 当前模型执白
-        let mut handles = Vec::with_capacity(num_games - half);
-        for game_i in 0..num_games - half {
-            let seed = rng_seed.wrapping_add((half + game_i) as u64);
-            let pb = Arc::clone(&pb);
-            let cur = cur.clone();
-            let base = base.clone();
-            let handle = pool
-                .spawn_with_handle(async move { play_eval_game(&base, &cur, num_sim, seed).await })
-                .expect("spawn eval task");
-            handles.push(async move {
-                let r = handle.await;
-                pb.inc(1);
-                r
-            });
-        }
         let outcomes_current_white: Vec<GameOutcome> =
-            futures_executor::block_on(futures::future::join_all(handles));
+            pool.run_all((0..num_games - half).map(|game_i| {
+                let seed = rng_seed.wrapping_add((half + game_i) as u64);
+                let pb = Arc::clone(&pb);
+                let cur = cur.clone();
+                let base = base.clone();
+                move || {
+                    let outcome = play_eval_game(&base, &cur, num_sim, seed);
+                    pb.inc(1);
+                    outcome
+                }
+            }));
 
         pb.finish_and_clear();
 
@@ -286,7 +276,7 @@ impl MatchRunner {
 //  评估对弈逻辑
 // ============================================================
 
-async fn play_eval_game(
+fn play_eval_game(
     black_server: &InferenceServer,
     white_server: &InferenceServer,
     num_simulations: usize,
@@ -314,7 +304,7 @@ async fn play_eval_game(
         };
 
         mcts.reset();
-        let result = mcts.search(&board, eval, &config, &mut rng).await;
+        let result = mcts.search(&board, eval, &config, &mut rng);
 
         if result.best_move >= npos || !board.play_idx(result.best_move) {
             break;

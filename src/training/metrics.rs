@@ -15,17 +15,20 @@
 //! epoch 末尾追加最终值行（`value,final`），聚合时直接采用该最终值。
 //! 训练结束后可以用 `burn::train::LearnerSummary` 读取并打印 Min/Max 汇总表。
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
-use burn::data::dataloader::Progress;
-use burn::optim::lr_scheduler::module_lr_scheduler::ModuleLearningRate;
-use burn::train::logger::{FileMetricLogger, MetricLogger};
-use burn::train::metric::state::{FormatOptions, NumericMetricState};
-use burn::train::metric::store::{MetricsUpdate, Split};
-use burn::train::metric::{
-    Metric, MetricAttributes, MetricDefinition, MetricEntry, MetricId, MetricMetadata, MetricName,
-    Numeric, NumericAttributes, NumericEntry, SerializedEntry,
+use burn::{
+    data::dataloader::Progress,
+    optim::lr_scheduler::module_lr_scheduler::ModuleLearningRate,
+    train::{
+        logger::{FileMetricLogger, MetricLogger},
+        metric::{
+            Metric, MetricAttributes, MetricDefinition, MetricEntry, MetricId, MetricMetadata,
+            MetricName, Numeric, NumericAttributes, NumericEntry, SerializedEntry,
+            state::{FormatOptions, NumericMetricState},
+            store::{MetricsUpdate, Split},
+        },
+    },
 };
 
 // ── 指标 ID ──

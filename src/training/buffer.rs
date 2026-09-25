@@ -4,8 +4,9 @@
 //! - 批量写入（自动淘汰旧数据）
 //! - 加权随机采样
 
-use rand::distr::{Distribution, weighted::WeightedIndex};
 use std::collections::VecDeque;
+
+use rand::distr::{Distribution, weighted::WeightedIndex};
 
 /// 经验回放缓冲区
 pub struct RolloutBuffer<T> {

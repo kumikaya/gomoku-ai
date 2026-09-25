@@ -16,14 +16,16 @@
 //! - Gumbel 噪声始终用于根节点选择（`_score_considered`）。
 //! - Dirichlet 噪声可选叠加到根子节点的 `prior` 上（由 `add_dirichlet_noise` 控制）。
 
+use std::{collections::HashMap, marker::PhantomData};
+
+use ndarray::Array2;
+use rand::{
+    RngExt,
+    distr::{Distribution, weighted::WeightedIndex},
+};
+
 use super::game::{ActionId, Game};
 use crate::inference::Evaluator;
-use ndarray::Array2;
-use rand::RngExt;
-use rand::distr::Distribution;
-use rand::distr::weighted::WeightedIndex;
-use std::collections::HashMap;
-use std::marker::PhantomData;
 
 // ============================================================
 //  GumbelConfig
@@ -528,12 +530,7 @@ impl<G: Game> MCTS<G> {
     /// 展开节点：调用 NN，为每个合法动作创建子节点（对齐 `_expand_leaf_node`）。
     ///
     /// 返回叶子值（当前玩家视角），同时把 raw_value 写入节点。
-    async fn expand_node<E: Evaluator>(
-        &mut self,
-        node_idx: NodeId,
-        game: &G,
-        evaluator: &E,
-    ) -> f32 {
+    fn expand_node<E: Evaluator>(&mut self, node_idx: NodeId, game: &G, evaluator: &E) -> f32 {
         let legal = game.legal_actions();
 
         if legal.is_empty() {
@@ -541,7 +538,7 @@ impl<G: Game> MCTS<G> {
         }
 
         let encoding = game.encode();
-        let (raw_logits, leaf_value) = evaluator.evaluate(encoding).await;
+        let (raw_logits, leaf_value) = evaluator.evaluate(encoding);
         let probs = softmax_legal(&raw_logits, &legal);
 
         // 记录 raw_value
@@ -578,7 +575,7 @@ impl<G: Game> MCTS<G> {
     /// `sim_index`: 本轮内当前模拟的序号（0-based），用于 halving table 索引。
     /// 从根出发，根用 `select_root_child`，内部用 `select_interior_child`，
     /// 到达叶节点后展开并反向传播。
-    async fn simulate<E: Evaluator>(
+    fn simulate<E: Evaluator>(
         &mut self,
         game: &mut G,
         evaluator: &E,
@@ -610,7 +607,7 @@ impl<G: Game> MCTS<G> {
         let leaf_value = if let Some(terminal_value) = game.terminal_value() {
             terminal_value
         } else {
-            self.expand_node(node_idx, game, evaluator).await
+            self.expand_node(node_idx, game, evaluator)
         };
 
         // ── backprop ──
@@ -623,7 +620,7 @@ impl<G: Game> MCTS<G> {
     //  Search（对齐 `get_next_action`）
     // ================================================================
 
-    pub async fn search<E: Evaluator>(
+    pub fn search<E: Evaluator>(
         &mut self,
         game: &G,
         evaluator: &E,
@@ -659,7 +656,7 @@ impl<G: Game> MCTS<G> {
             raw_policy_probs = probs;
         } else {
             let root_encoding = game.encode();
-            let (raw_logits, value) = evaluator.evaluate(root_encoding).await;
+            let (raw_logits, value) = evaluator.evaluate(root_encoding);
             root_nn_value = value;
             raw_policy_probs = softmax_legal(&raw_logits, &legal_moves);
 
@@ -697,8 +694,7 @@ impl<G: Game> MCTS<G> {
                 &halving_table,
                 &gumbel_noises,
                 sim_i,
-            )
-            .await;
+            );
         }
 
         // ── Phase 5: 构建 improved policy ──
@@ -972,7 +968,7 @@ mod tests {
     }
 
     impl Evaluator for MockEvaluator {
-        async fn evaluate(&self, state: Vec<i32>) -> (Vec<f32>, f32) {
+        fn evaluate(&self, state: Vec<i32>) -> (Vec<f32>, f32) {
             let key = Self::encode_key(&state);
             let logits = self
                 .policy_map
@@ -996,8 +992,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         assert!(result.best_move < 9);
         assert_eq!(result.policy.len(), 9);
@@ -1025,8 +1020,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(32);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         assert_eq!(result.best_move, 9);
         assert_eq!(result.policy, vec![0.0f32; 9]);
@@ -1056,8 +1050,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         assert_eq!(result.best_move, only_move);
     }
@@ -1074,8 +1067,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(256);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         let win_move = board.pos_to_idx(0, 2);
         assert!(result.best_move < 9);
@@ -1097,8 +1089,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(256);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         let block_move = board.pos_to_idx(0, 2);
         assert!(result.best_move < 9);
@@ -1119,8 +1110,7 @@ mod tests {
 
         let config = GumbelConfig::pure_gumbel(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         assert!(
             result.root_nn_prior[center_idx] > 0.5,
@@ -1150,8 +1140,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::mixed(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
         assert!(result.best_move < 9);
         assert!((result.policy.iter().sum::<f32>() - 1.0).abs() < 0.02);
     }
@@ -1168,8 +1157,7 @@ mod tests {
         let config = GumbelConfig::pure_gumbel(256);
         let win_move = board.pos_to_idx(0, 2);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         println!("policy: {:?}", result.policy);
         println!("children_q: {:?}", result.children_q);
@@ -1211,12 +1199,7 @@ mod tests {
                 break;
             }
             mcts.reset(); // 每步独立，不复用子树
-            let result = futures_executor::block_on(mcts.search(
-                &board,
-                &evaluator,
-                &config,
-                &mut rand::rng(),
-            ));
+            let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
             if result.best_move >= 9 {
                 break;
             }
@@ -1254,8 +1237,7 @@ mod tests {
         let evaluator = MockEvaluator::new().with_value(board.encode(), 1.0);
         let config = GumbelConfig::pure_gumbel(1024);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         assert!(
             result.root_value > -1.0,
@@ -1304,8 +1286,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(64);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
         let sum: f32 = result.policy.iter().sum();
         assert!(
             (sum - 1.0).abs() < 0.02,
@@ -1327,8 +1308,7 @@ mod tests {
         let evaluator = MockEvaluator::new();
         let config = GumbelConfig::pure_gumbel(256);
         let mut mcts: MCTS<Board> = MCTS::new();
-        let result =
-            futures_executor::block_on(mcts.search(&board, &evaluator, &config, &mut rand::rng()));
+        let result = mcts.search(&board, &evaluator, &config, &mut rand::rng());
 
         // 所有 9 个合法动作都应该有非零访问
         let nonzero_visits = result.children_visits.iter().filter(|&&v| v > 0).count();

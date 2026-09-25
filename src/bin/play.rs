@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 
-use burn::module::Module;
-use burn::store::ModuleRecord;
+use burn::{module::Module, store::ModuleRecord};
 use clap::Parser;
-use gomoku_ai::game::play::play_game;
-use gomoku_ai::inference::InferenceServer;
-use gomoku_ai::network::transformer::GomokuNetwork;
+use gomoku_ai::{
+    game::play::play_game, inference::InferenceServer, network::transformer::GomokuNetwork,
+};
 
 #[derive(Parser)]
 #[command(name = "gomoku-play")]
